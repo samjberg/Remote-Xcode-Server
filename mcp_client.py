@@ -24,6 +24,7 @@ git_diff_filepath = unix_path(os.path.join(diffs_path, 'gitdiff.diff'))
 git_diff_command = 'git diff HEAD'
 full_git_diff_command = f'{git_diff_command} > "{git_diff_filepath}"'
 git_add_command = 'git add .'
+current_offset = 0
 
 
 
@@ -64,16 +65,17 @@ def check_build_job(server_addr:tuple[str, int], job_id:str, offset:int=0) -> Re
     resp = requests.get(url)
     return resp
 
-def wait_for_build_completion(server_addr:tuple[str, int], job_id:str) -> Response:
+def wait_for_build_completion(server_addr:tuple[str, int], job_id:str, offset=0) -> Response:
     job_finished = False
     sleep_ms(20)
     while not job_finished:
-        resp = check_build_job(server_addr, job_id)
-        print(f'resp: {resp}')
-        print(f'resp.text: {resp.text}')
+        resp = check_build_job(server_addr, job_id, offset)
+        # print(f'resp: {resp}')
+        # print(f'resp.text: {resp.text}')
         job = json.loads(resp.text)
         new_text = job['newtext']
         print(new_text, end='')
+        offset += len(new_text)
         # print(f'new build text:  {new_text}', end='')
         if (job['status'].lower() == 'done') or (job['status'].lower() == 'complete'):
             job_finished = True
