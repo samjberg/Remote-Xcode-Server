@@ -1,25 +1,13 @@
-import os, subprocess, time, socket
+import os, subprocess, socket
 from flask import Flask, request, jsonify, Request, Response
 from threading import Thread
 from werkzeug.utils import secure_filename
 from uuid import uuid4
 from mcp_utils import *
-from typing import TextIO
+from typing import BinaryIO
 # from requests import Request
 
-def uploads_folder_exists() -> bool:
-    cwd = os.getcwd()
-    if 'uploads' not in os.listdir(cwd):
-        return False
-    return os.path.isdir(os.path.join(cwd, 'uploads'))
 
-def get_project_name() -> str:
-    dir_contents = os.listdir()
-    for name in dir_contents:
-        name_parts = name.split('.')
-        if name_parts[-1] == 'xcodeproj':
-            return name_parts[0]
-    return cwd.split('/')[-1]
 
 cwd = unix_path(os.getcwd())
 project_name = get_project_name()
@@ -42,10 +30,12 @@ else:
     ignores_diffs = False
     with open('.gitignore', 'r') as f:
         for line in f.readlines():
-            if line in ['/uploads/', 'uploads/']:
-                ignores_uploads = True
-            elif line in ['/diffs/', 'diffs/']:
-                ignores_diffs = True
+            for s in ['/uploads/', 'uploads/']:
+                if s==line or s in line:
+                    ignores_uploads = True
+            for s in ['/diffs/', 'diffs/']:
+                if s == line or s in line:
+                    ignores_diffs = True
             if ignores_uploads and ignores_diffs:
                 break
     
@@ -82,7 +72,7 @@ git_diff_filepath = unix_path(os.path.join(UPLOAD_FOLDER, 'gitdiff.diff'))
 JOBS = {}
 app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
-build_job_path = os.path.join(UPLOAD_FOLDER, 'build-fallbackid.txt')
+build_log_path = os.path.join(UPLOAD_FOLDER, 'build-fallbackid.txt')
 
 
 
@@ -100,12 +90,16 @@ def run_xcodebuild(job_id):
         xcodebuild_command: str = f"xcodebuild -scheme \"{project_name}\" -destination 'generic/platform=iOS Simulator' build"
         proc = subprocess.Popen(xcodebuild_command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0, shell=True)
         chunk_size = 4096
+        build_log_name = f'buildlog-{job_id}.txt'
+        build_log_path = os.path.join(UPLOAD_FOLDER, build_log_name)
+        log_write = open(build_log_path, 'w')
         while True:
             chunk = proc.stdout.read(chunk_size)
             if not chunk:
                 break
             conn.sendall(chunk)
 
+        log_write.close()
         proc.wait()
         conn.close()
 
@@ -115,28 +109,6 @@ def run_xcodebuild(job_id):
 
 
 
-    # global build_job_path
-    # try:
-    #     job = JOBS[job_id]
-    #     job["status"] = "running"
-    #     xcodebuild_command: str = f"xcodebuild -scheme \"{project_name}\" -destination 'generic/platform=iOS Simulator' build"
-    #     start_time_ms = time.time_ns()/1e6
-    #     print(f'running {xcodebuild_command}')
-    #     if not job["file_descriptor"]:
-    #         build_job_path = get_build_job_path(job_id)
-    #         build_job_file = open(build_job_path, 'w')
-    #         job["file_descriptor"] = build_job_file
-    #     proc = subprocess.Popen(xcodebuild_command, stdout=job["file_descriptor"], shell=True)
-    #     end_time_ms = time.time_ns()/1e6
-    #     build_duration = (end_time_ms - start_time_ms) / 1000
-    #     print(f'finished running {xcodebuild_command} in {build_duration} seconds')
-    #     result, err = proc.communicate()
-    #     job["result"] = result
-    #     job["status"] = "done"
-
-    # except Exception as e:
-    #     JOBS[job_id]["status"] = "error"
-    #     JOBS[job_id]["error"] = str(e)
 
 
 
@@ -177,14 +149,12 @@ def start_build_job(appname):
             os.system(git_apply_command)
 
 
-            #I had something weird happen with hashing once one time, so I'm triple hashing just to be safe that I land on a stable hash
             job_id = str(uuid4())
             if job_id in JOBS.keys():
                 return f'<p>Already building {appname}, job_id: {job_id}</p>'
-                #using w+ WILL overwrite the file if one already exists.  But that is a good thing.  That just means we don't necessarily HAVE to (although we still should) deal with deleteing the build file after it has finished
-                # build_log_file:TextIO = open(patch_path, 'w+') #
 
-            build_log_path:str = os.path.join(UPLOAD_FOLDER, 'buildlog.txt')
+            build_log_name:str = f'buildlog_{job_id}.txt'
+            build_log_path:str = os.path.join(UPLOAD_FOLDER, build_log_name)
 
             #Create the new job object and put it in job_id in the JOBS dict.
             #We have to be careful to ensure the file gets closed
@@ -207,10 +177,10 @@ def check_progress(job_id:str, offset:int) -> Response:
     if job['status'] == 'done':
         return 'Build already Complete'
 
-    build_job_path = get_build_job_path(job_id)
-    if not os.path.exists(build_job_path):
+    build_log_path = get_build_log_path(job_id)
+    if not os.path.exists(build_log_path):
         return 'Error: build job does not exist.'
-    with open(build_job_path, 'r') as f:
+    with open(build_log_path, 'r') as f:
         if f.seekable():
             f.seek(int(offset), 0)
         else:

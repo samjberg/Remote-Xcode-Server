@@ -8,6 +8,8 @@ cwd = unix_path(os.getcwd())
 app_name = get_appname()
 server_ip, server_port = '192.168.7.189', get_server_port() 
 server_addr = (server_ip, server_port)
+BUILD_SUCCESS = '** BUILD SUCCEEDED **'
+BUILD_FAILED = '** BUILD FAILED **'
 
 
 

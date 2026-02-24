@@ -17,23 +17,27 @@ def allowed_filename(filename:str) -> bool:
     valid_extensions = ['diff', 'txt']
     return filename.rsplit('.', 1)[-1].lower() in valid_extensions
 
-def get_build_job_path(job_id:int) -> str:
+def get_build_log_path(job_id:int) -> str:
     cwd = os.getcwd()
     uploads_path = os.path.join(cwd, 'uploads')
-    build_job_path = os.path.join(uploads_path, f'buildlog.txt')
-    return build_job_path
+    build_log_path = os.path.join(uploads_path, f'buildlog.txt')
+    return build_log_path
 
-# def get_project_root_path(cwd:str='') -> str:
-#     if cwd.lower() in ['/', '\\', 'c:/', 'c:\\']:
-#         print('Reached filesystem root, project root not found.')
-#         return None
-#     if cwd == '':
-#         cwd = unix_path(os.getcwd())
-#     dir_contents = os.listdir()
-#     for name in dir_contents:
-#         if name.split('.')[-1] == 'xcodeproj': #if the file extension is 'xcodeproj'
-#             return cwd                         #we are in project root, return cwd
-#performs a simple walk UP the filesystem from the starting location (either what is passed in as cwd, or if nothing is passed in, the actual current directory (i.e. unix_path(os.getcwd())))
+
+def uploads_folder_exists() -> bool:
+    cwd = os.getcwd()
+    if 'uploads' not in os.listdir(cwd):
+        return False
+    return os.path.isdir(os.path.join(cwd, 'uploads'))
+
+def get_project_name() -> str:
+    dir_contents = os.listdir()
+    for name in dir_contents:
+        name_parts = name.split('.')
+        if name_parts[-1] == 'xcodeproj':
+            return name_parts[0]
+    return os.getcwd().split('/')[-1]
+
 def get_project_root_path(cwd:str='.') -> str:
     if cwd == '.':
         cwd = os.getcwd()
@@ -61,6 +65,7 @@ def get_appname() -> str:
 
 def sleep_ms(ms:float) -> None:
     sleep(ms/1000.0)
+
 def parse_args() -> list[str]:
     args = sys.argv[1:]
     piped = not sys.stdin.isatty()
