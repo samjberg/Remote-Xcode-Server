@@ -106,6 +106,9 @@ def run_xcodebuild(job_id):
                 break
             conn.sendall(chunk)
 
+        proc.wait()
+        conn.close()
+
     except Exception as e:
         JOBS[job_id]['status'] = 'error'
         JOBS[job_id]['error'] = str(e)
