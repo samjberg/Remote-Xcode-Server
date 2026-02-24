@@ -1,4 +1,4 @@
-import sys, os, subprocess, time, requests, json
+import sys, os, socket, requests, json
 from flask import Response
 from mcp_utils import *
 
@@ -65,22 +65,38 @@ def check_build_job(server_addr:tuple[str, int], job_id:str, offset:int=0) -> Re
     resp = requests.get(url)
     return resp
 
-def wait_for_build_completion(server_addr:tuple[str, int], job_id:str, offset=0) -> Response:
-    job_finished = False
-    sleep_ms(20)
-    while not job_finished:
-        resp = check_build_job(server_addr, job_id, offset)
-        # print(f'resp: {resp}')
-        # print(f'resp.text: {resp.text}')
-        job = json.loads(resp.text)
-        new_text = job['newtext']
-        print(new_text, end='')
-        offset += len(new_text)
-        # print(f'new build text:  {new_text}', end='')
-        if (job['status'].lower() == 'done') or (job['status'].lower() == 'complete'):
-            job_finished = True
-            return job['result']
-        sleep_ms(1000)
+def wait_for_build_completion(server_addr:tuple[str, int], job_id:str, offset=0) -> str:
+    ip, port = server_addr
+    server_socket_port = 50271
+    chunk_size = 4096
+    full_text = ''
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.connect((ip, server_socket_port))
+        while True:
+            new_bytes = s.recv(chunk_size)
+            if not new_bytes:
+                break
+            new_text = new_bytes.decode('utf-8')
+            print(new_text, end='')
+            full_text += new_text
+
+    return full_text
+
+    # job_finished = False
+    # sleep_ms(20)
+    # while not job_finished:
+    #     resp = check_build_job(server_addr, job_id, offset)
+    #     # print(f'resp: {resp}')
+    #     # print(f'resp.text: {resp.text}')
+    #     job = json.loads(resp.text)
+    #     new_text = job['newtext']
+    #     print(new_text, end='')
+    #     offset += len(new_text)
+    #     # print(f'new build text:  {new_text}', end='')
+    #     if (job['status'].lower() == 'done') or (job['status'].lower() == 'complete'):
+    #         job_finished = True
+    #         return job['result']
+    #     sleep_ms(1000)
 
 
 

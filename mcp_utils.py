@@ -2,6 +2,7 @@ import os, sys, pathlib
 from time import sleep
 
 server_port = 8751
+socket_port = 50682
 
 def get_server_port() -> int:
     return server_port
