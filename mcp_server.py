@@ -97,6 +97,7 @@ def run_xcodebuild(job_id):
             chunk = proc.stdout.read(chunk_size)
             if not chunk:
                 break
+            log_write.write(chunk.decode())
             conn.sendall(chunk)
 
         log_write.close()
