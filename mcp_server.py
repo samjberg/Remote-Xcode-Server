@@ -1,4 +1,4 @@
-import os, subprocess, time
+import os, subprocess, time, socket
 from flask import Flask, request, jsonify, Request, Response
 from threading import Thread
 from werkzeug.utils import secure_filename
@@ -27,6 +27,11 @@ server_dir_name = 'uploads'
 server_dir_path = os.path.join(cwd, server_dir_name)
 project_info_filename = 'projectinfo.txt'
 project_info_filepath = os.path.join(server_dir_path, project_info_filename)
+
+server_socket_port = 50271 
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.bind(('0.0.0.0', server_socket_port))
+server.listen(1)
 
 if '.gitignore' not in os.listdir():
     with open('.gitignore', 'w') as f:
@@ -87,28 +92,51 @@ build_job_path = os.path.join(UPLOAD_FOLDER, 'build-fallbackid.txt')
 
 
 def run_xcodebuild(job_id):
-    global build_job_path
+    conn, addr = server.accept()
+    print(f'Received connection from {addr}')
     try:
         job = JOBS[job_id]
-        job["status"] = "running"
+        job['status'] = 'running'
         xcodebuild_command: str = f"xcodebuild -scheme \"{project_name}\" -destination 'generic/platform=iOS Simulator' build"
-        start_time_ms = time.time_ns()/1e6
-        print(f'running {xcodebuild_command}')
-        if not job["file_descriptor"]:
-            build_job_path = get_build_job_path(job_id)
-            build_job_file = open(build_job_path, 'w')
-            job["file_descriptor"] = build_job_file
-        proc = subprocess.Popen(xcodebuild_command, stdout=job["file_descriptor"], shell=True)
-        end_time_ms = time.time_ns()/1e6
-        build_duration = (end_time_ms - start_time_ms) / 1000
-        print(f'finished running {xcodebuild_command} in {build_duration} seconds')
-        result, err = proc.communicate()
-        job["result"] = result
-        job["status"] = "done"
+        proc = subprocess.Popen(xcodebuild_command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0, shell=True)
+        chunk_size = 4096
+        while True:
+            chunk = proc.stdout.read(chunk_size)
+            if not chunk:
+                break
+            conn.sendall(chunk)
+
+        proc.wait()
+        conn.close()
 
     except Exception as e:
-        JOBS[job_id]["status"] = "error"
-        JOBS[job_id]["error"] = str(e)
+        JOBS[job_id]['status'] = 'error'
+        JOBS[job_id]['error'] = str(e)
+
+
+
+    # global build_job_path
+    # try:
+    #     job = JOBS[job_id]
+    #     job["status"] = "running"
+    #     xcodebuild_command: str = f"xcodebuild -scheme \"{project_name}\" -destination 'generic/platform=iOS Simulator' build"
+    #     start_time_ms = time.time_ns()/1e6
+    #     print(f'running {xcodebuild_command}')
+    #     if not job["file_descriptor"]:
+    #         build_job_path = get_build_job_path(job_id)
+    #         build_job_file = open(build_job_path, 'w')
+    #         job["file_descriptor"] = build_job_file
+    #     proc = subprocess.Popen(xcodebuild_command, stdout=job["file_descriptor"], shell=True)
+    #     end_time_ms = time.time_ns()/1e6
+    #     build_duration = (end_time_ms - start_time_ms) / 1000
+    #     print(f'finished running {xcodebuild_command} in {build_duration} seconds')
+    #     result, err = proc.communicate()
+    #     job["result"] = result
+    #     job["status"] = "done"
+
+    # except Exception as e:
+    #     JOBS[job_id]["status"] = "error"
+    #     JOBS[job_id]["error"] = str(e)
 
 
 
