@@ -90,9 +90,7 @@ def run_xcodebuild(job_id):
         xcodebuild_command: str = f"xcodebuild -scheme \"{project_name}\" -destination 'generic/platform=iOS Simulator' build"
         proc = subprocess.Popen(xcodebuild_command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0, shell=True)
         chunk_size = 4096
-        build_log_name = f'buildlog-{job_id}.txt'
-        build_log_path = os.path.join(UPLOAD_FOLDER, build_log_name)
-        log_write = open(build_log_path, 'w')
+        log_write = job['file']
         while True:
             chunk = proc.stdout.read(chunk_size)
             if not chunk:
@@ -154,13 +152,13 @@ def start_build_job(appname):
             if job_id in JOBS.keys():
                 return f'<p>Already building {appname}, job_id: {job_id}</p>'
 
-            build_log_name:str = f'buildlog_{job_id}.txt'
+            build_log_name:str = f'buildlog-{job_id}.txt'
             build_log_path:str = os.path.join(UPLOAD_FOLDER, build_log_name)
 
             #Create the new job object and put it in job_id in the JOBS dict.
             #We have to be careful to ensure the file gets closed
             build_log_file = open(build_log_path, 'w')
-            JOBS[job_id] = {"status": "pending", "result": '', "error": None, "file_descriptor": build_log_file}
+            JOBS[job_id] = {"status": "pending", "result": '', "error": None, "file": build_log_file}
 
             t = Thread(target=run_xcodebuild, args=([job_id]), daemon=True)
             t.start()
