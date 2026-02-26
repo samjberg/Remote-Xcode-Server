@@ -5,9 +5,18 @@ from mimetypes import guess_type
 
 server_port = 8751
 socket_port = 50682
+runtime_dir_name = '.remote-xcode-server'
 
 def get_server_port() -> int:
     return server_port
+
+def get_runtime_dir_name() -> str:
+    return runtime_dir_name
+
+def get_runtime_dir_path(cwd:str|None=None) -> str:
+    if cwd is None:
+        cwd = os.getcwd()
+    return os.path.join(cwd, runtime_dir_name)
 
 def standardize_project_name(name:str) -> str:
     name.replace()
@@ -21,16 +30,16 @@ def allowed_filename(filename:str) -> bool:
 
 def get_build_log_path(job_id:int) -> str:
     cwd = os.getcwd()
-    uploads_path = os.path.join(cwd, 'uploads')
-    build_log_path = os.path.join(uploads_path, f'buildlog.txt')
+    runtime_path = get_runtime_dir_path(cwd)
+    build_log_path = os.path.join(runtime_path, f'buildlog.txt')
     return build_log_path
 
 
 def uploads_folder_exists() -> bool:
     cwd = os.getcwd()
-    if 'uploads' not in os.listdir(cwd):
+    if runtime_dir_name not in os.listdir(cwd):
         return False
-    return os.path.isdir(os.path.join(cwd, 'uploads'))
+    return os.path.isdir(get_runtime_dir_path(cwd))
 
 def get_project_name() -> str:
     dir_contents = os.listdir()
@@ -87,23 +96,19 @@ def update_gitignore():
     start_dir = os.getcwd()
     project_root = get_project_root_path(start_dir)
     gitignore_path = os.path.join(project_root, '.gitignore')
-    ignores_uploads = False
-    ignores_diffs = False
+    ignores_runtime_dir = False
     if not os.path.exists(gitignore_path):
         with open(gitignore_path, 'w') as f:
-            f.write('/uploads/\n/diffs/\n')
+            f.write(f'/{runtime_dir_name}/\n')
     else:
         ends_with_newline = False
         with open(gitignore_path, 'r') as f:
             lines = f.readlines()
 
         for line in lines:
-            for s in ['/uploads/', 'uploads/']:
+            for s in [f'/{runtime_dir_name}/', f'{runtime_dir_name}/']:
                 if s == line or s in line:
-                    ignores_uploads = True
-            for s in ['/diffs/', 'diffs/']:
-                if s == line or s in line:
-                    ignores_diffs = True
+                    ignores_runtime_dir = True
 
         if lines:
             # Check the actual on-disk trailing byte so newline translation doesn't
@@ -113,10 +118,8 @@ def update_gitignore():
                 ends_with_newline = f.read(1) in (b'\n', b'\r')
 
         additions = []
-        if not ignores_uploads:
-            additions.append('/uploads/\n')
-        if not ignores_diffs:
-            additions.append('/diffs/\n')
+        if not ignores_runtime_dir:
+            additions.append(f'/{runtime_dir_name}/\n')
 
         if additions:
             with open(gitignore_path, 'a') as f:
@@ -144,7 +147,7 @@ def is_plaintext(path:str):
 
 
 def get_changed_file_paths():
-    diff_command = 'git diff --name-only -z HEAD'
+    diff_command = 'git diff --name-only -z HEAD -- . :(exclude).gitignore'
     proc = subprocess.Popen(diff_command, stdout=subprocess.PIPE, shell=True)
     res, err = proc.communicate()
     if res:

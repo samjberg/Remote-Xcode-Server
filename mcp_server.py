@@ -10,7 +10,7 @@ from mcp_utils import *
 
 cwd = unix_path(os.getcwd())
 project_name = get_project_name()
-server_dir_name = 'uploads'
+server_dir_name = get_runtime_dir_name()
 server_dir_path = os.path.join(cwd, server_dir_name)
 project_info_filename = 'projectinfo.txt'
 project_info_filepath = os.path.join(server_dir_path, project_info_filename)
@@ -42,7 +42,7 @@ if project_info_filename not in os.listdir(server_dir_path): #this means this is
 
 
 
-UPLOAD_FOLDER = unix_path(os.path.join(cwd, 'uploads'))
+UPLOAD_FOLDER = unix_path(os.path.join(cwd, server_dir_name))
 JOBS = {}
 app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER

@@ -60,10 +60,11 @@ if __name__ == '__main__':
 
 
 
-    diffs_path = unix_path(os.path.join(cwd, 'diffs'))
+    runtime_dir = get_runtime_dir_name()
+    diffs_path = unix_path(os.path.join(cwd, runtime_dir))
     gitignore_path = os.path.join(cwd, '.gitignore')
     git_diff_filepath = unix_path(os.path.join(diffs_path, 'gitdiff.diff'))
-    git_diff_command = 'git diff HEAD'
+    git_diff_command = 'git diff HEAD -- . :(exclude).gitignore'
     full_git_diff_command = f'{git_diff_command} > "{git_diff_filepath}"'
     git_add_command = 'git add .'
 
@@ -100,4 +101,3 @@ if __name__ == '__main__':
     # print('final build log')
     print(build_log_str)
     
-
