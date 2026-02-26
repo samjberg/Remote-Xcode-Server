@@ -20,30 +20,7 @@ server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server.bind(('0.0.0.0', server_socket_port))
 server.listen(1)
 
-if '.gitignore' not in os.listdir():
-    with open('.gitignore', 'w') as f:
-        server_dir_ignore_line = f'/{server_dir_name}/'
-        f.writelines([server_dir_ignore_line])
-else:
-    ignores_uploads = False
-    ignores_diffs = False
-    with open('.gitignore', 'r') as f:
-        for line in f.readlines():
-            for s in ['/uploads/', 'uploads/']:
-                if s==line or s in line:
-                    ignores_uploads = True
-            for s in ['/diffs/', 'diffs/']:
-                if s == line or s in line:
-                    ignores_diffs = True
-            if ignores_uploads and ignores_diffs:
-                break
-    
-    if not (ignores_uploads and ignores_diffs):
-        with open('.gitignore', 'a') as f:
-            if not ignores_uploads:
-                f.write('/uploads/\n')
-            if not ignores_diffs:
-                f.write('/diffs/\n')
+update_gitignore()
 
 
 

@@ -94,25 +94,35 @@ def update_gitignore():
             f.write('/uploads/\n/diffs/\n')
     else:
         ends_with_newline = False
-        with open('.gitignore', 'r') as f:
-            for line in f.readlines():
-                for s in ['/uploads/', 'uploads/']:
-                    if s == line or s in line:
-                        ignores_uploads = True
-                for s in ['/diffs/', 'diffs/']:
-                    if s == line or s in line:
-                        ignores_diffs = True
-                if line[-1] == '\n':
-                    ends_with_newline = True
+        with open(gitignore_path, 'r') as f:
+            lines = f.readlines()
 
-        if not (ignores_uploads and ignores_diffs): #as long as BOTH are NOT already ignored
+        for line in lines:
+            for s in ['/uploads/', 'uploads/']:
+                if s == line or s in line:
+                    ignores_uploads = True
+            for s in ['/diffs/', 'diffs/']:
+                if s == line or s in line:
+                    ignores_diffs = True
+
+        if lines:
+            # Check the actual on-disk trailing byte so newline translation doesn't
+            # affect the result on Windows.
+            with open(gitignore_path, 'rb') as f:
+                f.seek(-1, os.SEEK_END)
+                ends_with_newline = f.read(1) in (b'\n', b'\r')
+
+        additions = []
+        if not ignores_uploads:
+            additions.append('/uploads/\n')
+        if not ignores_diffs:
+            additions.append('/diffs/\n')
+
+        if additions:
             with open(gitignore_path, 'a') as f:
-                if not ends_with_newline:
+                if lines and not ends_with_newline:
                     f.write('\n')
-                if not ignores_uploads:
-                    f.write('/uploads/\n')
-                if not ignores_diffs:
-                    f.write('/diffs/\n')
+                f.writelines(additions)
 
 
 
@@ -120,7 +130,7 @@ def is_plaintext(path:str):
     path = unix_path(path)
     name = path.split('/')[-1]
     #plaintext file extensions that are not recognized by mimetype.guess_type() and will return (None, None) and so must be handled manually
-    unknown_plaintext_extensions = ['gitignore', 'diff', 'log']
+    unknown_plaintext_extensions = ['swift', 'gitignore', 'diff', 'log']
     ext = name.split('.')[-1]
     if ext in unknown_plaintext_extensions:
         return True
