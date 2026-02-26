@@ -46,7 +46,7 @@ def wait_for_build_completion(server_addr:tuple[str, int], job_id:str, offset=0)
 
     return full_text
 
-def send_current_changes(server_addr:tuple[str, int]) -> Response:
+def prepare_current_changes() -> tuple[str, list[str]]:
     cwd = unix_path(os.getcwd())
     diffs_path = get_runtime_dir_path(cwd)
     diff_filename = 'gitdiff.diff'
@@ -65,10 +65,15 @@ def send_current_changes(server_addr:tuple[str, int]) -> Response:
         if changed_text_paths:
             subprocess.run(['git', 'diff', 'HEAD', '--', *changed_text_paths], stdout=diff_file)
 
+    return git_diff_path, changed_binary_paths
+
+def send_current_changes(server_addr:tuple[str, int]) -> Response:
+    git_diff_path, changed_binary_paths = prepare_current_changes()
+
     ip, port = server_addr
     app_name = get_appname()
     url = f'http://{ip}:{port}/sendchanges/{app_name}'
-    filename = diff_filename
+    filename = 'gitdiff.diff'
 
     files = {'gitdiff': (filename, open(git_diff_path, 'rb'), 'text/plain', {'Expires': 0})}
 
@@ -129,10 +134,7 @@ if __name__ == '__main__':
 
     # os.system(git_add_command)
 
-    changed_file_paths = [path for path in get_changed_file_paths() if path]
-    changed_binary_paths = [path for path in changed_file_paths if not is_plaintext(path.split('/')[-1])]
-    changed_text_paths = [path for path in changed_file_paths if path not in changed_binary_paths and path != '.gitignore']
-
+    
     # # Build a patch that only contains plaintext files; binary files are sent separately.
     # with open(git_diff_filepath, 'w', newline='') as diff_file:
     #     if changed_text_paths:
@@ -154,6 +156,7 @@ if __name__ == '__main__':
 
 
     if 'build' in arg: #for now, just to allow for flexibility in testing
+        git_diff_filepath, changed_binary_paths = prepare_current_changes()
         resp:Response = start_build_job(server_addr, git_diff_filepath, changed_binary_paths)
         json_obj = json.loads(resp.text)
         job_id = json_obj['job_id']
