@@ -93,7 +93,7 @@ if __name__ == '__main__':
             print('binary ', end='')
         print(f'file located at {path}')
 
-    resp:Response = start_build_job(server_addr, git_diff_filepath)
+    resp:Response = start_build_job(server_addr, git_diff_filepath, changed_binary_paths)
     json_obj = json.loads(resp.text)
     job_id = json_obj['job_id']
     build_log_str = wait_for_build_completion(server_addr, job_id)
