@@ -4,7 +4,6 @@ from threading import Thread
 from werkzeug.utils import secure_filename
 from uuid import uuid4
 from mcp_utils import *
-from typing import BinaryIO
 # from requests import Request
 
 
@@ -67,16 +66,44 @@ if project_info_filename not in os.listdir(server_dir_path): #this means this is
 
 
 UPLOAD_FOLDER = unix_path(os.path.join(cwd, 'uploads'))
-git_diff_filepath = unix_path(os.path.join(UPLOAD_FOLDER, 'gitdiff.diff'))
-
 JOBS = {}
 app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
-build_log_path = os.path.join(UPLOAD_FOLDER, 'build-fallbackid.txt')
 
 
 
 
+def get_safe_project_path(client_path:str) -> str:
+    """Resolve a client-supplied repo-relative path safely under the server project root."""
+    if client_path is None:
+        raise ValueError('Path is None')
+
+    rel_path = unix_path(str(client_path)).strip()
+    if rel_path == '':
+        raise ValueError('Path is empty')
+    if '\x00' in rel_path:
+        raise ValueError('Path contains NUL byte')
+    if rel_path.startswith('/'):
+        raise ValueError(f'Absolute paths are not allowed: {rel_path}')
+
+    # Reject Windows drive-letter paths (e.g. C:/foo) and UNC-like inputs.
+    first_part = rel_path.split('/')[0]
+    if len(first_part) >= 2 and first_part[1] == ':':
+        raise ValueError(f'Drive-letter paths are not allowed: {rel_path}')
+    if rel_path.startswith('//'):
+        raise ValueError(f'UNC-like paths are not allowed: {rel_path}')
+
+    normalized_rel = unix_path(os.path.normpath(rel_path))
+    normalized_parts = [p for p in normalized_rel.split('/') if p not in ['', '.']]
+    if any(p == '..' for p in normalized_parts):
+        raise ValueError(f'Path traversal is not allowed: {rel_path}')
+
+    project_root_abs = os.path.abspath(cwd)
+    dest_abs = os.path.abspath(os.path.join(project_root_abs, normalized_rel))
+    if os.path.commonpath([project_root_abs, dest_abs]) != project_root_abs:
+        raise ValueError(f'Path escapes project root: {rel_path}')
+
+    return dest_abs
 
 
 
@@ -121,11 +148,11 @@ def start_build_job(appname):
     print(f'appname: {appname}')
 
     if request.method == 'POST' or request.method == 'GET':
-        if 'file' not in request.files:
+        if 'gitdiff' not in request.files:
             print('NO FILE PART')
             return 'NO FILE PART'
 
-        file = request.files['file']
+        file = request.files['gitdiff']
         print(f'file: {file}')
         print(f'file.filename: {file.filename}')
         print(f'file.name: {file.name}')
@@ -134,6 +161,33 @@ def start_build_job(appname):
             return 'empty filename'
 
         print(f'request.files: {request.files}')
+
+        #there are are additional file(s) besides the diff.  This means the client sent binary files
+        #we need to save these files to their paths (path is the first item of the tuple)
+        # for i in range(1, len(request.files.keys())):
+        for file_key in request.files.keys():
+            if file_key == 'gitdiff':
+                continue
+            binary_file = request.files[file_key]
+            #I know this seems wrong.  But FileStorage.filename always returns the FIRST ITEM (0 index) in the tuple that was 
+            #used as the value in the files dict sent by the requests library (from the client).  And for the binary files, I am
+            #passing the path in the 0th index instead of the filename, because I need to save the files in the same relative locations
+            rel_path = unix_path(binary_file.filename)
+            binary_file_name = rel_path.split('/')[-1]
+            path = get_safe_project_path(rel_path)
+            parent_dir = os.path.dirname(path)
+            if parent_dir and not os.path.exists(parent_dir):
+                os.makedirs(parent_dir, exist_ok=True)
+            if os.path.exists(path):
+                if os.path.isfile(path):
+                    #If the path exists and IS a a file, simply remove it, since FileStorage.save does not overwrite files apparently
+                    os.remove(path)
+                else:
+                    print(f'Path given for changed or added binary file {binary_file_name}: {path}, already exists as a directory')
+                    print("Honestly, that's just really strange.  Idk")
+
+            binary_file.save(path)
+
 
 
         if file and allowed_filename(file.filename):
@@ -212,9 +266,6 @@ def job_status(job_id):
 @app.route('/')
 def hello_world():
     return 'Hello, World!'
-    with open(git_diff_filepath, 'r') as f:
-        text = f.read()
-    return text
 
 
 

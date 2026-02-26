@@ -1,6 +1,7 @@
-import os, sys, pathlib, socket
+import os, sys, pathlib, socket, subprocess
 from time import sleep
 from typing import BinaryIO
+from mimetypes import guess_type
 
 server_port = 8751
 socket_port = 50682
@@ -115,9 +116,35 @@ def update_gitignore():
 
 
 
+def is_plaintext(path:str):
+    path = unix_path(path)
+    name = path.split('/')[-1]
+    #plaintext file extensions that are not recognized by mimetype.guess_type() and will return (None, None) and so must be handled manually
+    unknown_plaintext_extensions = ['gitignore', 'diff', 'log']
+    ext = name.split('.')[-1]
+    if ext in unknown_plaintext_extensions:
+        return True
+    guess = guess_type(path, strict=False)[0]
+    if guess and type(guess) == str:
+        return guess[:4] == 'text'
+    return False
 
 
+    
 
+
+def get_changed_file_paths():
+    diff_command = 'git diff --name-only -z HEAD'
+    proc = subprocess.Popen(diff_command, stdout=subprocess.PIPE, shell=True)
+    res, err = proc.communicate()
+    if res:
+        lines_bytes = [b for b in res.split(b'\x00') if b]
+        file_paths = [b.decode() for b in lines_bytes]
+        return file_paths
+    else:
+        print(f'Did not receive any results from: {diff_command}')
+        print(f'Error message: {err.decode()}')
+    return []
 
 
 def send_bytes(b:bytes, conn:socket.socket, chunk_size:int=4096, start_pos=0):

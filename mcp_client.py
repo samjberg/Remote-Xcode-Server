@@ -5,12 +5,20 @@ from mcp_utils import *
 def get_jobid_from_resp(resp:Response):
     return json.loads(resp.text)['job_id']
 
-def start_build_job(server_addr:tuple[str, int], git_diff_path) -> str:
+def start_build_job(server_addr:tuple[str, int], git_diff_path:str, changed_binary_paths:list[str]=[]) -> str:
     ip, port = server_addr
     app_name = get_appname()
     url = f'http://{ip}:{port}/appname/{app_name}'
     filename = git_diff_path.split('/')[-1]
-    files = {'file': (filename, open(git_diff_path, 'rb'), 'text/plain', {'Expires': 0})}
+
+    files = {'gitdiff': (filename, open(git_diff_path, 'rb'), 'text/plain', {'Expires': 0})}
+    for i, path in enumerate(changed_binary_paths):
+        path = unix_path(path)
+        print(f'Adding {path} to POST request')
+        mimetype, encoding = guess_type(path, strict=False)
+        if not mimetype:
+            mimetype = 'application/octet-stream'
+        files[f'binaryfile{i}'] = (path, open(path, 'rb'), mimetype, {'Expires': 0})
     print(f'Starting build job by making POST request to {url} sending a diff file located at {git_diff_path}\n')
     resp = requests.post(url, files=files)
     return resp
@@ -73,10 +81,17 @@ if __name__ == '__main__':
         os.mkdir(diffs_path)
     #End of all first-run initialization
 
+    #Actuall run the git commands
     os.system(git_add_command)
-    # sleep_ms(10) ###  sleep is NOT necessary.  os.system is blocking, so even though it DOES launch a new process (subshell), the main process (this script) is blocked until it complete.  Therefore there is no race condition by definition.
     os.system(full_git_diff_command)
-    # sleep_ms(50)
+
+    changed_file_paths = [path for path in get_changed_file_paths() if path]
+    changed_binary_paths = [path for path in changed_file_paths if not is_plaintext(path.split('/')[-1])]
+    for path in changed_file_paths:
+        print('Changed ', end='')
+        if path in changed_binary_paths:
+            print('binary ', end='')
+        print(f'file located at {path}')
 
     resp:Response = start_build_job(server_addr, git_diff_filepath)
     json_obj = json.loads(resp.text)
@@ -85,5 +100,4 @@ if __name__ == '__main__':
     # print('final build log')
     print(build_log_str)
     
-
 
