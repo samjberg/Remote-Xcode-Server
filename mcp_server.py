@@ -174,9 +174,10 @@ def start_build_job(appname):
             file.save(os.path.join(app.config["UPLOAD_FOLDER"], filename))
 
             patch_path = f'{app.config["UPLOAD_FOLDER"]}/{filename}'
-            git_apply_command = f'git apply {patch_path}'
-            #run the git apply command
-            os.system(git_apply_command)
+            if os.path.getsize(patch_path) > 0:
+                git_apply_command = f'git apply {patch_path}'
+                #run the git apply command
+                os.system(git_apply_command)
 
 
             job_id = str(uuid4())

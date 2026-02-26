@@ -64,8 +64,6 @@ if __name__ == '__main__':
     diffs_path = unix_path(os.path.join(cwd, runtime_dir))
     gitignore_path = os.path.join(cwd, '.gitignore')
     git_diff_filepath = unix_path(os.path.join(diffs_path, 'gitdiff.diff'))
-    git_diff_command = 'git diff HEAD -- . :(exclude).gitignore'
-    full_git_diff_command = f'{git_diff_command} > "{git_diff_filepath}"'
     git_add_command = 'git add .'
 
 
@@ -84,10 +82,16 @@ if __name__ == '__main__':
 
     #Actuall run the git commands
     os.system(git_add_command)
-    os.system(full_git_diff_command)
 
     changed_file_paths = [path for path in get_changed_file_paths() if path]
     changed_binary_paths = [path for path in changed_file_paths if not is_plaintext(path.split('/')[-1])]
+    changed_text_paths = [path for path in changed_file_paths if path not in changed_binary_paths and path != '.gitignore']
+
+    # Build a patch that only contains plaintext files; binary files are sent separately.
+    with open(git_diff_filepath, 'w', newline='') as diff_file:
+        if changed_text_paths:
+            subprocess.run(['git', 'diff', 'HEAD', '--', *changed_text_paths], stdout=diff_file)
+
     for path in changed_file_paths:
         print('Changed ', end='')
         if path in changed_binary_paths:

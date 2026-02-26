@@ -132,10 +132,13 @@ def update_gitignore():
 def is_plaintext(path:str):
     path = unix_path(path)
     name = path.split('/')[-1]
+    
+    ext = name.rsplit('.', 1)[-1].lower()
     #plaintext file extensions that are not recognized by mimetype.guess_type() and will return (None, None) and so must be handled manually
-    unknown_plaintext_extensions = ['swift', 'gitignore', 'diff', 'log']
-    ext = name.split('.')[-1]
-    if ext in unknown_plaintext_extensions:
+    csv_path = os.path.join(sys.path[0], 'plaintext_extensions.csv')
+    with open(csv_path, 'r') as f:
+        plaintext_extensions = f.read().split(',')
+    if ext in plaintext_extensions:
         return True
     guess = guess_type(path, strict=False)[0]
     if guess and type(guess) == str:
