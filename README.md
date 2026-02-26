@@ -97,16 +97,34 @@ Update this to your Mac’s LAN IP address.
 
 ### 3. Run the client from your project repo
 
-On the client machine, run:
+On the client machine, run one of these:
 
 ```bash
+# Default (same as `build`)
 python mcp_client.py
+
+# Build flow (sync changes + start remote build + stream logs)
+python mcp_client.py build
+
+# Sync-only flow (send changes to server, no build)
+python mcp_client.py sendchanges
 ```
 
 Current expectation:
 
 - Run it from the project root (the code is intended to work from subdirectories too, but this is not fully reliable yet).
 - The repo should have the same base history on both machines so `git apply` works cleanly.
+
+### Client Commands (Temporary / Minimal)
+
+Current `mcp_client.py` CLI behavior is intentionally minimal and temporary:
+
+- `build`: the normal workflow. This is the default if no command is provided.
+- `sendchanges`: syncs local changes to the server without starting a build (convenience for testing/syncing only).
+
+`sendchanges` is intended to package and send the current diff plus changed binary files, so you can sync work-in-progress changes without making a commit/push or manually copying a patch.
+
+Note: the current implementation checks commands using substring matching (e.g. `'build' in arg`), which is temporary and may change.
 
 ## What Gets Created
 
@@ -131,7 +149,7 @@ The code also attempts to add `uploads/` and `diffs/` to `.gitignore`.
 This project works fundamentally, but it is still early and buggy. Known limitations include:
 
 - Server IP is hardcoded in `mcp_client.py`.
-- No CLI arguments/config file yet.
+- CLI arguments are currently very minimal/temporary (`build`, `sendchanges`, defaulting to `build`), and a proper argument/config system is still needed.
 - Build command is currently fixed and simple (`xcodebuild ... build` with a derived scheme name).
 - Log streaming is now socket-based (raw TCP), but the code still contains older HTTP polling endpoints/logic.
 - Error handling is minimal.
