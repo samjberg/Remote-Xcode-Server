@@ -46,6 +46,48 @@ def wait_for_build_completion(server_addr:tuple[str, int], job_id:str, offset=0)
 
     return full_text
 
+def send_current_changes(server_addr:tuple[str, int]) -> None:
+    cwd = unix_path(os.getcwd())
+    diffs_path = get_runtime_dir_path(cwd)
+    diff_filename = 'gitdiff.diff'
+    git_diff_path = os.path.join(diffs_path, diff_filename)
+    if os.path.exists(git_diff_path):
+        os.remove(git_diff_path)
+    server_ip, server_port = server_addr
+    os.system('git add .')
+    
+    # Build a patch that only contains plaintext files; binary files are sent separately.
+    with open(git_diff_path, 'w', newline='') as diff_file:
+        if changed_text_paths:
+            subprocess.run(['git', 'diff', 'HEAD', '--', *changed_text_paths], stdout=diff_file)
+
+    ip, port = server_addr
+    app_name = get_appname()
+    url = f'http://{ip}:{port}/sendchanges/{app_name}'
+    filename = diff_filename
+
+    files = {'gitdiff': (filename, open(git_diff_path, 'rb'), 'text/plain', {'Expires': 0})}
+
+    changed_file_paths = [path for path in get_changed_file_paths() if path]
+    changed_binary_paths = [path for path in changed_file_paths if not is_plaintext(path.split('/')[-1])]
+    changed_text_paths = [path for path in changed_file_paths if path not in changed_binary_paths and path != '.gitignore']
+
+    for i, path in enumerate(changed_binary_paths):
+        path = unix_path(path)
+        print(f'Adding {path} to POST request')
+        mimetype, encoding = guess_type(path, strict=False)
+        if not mimetype:
+            mimetype = 'application/octet-stream'
+        files[f'binaryfile{i}'] = (path, open(path, 'rb'), mimetype, {'Expires': 0})
+    print(f'Sending changes located at {git_diff_path} to {url}\n')
+    resp = requests.post(url, files=files)
+    return resp
+
+
+
+
+
+
 
 #for now, temporarily, I will just impose the requirement that the client must be run from the project root.  This will let me get a testable version much more quickly.  I can improve it from there
 

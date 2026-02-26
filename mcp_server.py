@@ -112,11 +112,63 @@ def run_xcodebuild(job_id):
 
 
 
+@app.route('/sendchanges/<appname>', methods=['POST'])
+def receieve_changes(appname):
+    if 'gitdiff' not in request.files:
+        print('No diff received')
+        return 'No diff received'
 
+    file = request.files['gitdiff']
+    print(f'file: {file}')
+    print(f'file.filename: {file.filename}')
+    print(f'file.name: {file.name}')
+    if file == '':
+        print('empty filename')
+        return 'empty filename'
 
+    print(f'request.files: {request.files}')
 
+    #there are are additional file(s) besides the diff.  This means the client sent binary files
+    #we need to save these files to their paths (path is the first item of the tuple)
+    # for i in range(1, len(request.files.keys())):
+    for file_key in request.files.keys():
+        if file_key == 'gitdiff':
+            continue
+        binary_file = request.files[file_key]
+        #I know this seems wrong.  But FileStorage.filename always returns the FIRST ITEM (0 index) in the tuple that was 
+        #used as the value in the files dict sent by the requests library (from the client).  And for the binary files, I am
+        #passing the path in the 0th index instead of the filename, because I need to save the files in the same relative locations
+        rel_path = unix_path(binary_file.filename)
+        binary_file_name = rel_path.split('/')[-1]
+        path = get_safe_project_path(rel_path)
+        parent_dir = os.path.dirname(path)
+        if parent_dir and not os.path.exists(parent_dir):
+            os.makedirs(parent_dir, exist_ok=True)
+        if os.path.exists(path):
+            if os.path.isfile(path):
+                #If the path exists and IS a a file, simply remove it, since FileStorage.save does not overwrite files apparently
+                os.remove(path)
+            else:
+                print(f'Path given for changed or added binary file {binary_file_name}: {path}, already exists as a directory')
+                print("Honestly, that's just really strange.  Idk")
 
+        binary_file.save(path)
 
+    if file and allowed_filename(file.filename):
+        #create a secure version of the filename
+        filename = secure_filename(file.filename)
+        #save the file with the secure filename in UPLOAD_FOLDER
+        file.save(os.path.join(app.config["UPLOAD_FOLDER"], filename))
+
+        patch_path = f'{app.config["UPLOAD_FOLDER"]}/{filename}'
+        if os.path.getsize(patch_path) > 0:
+            git_apply_command = f'git apply {patch_path}'
+            #run the git apply command
+            os.system(git_apply_command)
+    else:
+        return f"Disallowed filename or file does not exist"
+
+    return "Some other method besides POST or GET was used.  Don't do that"
 
 
 
