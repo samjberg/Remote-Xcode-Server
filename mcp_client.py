@@ -70,8 +70,29 @@ def send_current_changes(server_addr:tuple[str, int]) -> Response:
     return resp
 
 
+
+def retrieve_changed_file_list_on_server(server_addr:tuple[str, int]) -> list[str]:
+    ip, port = server_addr
+    app_name = get_appname()
+    url = f'http://{ip}:{port}/retrieve_changed_file_paths/{app_name}'
+    try:
+        diff_resp:Response = requests.get(url, stream=True)
+    except requests.RequestException as e:
+        print(f'Failed to retrieve list of changed file paths: {e}')
+        return []
+    
+    if not diff_resp.text:
+        print('Received empty path list')
+        return []
+
+    changed_file_paths = diff_resp.text.split('\n')
+    return changed_file_paths
+    
+
+
+
 #Sort of like git pull, but for uncommitted changes and specifically to the server
-def retrieve_current_changes(server_addr:tuple[str, int]) -> bool:
+def retrieve_current_changes(server_addr:tuple[str, int], save_changes=True, save_as_filename='gitdiff.diff') -> bool:
     ip, port = server_addr
     app_name = get_appname()
     url = f'http://{ip}:{port}/retrieve_text_changes/{app_name}'
@@ -87,7 +108,7 @@ def retrieve_current_changes(server_addr:tuple[str, int]) -> bool:
         print('Received empty diff file')
 
     runtime_dir = get_runtime_dir_path()
-    git_patch_path = os.path.join(runtime_dir, 'gitdiff.diff')
+    git_patch_path = os.path.join(runtime_dir, save_as_filename)
     with open(git_patch_path, 'wb') as f:
         f.write(diff_resp.content)
 
@@ -133,8 +154,16 @@ def retrieve_current_changes(server_addr:tuple[str, int]) -> bool:
                 f.write(chunk)
     
     return ran_successfully #the idea is just to return True/False based on whether everything runs successfully or not, but I haven't really implemented that yet
+
+
     
 
+
+def sync_changes_with_server(server_addr:tuple[str, int]) -> bool:
+
+
+    return
+    
 
 
 

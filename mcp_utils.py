@@ -1,5 +1,4 @@
 import os, sys, pathlib, socket, subprocess
-from time import sleep
 from typing import BinaryIO
 from mimetypes import guess_type
 
@@ -14,14 +13,14 @@ def get_runtime_dir_name() -> str:
     return runtime_dir_name
 
 def get_runtime_dir_path(cwd:str|None=None) -> str:
+    """Returns the directory Remote-Xcode-Server uses to save files on both client and server"""
     if cwd is None:
         cwd = os.getcwd()
     return os.path.join(cwd, runtime_dir_name)
 
-def standardize_project_name(name:str) -> str:
-    name.replace()
 
 def unix_path(path:str) -> str:
+    """Returns a POSIX compliant version of path"""
     return pathlib.Path(path).as_posix()
 
 def allowed_filename(filename:str) -> bool:
@@ -31,7 +30,8 @@ def allowed_filename(filename:str) -> bool:
 def get_build_log_path(job_id:int) -> str:
     cwd = os.getcwd()
     runtime_path = get_runtime_dir_path(cwd)
-    build_log_path = os.path.join(runtime_path, f'buildlog.txt')
+    filename = f'buildlog-{job_id}.txt'
+    build_log_path = os.path.join(runtime_path, filename)
     return build_log_path
 
 
@@ -74,24 +74,6 @@ def get_appname() -> str:
     return root_path.split('/')[-1]#.replace(' ', '_')
 
 
-def sleep_ms(ms:float) -> None:
-    sleep(ms/1000.0)
-
-def parse_args() -> list[str]:
-    args = sys.argv[1:]
-    piped = not sys.stdin.isatty()
-    if piped:
-        text = sys.stdin.read()
-        return_args = args
-    else:
-        text = args[-1]
-        return_args = args[:-1]
-    filename = text    
-    if os.path.isfile(filename):
-        with open(filename, 'r') as f:
-            text = f.read()
-    return text, return_args
-
 def update_gitignore():
     start_dir = os.getcwd()
     project_root = get_project_root_path(start_dir)
@@ -128,8 +110,8 @@ def update_gitignore():
                 f.writelines(additions)
 
 
-
 def is_plaintext(path:str):
+    """Return True if the file at the supplied path is a plaintext, otherwise returns False"""
     path = unix_path(path)
     name = path.split('/')[-1]
 
@@ -146,27 +128,74 @@ def is_plaintext(path:str):
     return False
 
 
-def get_changed_file_paths():
+def is_subdir(path, directory):
+    path = os.path.realpath(path)
+    directory = os.path.realpath(directory)
+
+    relative = os.path.relpath(path, directory)
+
+    if relative.startswith(os.pardir):
+        return False
+    else:
+        return True
+
+
+def get_changed_file_paths(scope='repo') -> list[str]:
+    '''
+    Returns a list of paths to all files that have been changed relative to HEAD, including untracked files.
+
+    [scope] is 'repo' by default, which will detect all changes in the entire repo.  If 'cwd' is passed instead,
+
+    only changes in the current directory (and subdirectories) will be included.'''
     # Use argv form (no shell) for cross-platform behavior.
     # Exclude .gitignore in Python instead of relying on shell/pathspec parsing.
-    diff_command = ['git', 'diff', '--name-only', '-z', 'HEAD', '--', '.']
-    proc = subprocess.run(diff_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    cwd = os.getcwd()
+    project_root_path = get_project_root_path()
+    diff_command = ['git', 'diff', '--name-only', '-z', 'HEAD']
 
+    if scope == 'cwd':
+        diff_command.extend(['--', '.'])
+        diff_run_path = cwd
+    else:
+        diff_run_path = project_root_path
+
+    proc = subprocess.run(diff_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=diff_run_path)
     if proc.returncode != 0:
         err_text = proc.stderr.decode(errors='replace') if proc.stderr else ''
         print(f'git diff command failed: {" ".join(diff_command)}')
         if err_text:
             print(f'Error message: {err_text}')
-        return []
 
     if not proc.stdout:
-        return []
+        print(f'No output from {' '.join(diff_command)} in proc.stdout')
 
     #split "lines" (file paths) on null byte
     lines_bytes = [b for b in proc.stdout.split(b'\x00') if b] 
     file_paths = [b.decode(errors='replace') for b in lines_bytes]
     file_paths = [p for p in file_paths if p and p != '.gitignore']
+
+    untracked_diff_command = ['git', 'ls-files', '--others', '--exclude-standard', '-z']
+    untracked_proc = subprocess.run(untracked_diff_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=diff_run_path)
+
+    if untracked_proc.returncode != 0:
+        err_text = untracked_proc.stderr.decode(errors='replace') if untracked_proc.stderr else ''
+        print(f'git diff command failed: {" ".join(untracked_diff_command)}')
+        if err_text:
+            print(f'Error message: {err_text}')
+
+    if not untracked_proc.stdout:
+        print(f'No output from {' '.join(untracked_diff_command)} in proc.stdout')
+
+    untracked_lines_bytes = [b for b in untracked_proc.stdout.split(b'\x00') if b]
+    untracked_file_paths = [b.decode(errors='replace') for b in untracked_lines_bytes]
+    untracked_file_paths = [p for p in untracked_file_paths if p and p != '.gitignore']
+
+    for path in untracked_file_paths:
+        if not path in file_paths:
+            file_paths.append(path)
+
     return file_paths
+
 
 
 

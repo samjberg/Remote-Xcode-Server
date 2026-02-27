@@ -285,6 +285,13 @@ def start_build_job(appname):
         return "Some other method besides POST or GET was used.  Don't do that"
         
 
+@app.route('/retrieve_changed_file_paths/<appname>')
+def send_changed_file_paths(appname:str) -> Response:
+    #run "git add ." 
+    get_changed_file_paths()
+    os.system('git add .')
+
+
 
 @app.route('/checkprogress/<job_id>/<offset>')
 def check_progress(job_id:str, offset:int) -> Response:
