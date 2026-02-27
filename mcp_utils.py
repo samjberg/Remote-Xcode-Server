@@ -2,7 +2,6 @@ import os, sys, pathlib, socket, subprocess
 from time import sleep
 from typing import BinaryIO
 from mimetypes import guess_type
-from urllib.request import pathname2url
 
 server_port = 8751
 socket_port = 50682
@@ -192,18 +191,6 @@ def prepare_text_changes() -> tuple[str, list[str]]:
 
     return git_diff_path, changed_binary_paths
 
-
-def sanitize_path_for_url(path:str) -> str:
-    url = pathname2url(path)
-    i = 0
-    c = url[0]
-    while c == '/':
-        i += 1
-        c = url[i]
-    if (i+1) < len(url):
-        if url[i+1] == ':': #if the path (starting from i) starts with a drive letter
-            return url[i:]
-    return url[i-1:]
 
 def send_bytes(b:bytes, conn:socket.socket, chunk_size:int=4096, start_pos=0):
     msg_size = len(b) - start_pos

@@ -1,4 +1,4 @@
-import sys, os, socket, requests, json
+import sys, os, socket, requests, json, urllib
 from requests import Response
 from mcp_utils import *
 
@@ -118,7 +118,7 @@ def retrieve_current_changes(server_addr:tuple[str, int]) -> bool:
 
         filename = os.path.split(path)[-1]
         print(f'Retrieving {filename} from server')
-        sanitized_path = sanitize_path_for_url(path)
+        sanitized_path = urllib.parse.quote(path, safe='/')
         url = f'http://{ip}:{port}/retrieve_binary_file/{app_name}/{sanitized_path}'
         try:
             resp:Response = requests.get(url, stream=True)
