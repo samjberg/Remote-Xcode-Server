@@ -148,17 +148,26 @@ def is_plaintext(path:str):
 
 
 def get_changed_file_paths():
-    diff_command = 'git diff --name-only -z HEAD -- . :(exclude).gitignore'
-    proc = subprocess.Popen(diff_command, stdout=subprocess.PIPE, shell=True)
-    res, err = proc.communicate()
-    if res:
-        lines_bytes = [b for b in res.split(b'\x00') if b]
-        file_paths = [b.decode() for b in lines_bytes]
-        return file_paths
-    else:
-        print(f'Did not receive any results from: {diff_command}')
-        print(f'Error message: {err.decode()}')
-    return []
+    # Use argv form (no shell) for cross-platform behavior.
+    # Exclude .gitignore in Python instead of relying on shell/pathspec parsing.
+    diff_command = ['git', 'diff', '--name-only', '-z', 'HEAD', '--', '.']
+    proc = subprocess.run(diff_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    if proc.returncode != 0:
+        err_text = proc.stderr.decode(errors='replace') if proc.stderr else ''
+        print(f'git diff command failed: {" ".join(diff_command)}')
+        if err_text:
+            print(f'Error message: {err_text}')
+        return []
+
+    if not proc.stdout:
+        return []
+
+    #split "lines" (file paths) on null byte
+    lines_bytes = [b for b in proc.stdout.split(b'\x00') if b] 
+    file_paths = [b.decode(errors='replace') for b in lines_bytes]
+    file_paths = [p for p in file_paths if p and p != '.gitignore']
+    return file_paths
 
 
 
