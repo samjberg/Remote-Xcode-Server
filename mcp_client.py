@@ -1,5 +1,5 @@
 import sys, os, socket, requests, json
-from flask import Response
+from requests import Response
 from mcp_utils import *
 
 def get_jobid_from_resp(resp:Response):
@@ -46,29 +46,9 @@ def wait_for_build_completion(server_addr:tuple[str, int], job_id:str, offset=0)
 
     return full_text
 
-def prepare_current_changes() -> tuple[str, list[str]]:
-    cwd = unix_path(os.getcwd())
-    diffs_path = get_runtime_dir_path(cwd)
-    diff_filename = 'gitdiff.diff'
-    git_diff_path = os.path.join(diffs_path, diff_filename)
-    if os.path.exists(git_diff_path):
-        os.remove(git_diff_path)
-    os.system('git add .')
-
-    changed_file_paths = [path for path in get_changed_file_paths() if path]
-    changed_binary_paths = [path for path in changed_file_paths if not is_plaintext(path.split('/')[-1])]
-    changed_text_paths = [path for path in changed_file_paths if path not in changed_binary_paths and path != '.gitignore']
-
-    
-    # Build a patch that only contains plaintext files; binary files are sent separately.
-    with open(git_diff_path, 'w', newline='') as diff_file:
-        if changed_text_paths:
-            subprocess.run(['git', 'diff', 'HEAD', '--', *changed_text_paths], stdout=diff_file)
-
-    return git_diff_path, changed_binary_paths
-
+#Sort of like git push, but for uncommited changes and specifically from the server
 def send_current_changes(server_addr:tuple[str, int]) -> Response:
-    git_diff_path, changed_binary_paths = prepare_current_changes()
+    git_diff_path, changed_binary_paths = prepare_text_changes()
 
     ip, port = server_addr
     app_name = get_appname()
@@ -90,7 +70,70 @@ def send_current_changes(server_addr:tuple[str, int]) -> Response:
     return resp
 
 
+#Sort of like git pull, but for uncommitted changes and specifically to the server
+def retrieve_current_changes(server_addr:tuple[str, int]) -> bool:
+    ip, port = server_addr
+    app_name = get_appname()
+    url = f'http://{ip}:{port}/retrieve_text_changes/{app_name}'
+    ran_successfully = True
+    try:
+        diff_resp:Response = requests.get(url, stream=True)
+        diff_resp.raise_for_status()
+    except requests.RequestException as e:
+        print(f'Failed to retrieve text changes: {e}')
+        return False
 
+    if not diff_resp.content:
+        print('Received empty diff file')
+
+    runtime_dir = get_runtime_dir_path()
+    git_patch_path = os.path.join(runtime_dir, 'gitdiff.diff')
+    with open(git_patch_path, 'wb') as f:
+        f.write(diff_resp.content)
+
+    #apply patch
+    git_apply_command = f'git apply {git_patch_path}'
+    os.system(git_apply_command)
+
+    #request paths for changed binary files
+    url = f'http://{ip}:{port}/retrieve_changed_binary_paths/{app_name}'
+    try:
+        binary_paths_resp:Response = requests.get(url)
+        binary_paths_resp.raise_for_status()
+    except requests.RequestException as e:
+        print(f'Failed to retrieve binary path list: {e}')
+        return False
+    if not binary_paths_resp.text:
+        print('No changed binary files returned by server')
+
+    #split binary file paths into a list
+    paths = [path.strip() for path in binary_paths_resp.text.split('\n')]
+    paths = [path for path in paths if path] #remove empty paths
+
+    for path in paths:
+        #verify that the directory in which we are supposed to write the binary file to already exists.  If not, create it and all intermediate directories with os.makedirs
+        parent_dir = os.path.dirname(path)
+        if not os.path.exists(parent_dir):
+            os.makedirs(parent_dir, exist_ok=True)
+
+        filename = os.path.split(path)[-1]
+        print(f'Retrieving {filename} from server')
+        sanitized_path = sanitize_path_for_url(path)
+        url = f'http://{ip}:{port}/retrieve_binary_file/{app_name}/{sanitized_path}'
+        try:
+            resp:Response = requests.get(url, stream=True)
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            print(f'Failed to retrieve binary file {path}: {e}')
+            ran_successfully = False
+            continue
+        chunk_size = 1024 * 8
+        with open(path, 'wb') as f:
+            for chunk in resp.iter_content(chunk_size=chunk_size):
+                f.write(chunk)
+    
+    return ran_successfully #the idea is just to return True/False based on whether everything runs successfully or not, but I haven't really implemented that yet
+    
 
 
 
@@ -128,23 +171,7 @@ if __name__ == '__main__':
         os.mkdir(diffs_path)
     #End of all first-run initialization
 
-    #Actuall run the git commands
 
-
-
-    # os.system(git_add_command)
-
-    
-    # # Build a patch that only contains plaintext files; binary files are sent separately.
-    # with open(git_diff_filepath, 'w', newline='') as diff_file:
-    #     if changed_text_paths:
-    #         subprocess.run(['git', 'diff', 'HEAD', '--', *changed_text_paths], stdout=diff_file)
-
-    # for path in changed_file_paths:
-    #     print('Changed ', end='')
-    #     if path in changed_binary_paths:
-    #         print('binary ', end='')
-    #     print(f'file located at {path}')
 
 
     if len(sys.argv) > 1:
@@ -152,18 +179,24 @@ if __name__ == '__main__':
     else:
         arg = 'build'
 
-    
-
 
     if 'build' in arg: #for now, just to allow for flexibility in testing
-        git_diff_filepath, changed_binary_paths = prepare_current_changes()
+        git_diff_filepath, changed_binary_paths = prepare_text_changes()
         resp:Response = start_build_job(server_addr, git_diff_filepath, changed_binary_paths)
         json_obj = json.loads(resp.text)
         job_id = json_obj['job_id']
         build_log_str = wait_for_build_completion(server_addr, job_id)
         # print('final build log')
-        print(build_log_str)
+        # print(build_log_str)
     elif 'sendchanges' in arg:
         resp:Response = send_current_changes(server_addr)
         print(resp)
+    elif 'getchanges' in arg:
+        success:bool = retrieve_current_changes(server_addr)
+        if success:
+            print('Successfully retrieved changes from the server')
+        else:
+            print('Failed to retrieve changes from the server')
+    else:
+        print(f'Invalid argument: {arg}')
     

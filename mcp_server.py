@@ -1,5 +1,5 @@
 import os, subprocess, socket
-from flask import Flask, request, jsonify, Request, Response
+from flask import Flask, request, send_file, send_from_directory, jsonify, Request, Response
 from threading import Thread
 from werkzeug.utils import secure_filename
 from uuid import uuid4
@@ -110,6 +110,38 @@ def run_xcodebuild(job_id):
         JOBS[job_id]['status'] = 'error'
         JOBS[job_id]['error'] = str(e)
 
+@app.route('/retrieve_text_changes/<appname>')
+def send_changes(appname:str):
+    git_diff_path, changed_binary_paths = prepare_text_changes()
+    git_diff_dir, git_diff_name = [unix_path(p) for p in os.path.split(git_diff_path)]
+    return send_from_directory(git_diff_dir, git_diff_name, as_attachment=True)
+
+@app.route('/retrieve_changed_binary_paths/<appname>')
+def send_changed_binary_paths(appname:str):
+    changed_file_paths = [path for path in get_changed_file_paths() if path]
+    changed_binary_paths = [path for path in changed_file_paths if not is_plaintext(path.split('/')[-1])]
+    paths_str = '\n'.join(changed_binary_paths)
+    return paths_str
+
+
+#note that <path:path> is NOT representing <variablename:variablename>. The full syntax for route variables is <converter:name>
+#so it is just a coincidence that the thing I'm trying to pass here as a variable in the url IS literally a path, which happens to be
+#the same as the name of the converter we need to use: "path".  The path converter makes it so that we can pass nested paths here, instead
+#of paths getting cut off once they reach the first '/' (the first path delimiter)
+@app.route('/retrieve_binary_file/<appname>/<path:path>')
+def send_binary_file(appname:str, path:str):
+    path = get_safe_project_path(path)
+    if not os.path.exists(path):
+        filename = os.path.split(path)[-1]
+        return f'Invalid path/requested file: {filename} does not exist'
+    elif not os.path.isfile(path):
+        filename = os.path.split(path)[-1]
+        if os.path.isdir(path):
+            return f'Path: {path} exists, but is a directory.  Only individual binary files can be requested via this route'
+        else:
+            return f'Path: {path} exists, but is somehow neither a regular file or directory.  You did something really crazy.'
+
+    return send_file(path, as_attachment=True)
 
 
 @app.route('/sendchanges/<appname>', methods=['POST'])
