@@ -2,6 +2,14 @@ import sys, os, socket, requests, json, urllib
 from requests import Response
 from mcp_utils import *
 
+def configure_stdio():
+    """Ensure redirected output can represent UTF-8 build logs on Windows."""
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    if hasattr(sys.stderr, 'reconfigure'):
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
+
 def get_jobid_from_resp(resp:Response):
     return json.loads(resp.text)['job_id']
 
@@ -40,7 +48,7 @@ def wait_for_build_completion(server_addr:tuple[str, int], job_id:str, offset=0)
             new_bytes = s.recv(chunk_size)
             if not new_bytes:
                 break
-            new_text = new_bytes.decode('utf-8')
+            new_text = new_bytes.decode('utf-8', errors='replace')
             print(new_text, end='')
             full_text += new_text
 
@@ -171,6 +179,7 @@ def sync_changes_with_server(server_addr:tuple[str, int]) -> bool:
 
 
 if __name__ == '__main__':
+    configure_stdio()
 
     cwd = unix_path(os.getcwd())
     server_ip, server_port = '192.168.7.189', get_server_port() 
