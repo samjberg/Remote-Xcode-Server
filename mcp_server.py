@@ -1,8 +1,7 @@
 import os, subprocess, socket
-from flask import Flask, request, jsonify, Request, Response
+from flask import Flask, request, send_file, send_from_directory, jsonify, Request, Response
 from threading import Thread
 from werkzeug.utils import secure_filename
-from uuid import uuid4
 from mcp_utils import *
 # from requests import Request
 
@@ -10,7 +9,7 @@ from mcp_utils import *
 
 cwd = unix_path(os.getcwd())
 project_name = get_project_name()
-server_dir_name = 'uploads'
+server_dir_name = get_runtime_dir_name()
 server_dir_path = os.path.join(cwd, server_dir_name)
 project_info_filename = 'projectinfo.txt'
 project_info_filepath = os.path.join(server_dir_path, project_info_filename)
@@ -42,7 +41,7 @@ if project_info_filename not in os.listdir(server_dir_path): #this means this is
 
 
 
-UPLOAD_FOLDER = unix_path(os.path.join(cwd, 'uploads'))
+UPLOAD_FOLDER = unix_path(os.path.join(cwd, server_dir_name))
 JOBS = {}
 app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
@@ -112,11 +111,160 @@ def run_xcodebuild(job_id):
 
 
 
+@app.route('/retrieve_text_changes/<appname>')
+def send_changes(appname:str):
+    git_diff_path, changed_binary_paths = prepare_text_changes()
+    git_diff_dir, git_diff_name = [unix_path(p) for p in os.path.split(git_diff_path)]
+    return send_from_directory(git_diff_dir, git_diff_name, as_attachment=True)
+
+@app.route('/retrieve_changed_binary_paths/<appname>')
+def send_changed_binary_paths(appname:str):
+    changed_file_paths = [path for path in get_changed_file_paths() if path]
+    changed_binary_paths = [path for path in changed_file_paths if not is_plaintext(path.split('/')[-1])]
+    paths_str = '\n'.join(changed_binary_paths)
+    return paths_str
+
+@app.route('/retrieve_diff_for_files/<appname>', methods=['POST'])
+def send_diff_for_files(appname:str):
+    try:
+        paths = request.json['filepaths']
+    except KeyError as e:
+        print(f'Error: key filepaths not found in request json.  err: {e}')
+
+    git_diff_path = get_diff_for_files(paths)
+    diffs_path, git_diff_name = os.path.split(git_diff_path)
+    return send_from_directory(diffs_path, git_diff_name)
+
+
+@app.route('/retrieve_current_commit_hash/<appname>')
+def send_current_commit_hash(appname:str):
+    current_commit_hash = get_current_commit_hash()
+    return current_commit_hash
+
+
+@app.route('/retrieve_git_branches/<appname>/<sort_order>')
+def send_git_branches(appname:str, sort_order:str):
+    git_branches, current_branch = get_git_branches(appname, return_current_branch=True, sort_order=sort_order)
+    return jsonify({'branches': git_branches, 'current_branch': current_branch})
+
+
+@app.route('/git_state/<appname>')
+def send_git_state(appname:str):
+    try:
+        state = get_git_state(get_project_root_path())
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    return jsonify(state)
+
+
+@app.route('/git_action/<appname>', methods=['POST'])
+def run_git_action(appname:str):
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({'success': False, 'error': 'Expected JSON object payload'}), 400
+
+    allowed_payload_keys = {'action', 'args'}
+    unknown_payload_keys = set(payload.keys()) - allowed_payload_keys
+    if unknown_payload_keys:
+        return jsonify({
+            'success': False,
+            'error': f'Unknown top-level payload keys: {sorted(unknown_payload_keys)}',
+        }), 400
+
+    action = payload.get('action', '')
+    if not isinstance(action, str) or not action:
+        return jsonify({'success': False, 'error': 'Field "action" is required and must be a string'}), 400
+
+    action_args = payload.get('args', {})
+    if action_args is None:
+        action_args = {}
+    if not isinstance(action_args, dict):
+        return jsonify({'success': False, 'error': 'Field "args" must be an object if provided'}), 400
+
+    result = execute_git_action(action, action_args, cwd=get_project_root_path())
+    if 'command' not in result and not result.get('success', False):
+        return jsonify(result), 400
+    return jsonify(result)
 
 
 
+#note that <path:path> is NOT representing <variablename:variablename>. The full syntax for route variables is <converter:name>
+#so it is just a coincidence that the thing I'm trying to pass here as a variable in the url IS literally a path, which happens to be
+#the same as the name of the converter we need to use: "path".  The path converter makes it so that we can pass nested paths here, instead
+#of paths getting cut off once they reach the first '/' (the first path delimiter)
+@app.route('/retrieve_binary_file/<appname>/<path:path>')
+def send_binary_file(appname:str, path:str):
+    path = get_safe_project_path(path)
+    if not os.path.exists(path):
+        filename = os.path.split(path)[-1]
+        return f'Invalid path/requested file: {filename} does not exist'
+    elif not os.path.isfile(path):
+        filename = os.path.split(path)[-1]
+        if os.path.isdir(path):
+            return f'Path: {path} exists, but is a directory.  Only individual binary files can be requested via this route'
+        else:
+            return f'Path: {path} exists, but is somehow neither a regular file or directory.  You did something really crazy.'
+
+    return send_file(path, as_attachment=True)
 
 
+@app.route('/sendchanges/<appname>', methods=['POST'])
+def receieve_changes(appname):
+    if 'gitdiff' not in request.files:
+        print('No diff received')
+        return 'No diff received'
+
+    file = request.files['gitdiff']
+    print(f'file: {file}')
+    print(f'file.filename: {file.filename}')
+    print(f'file.name: {file.name}')
+    if file == '':
+        print('empty filename')
+        return 'empty filename'
+
+    print(f'request.files: {request.files}')
+
+    #there are are additional file(s) besides the diff.  This means the client sent binary files
+    #we need to save these files to their paths (path is the first item of the tuple)
+    # for i in range(1, len(request.files.keys())):
+    for file_key in request.files.keys():
+        if file_key == 'gitdiff':
+            continue
+        binary_file = request.files[file_key]
+        #I know this seems wrong.  But FileStorage.filename always returns the FIRST ITEM (0 index) in the tuple that was 
+        #used as the value in the files dict sent by the requests library (from the client).  And for the binary files, I am
+        #passing the path in the 0th index instead of the filename, because I need to save the files in the same relative locations
+        rel_path = unix_path(binary_file.filename)
+        binary_file_name = rel_path.split('/')[-1]
+        path = get_safe_project_path(rel_path)
+        parent_dir = os.path.dirname(path)
+        if parent_dir and not os.path.exists(parent_dir):
+            os.makedirs(parent_dir, exist_ok=True)
+        if os.path.exists(path):
+            if os.path.isfile(path):
+                #If the path exists and IS a a file, simply remove it, since FileStorage.save does not overwrite files apparently
+                os.remove(path)
+            else:
+                print(f'Path given for changed or added binary file {binary_file_name}: {path}, already exists as a directory')
+                print("Honestly, that's just really strange.  Idk")
+
+        binary_file.save(path)
+
+    if file and allowed_filename(file.filename):
+        #create a secure version of the filename
+        filename = secure_filename(file.filename)
+        #save the file with the secure filename in UPLOAD_FOLDER
+        file.save(os.path.join(app.config["UPLOAD_FOLDER"], filename))
+
+        patch_path = f'{app.config["UPLOAD_FOLDER"]}/{filename}'
+        if os.path.getsize(patch_path) > 0:
+            git_apply_command = f'git apply {patch_path}'
+            #run the git apply command
+            os.system(git_apply_command)
+    else:
+        return f"Disallowed filename or file does not exist"
+
+    return "Some other method besides POST or GET was used.  Don't do that"
 
 
 
@@ -174,9 +322,10 @@ def start_build_job(appname):
             file.save(os.path.join(app.config["UPLOAD_FOLDER"], filename))
 
             patch_path = f'{app.config["UPLOAD_FOLDER"]}/{filename}'
-            git_apply_command = f'git apply {patch_path}'
-            #run the git apply command
-            os.system(git_apply_command)
+            if os.path.getsize(patch_path) > 0:
+                git_apply_command = f'git apply {patch_path}'
+                #run the git apply command
+                os.system(git_apply_command)
 
 
             job_id = str(uuid4())
@@ -199,6 +348,15 @@ def start_build_job(appname):
     else:
         return "Some other method besides POST or GET was used.  Don't do that"
         
+
+@app.route('/retrieve_changed_file_paths/<appname>/<scope>')
+def send_changed_file_paths(appname:str, scope:str) -> Response:
+    changed_file_paths = get_changed_file_paths(scope)
+    changed_plaintext_paths = [path for path in changed_file_paths if is_plaintext(path)]
+    changed_binary_paths = [path for path in changed_file_paths if path not in changed_plaintext_paths]
+    obj = {'plaintext_file_paths': changed_plaintext_paths, 'binary_file_paths': changed_binary_paths}
+    return jsonify(obj)
+
 
 
 @app.route('/checkprogress/<job_id>/<offset>')
