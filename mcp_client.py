@@ -292,6 +292,36 @@ def _run_local_git_action(action:str, args:dict|None=None) -> dict:
     return execute_git_action(action, args=args, cwd=get_project_root_path())
 
 
+def _format_action_failure(action_label:str, result:dict|None) -> str:
+    if result is None:
+        return f'Failed action {action_label}: no response returned.'
+
+    stderr_text = str(result.get('stderr', '')).strip()
+    stdout_text = str(result.get('stdout', '')).strip()
+    error_text = str(result.get('error', '')).strip()
+    returncode = result.get('returncode', None)
+
+    detail = stderr_text or stdout_text or error_text
+    if detail:
+        if returncode is not None:
+            return f'Failed action {action_label} (returncode={returncode}): {detail}'
+        return f'Failed action {action_label}: {detail}'
+
+    if returncode is not None:
+        return f'Failed action {action_label} (returncode={returncode}).'
+    return f'Failed action {action_label}.'
+
+
+def _is_gitignore_overwrite_conflict(result:dict|None) -> bool:
+    if result is None:
+        return False
+    stderr_text = str(result.get('stderr', '')).lower()
+    stdout_text = str(result.get('stdout', '')).lower()
+    error_text = str(result.get('error', '')).lower()
+    combined = f'{stderr_text}\n{stdout_text}\n{error_text}'
+    return '.gitignore' in combined and 'would be overwritten by checkout' in combined
+
+
 def compute_reconcile_decision(local_state:dict, server_state:dict) -> dict:
     local_head = local_state.get('head', '')
     server_head = server_state.get('head', '')
@@ -451,14 +481,51 @@ def apply_reconcile_actions(server_addr:tuple[str, int], decision:dict) -> dict:
 
     first_result = run_side_action(non_authoritative_side, first_action, first_args)
     if not first_result or not first_result.get('success', False):
-        return _reconcile_result(
-            RECONCILE_STATUS_ERROR,
-            authority_side=authority_side,
-            target_branch=target_branch,
-            target_commit=target_commit,
-            actions_applied=actions_applied,
-            message=f'Failed action {non_authoritative_side}:{first_action}',
-        )
+        if first_action == 'checkout_branch_at_commit' and _is_gitignore_overwrite_conflict(first_result):
+            backup_result = run_side_action(non_authoritative_side, 'backup_remove_gitignore', {})
+            if backup_result and backup_result.get('success', False):
+                retry_result = run_side_action(non_authoritative_side, first_action, first_args)
+                if retry_result and retry_result.get('success', False):
+                    target_side_state = read_side_state(non_authoritative_side)
+                    if target_side_state is None:
+                        return _reconcile_result(
+                            RECONCILE_STATUS_ERROR,
+                            authority_side=authority_side,
+                            target_branch=target_branch,
+                            target_commit=target_commit,
+                            actions_applied=actions_applied,
+                            message=f'Failed to read {non_authoritative_side} git state after retry checkout step.',
+                        )
+                else:
+                    action_label = f'{non_authoritative_side}:{first_action}'
+                    return _reconcile_result(
+                        RECONCILE_STATUS_ERROR,
+                        authority_side=authority_side,
+                        target_branch=target_branch,
+                        target_commit=target_commit,
+                        actions_applied=actions_applied,
+                        message=_format_action_failure(action_label, retry_result),
+                    )
+            else:
+                backup_label = f'{non_authoritative_side}:backup_remove_gitignore'
+                return _reconcile_result(
+                    RECONCILE_STATUS_ERROR,
+                    authority_side=authority_side,
+                    target_branch=target_branch,
+                    target_commit=target_commit,
+                    actions_applied=actions_applied,
+                    message=_format_action_failure(backup_label, backup_result),
+                )
+        else:
+            action_label = f'{non_authoritative_side}:{first_action}'
+            return _reconcile_result(
+                RECONCILE_STATUS_ERROR,
+                authority_side=authority_side,
+                target_branch=target_branch,
+                target_commit=target_commit,
+                actions_applied=actions_applied,
+                message=_format_action_failure(action_label, first_result),
+            )
 
     target_side_state = read_side_state(non_authoritative_side)
     if target_side_state is None:
@@ -474,13 +541,14 @@ def apply_reconcile_actions(server_addr:tuple[str, int], decision:dict) -> dict:
     if target_side_state.get('head', '') != target_commit:
         ff_result = run_side_action(non_authoritative_side, 'ff_only_to_commit', {'commit': target_commit})
         if not ff_result or not ff_result.get('success', False):
+            action_label = f'{non_authoritative_side}:ff_only_to_commit'
             return _reconcile_result(
                 RECONCILE_STATUS_ERROR,
                 authority_side=authority_side,
                 target_branch=target_branch,
                 target_commit=target_commit,
                 actions_applied=actions_applied,
-                message=f'Failed action {non_authoritative_side}:ff_only_to_commit',
+                message=_format_action_failure(action_label, ff_result),
             )
 
     return _reconcile_result(
@@ -682,9 +750,50 @@ def reconcile_git_state(server_addr:tuple[str, int], app_name:str='') -> dict:
     )
 
 
+def retrieve_diff_for_files(server_addr:tuple[str, int], paths:list[str]) -> str:
+    ip, port = server_addr
+    app_name:str = get_appname()
+    url = f'http://{ip}:{port}/retrieve_diff_for_files/{app_name}'
+    try:
+        resp:Response = requests.post(url, json={'filepaths': paths})
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        print(f'Failed to retrieve diff for specified files: {','.join(paths)[1:]}')
+        return []
+
+    runtime_dir_path = get_runtime_dir_path()
+    git_diff_name = 'specific_files_gitdiff'
+    git_diff_path = os.path.join(runtime_dir_path, git_diff_name)
+
+    with open(git_diff_path, 'wb') as diff_file:
+        KB = 1024
+        diff_size = len(resp.content)
+        #if diff is over 0.5MB
+        if diff_size > 512 * KB:
+            chunk_size = 32 * KB
+            i = 0
+            while i < diff_size:
+                chunk = resp.content[i:i+chunk_size]
+                diff_file.write(chunk)
+                i += chunk_size
+        else: #diff_size is less than 0.5MB, just write it all in one go
+            diff_file.write(resp.content)
+
+    return git_diff_path
+
+
+
+
+    
+
+
+
+
 def sync_changes_with_server(server_addr:tuple[str, int], sync_branches=False, scope='repo') -> bool:
     ip, port = server_addr
     app_name = get_appname()
+
+    ########################### Reconcile actual git state (commit/branch) between client and server ###########################
     reconcile_result = reconcile_git_state(server_addr, app_name=app_name)
     reconcile_status = reconcile_result.get('status', RECONCILE_STATUS_ERROR)
     if reconcile_status not in [RECONCILE_STATUS_ALIGNED, RECONCILE_STATUS_RECONCILED]:
@@ -693,8 +802,9 @@ def sync_changes_with_server(server_addr:tuple[str, int], sync_branches=False, s
         if reconcile_result.get('actions_applied'):
             print(f"Actions applied before stop: {', '.join(reconcile_result['actions_applied'])}")
         return False
+    ############################################################################################################################  
 
-
+    ################################################# Sync uncommitted changes #################################################
     url = f'http://{ip}:{port}/retrieve_changed_file_paths/{app_name}/{scope}'
     changed_fpaths_client = get_changed_file_paths(scope)
     changed_plainpaths_client, changed_binarypaths_client = split_paths_by_text_or_binary(changed_fpaths_client)
@@ -725,6 +835,10 @@ def sync_changes_with_server(server_addr:tuple[str, int], sync_branches=False, s
     shared_plaintext_paths = [path for path in changed_plainpaths_client if path in changed_plainpaths_server]
     shared_binary_paths = [path for path in changed_binarypaths_client if path in changed_binarypaths_server]
 
+    #if there are any plaintext files only on the server
+    if server_only_plaintext_paths:
+        pass
+        # retrieve_diff_for_files()
 
 
 

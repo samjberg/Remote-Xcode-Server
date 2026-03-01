@@ -2,7 +2,6 @@ import os, subprocess, socket
 from flask import Flask, request, send_file, send_from_directory, jsonify, Request, Response
 from threading import Thread
 from werkzeug.utils import secure_filename
-from uuid import uuid4
 from mcp_utils import *
 # from requests import Request
 
@@ -125,6 +124,16 @@ def send_changed_binary_paths(appname:str):
     paths_str = '\n'.join(changed_binary_paths)
     return paths_str
 
+@app.route('/retrieve_diff_for_files/<appname>', methods=['POST'])
+def send_diff_for_files(appname:str):
+    try:
+        paths = request.json['filepaths']
+    except KeyError as e:
+        print(f'Error: key filepaths not found in request json.  err: {e}')
+
+    git_diff_path = get_diff_for_files(paths)
+    diffs_path, git_diff_name = os.path.split(git_diff_path)
+    return send_from_directory(diffs_path, git_diff_name)
 
 
 @app.route('/retrieve_current_commit_hash/<appname>')

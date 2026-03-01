@@ -1,6 +1,7 @@
-import os, sys, pathlib, socket, subprocess, shlex, datetime
+import os, sys, pathlib, socket, subprocess, shlex, datetime, shutil
 from typing import Callable, BinaryIO, ParamSpec, TypeVar
 from mimetypes import guess_type
+from uuid import uuid4
 
 #who even knows what these two lines are.  But they are necessary to enable typehinting for functions (i.e. run_process)
 #that use the decorator @handle_process_errors
@@ -380,6 +381,7 @@ def execute_git_action(action:str, args:dict|None=None, cwd:str|None=None) -> di
         'ff_only_to_commit': {'commit'},
         'has_commit': {'commit'},
         'ahead_behind': {'left', 'right'},
+        'backup_remove_gitignore': set(),
     }
 
     if action not in allowed_arg_keys:
@@ -396,6 +398,46 @@ def execute_git_action(action:str, args:dict|None=None, cwd:str|None=None) -> di
             'success': False,
             'action': action,
             'error': f'Invalid args for {action}. Required keys: {sorted(required_keys)}, supplied: {sorted(supplied_keys)}',
+        }
+
+    if action == 'backup_remove_gitignore':
+        gitignore_path = os.path.join(cwd, '.gitignore')
+        runtime_dir_path = get_runtime_dir_path(cwd)
+        os.makedirs(runtime_dir_path, exist_ok=True)
+
+        if not os.path.exists(gitignore_path):
+            return {
+                'success': True,
+                'action': action,
+                'command': ['file-op', 'backup_remove_gitignore'],
+                'returncode': 0,
+                'stdout': '.gitignore not found; nothing to remove.',
+                'stderr': '',
+                'removed': False,
+                'backup_path': '',
+            }
+
+        timestamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+        backup_filename = f'gitignore-backup-{timestamp}.gitignore'
+        backup_path = os.path.join(runtime_dir_path, backup_filename)
+        counter = 1
+        while os.path.exists(backup_path):
+            backup_filename = f'gitignore-backup-{timestamp}-{counter}.gitignore'
+            backup_path = os.path.join(runtime_dir_path, backup_filename)
+            counter += 1
+
+        shutil.copy2(gitignore_path, backup_path)
+        os.remove(gitignore_path)
+
+        return {
+            'success': True,
+            'action': action,
+            'command': ['file-op', 'backup_remove_gitignore'],
+            'returncode': 0,
+            'stdout': f'Backed up and removed .gitignore: {unix_path(backup_path)}',
+            'stderr': '',
+            'removed': True,
+            'backup_path': unix_path(backup_path),
         }
 
     if action == 'fetch_origin':
@@ -526,6 +568,24 @@ def get_changed_file_paths(scope='repo') -> list[str]:
 
     return file_paths
 
+def get_diff_for_files(paths:list[str]) -> str:
+    cwd = unix_path(os.getcwd())
+    runtime_dir_path = get_runtime_dir_path(cwd)
+    diff_filename = f'specific_files_gitdiff.diff'
+    git_diff_path = os.path.join(runtime_dir_path, diff_filename)
+    if os.path.exists(git_diff_path): #my brain would actually explode if this returned true lmao
+        os.remove(git_diff_path)
+
+    if not paths:
+        #create the file anyway, just put a newline.  It should be read and parsed as having no diff output, which is correct
+        with open(git_diff_path, 'w') as diff_file:
+            diff_file.write('\n')
+        return git_diff_path
+    
+    os.system('git add .')
+    with open(git_diff_path, 'w') as diff_file:
+        run_process(['git', 'diff', 'HEAD', '--', *paths], stdout=diff_file, stderr=subprocess.STDOUT, cwd=cwd)
+    return git_diff_path
 
 
 
@@ -549,42 +609,3 @@ def prepare_text_changes() -> tuple[str, list[str]]:
             subprocess.run(['git', 'diff', 'HEAD', '--', *changed_text_paths], stdout=diff_file)
 
     return git_diff_path, changed_binary_paths
-
-
-def send_bytes(b:bytes, conn:socket.socket, chunk_size:int=4096, start_pos=0):
-    msg_size = len(b) - start_pos
-    if msg_size <= chunk_size:
-        conn.sendall(b[start_pos:])
-    else: #b is a bytestring longer than chunk_size
-        pos = min(start_pos, msg_size-1)
-        while pos < msg_size:
-            pos += conn.send(b[pos:pos+chunk_size])
-        
-
-
-def send_file_contents(f:BinaryIO, conn:socket.socket, chunk_size:int=4096):
-    while True:
-        chunk = f.read(chunk_size)
-        if not chunk:
-            break
-        conn.sendall(chunk)
-
-
-
-def recv_file_contents(s:socket.socket, chunk_size:int=4096, dest_file=None, print_output=True):
-    while True:
-        new_bytes = s.recv(chunk_size)
-        if not new_bytes:
-            break
-        new_text = new_bytes.decode('utf-8')
-        if print_output:
-            print(new_text)
-        if dest_file:
-            pass
-
-        
-
-
-
-
-
