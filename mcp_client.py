@@ -163,14 +163,590 @@ def retrieve_current_changes(server_addr:tuple[str, int], save_changes=True, sav
     
     return ran_successfully #the idea is just to return True/False based on whether everything runs successfully or not, but I haven't really implemented that yet
 
+def get_current_server_commit_hash(server_addr:tuple[str, int], app_name:str='') -> str|None:
+    ip, port = server_addr
+    if app_name == '':
+        app_name = get_appname()
+
+    url = f'http://{ip}:{port}/retrieve_current_commit_hash/{app_name}'
+
+    try:
+        resp:Response = requests.get(url)
+    except requests.RequestException as e:
+        print(f"Failed to retrieve server's current commit hash")
+        return None
+    
+    if not resp.text:
+        print(f"Received empty string as server's current commit hash")
+        return None
+
+    commit_hash = resp.text.strip()
+    return commit_hash
+
+
+def retrieve_git_branches_from_server(server_addr:tuple[str, int], app_name:str='', sort_order:str='creatordate') -> list[str] | tuple[list[str], str]:
+    ip, port = server_addr
+    valid_sort_orders = ['creatordate', 'committerdate', 'taggerdate', 'authordate']
+    if not sort_order in valid_sort_orders:
+        sort_order = valid_sort_orders[0]
+    url = f'http://{ip}:{port}/retrieve_git_branches/{app_name}/{sort_order}'
+    try:
+        resp = requests.get(url)
+    except requests.RequestException as e:
+        print("Failed to retrieve server's local git branches")
+        return []
+    
+    if not resp.text:
+        print(f"Recieved an empty string as server's git branches.  Something almost certainly went wrong")
+        return []
+
+    resp_obj = json.loads(resp.text)
+    server_branches = resp_obj['branches']
+    server_current_branch = resp_obj['current_branch']
+    return server_branches, server_current_branch
+
+
+RECONCILE_STATUS_ALIGNED = 'ALIGNED'
+RECONCILE_STATUS_RECONCILED = 'RECONCILED'
+RECONCILE_STATUS_BLOCKED_DIRTY_WORKTREE = 'BLOCKED_DIRTY_WORKTREE'
+RECONCILE_STATUS_BLOCKED_MISSING_COMMIT_OBJECT = 'BLOCKED_MISSING_COMMIT_OBJECT'
+RECONCILE_STATUS_BLOCKED_DIVERGED_HISTORY = 'BLOCKED_DIVERGED_HISTORY'
+RECONCILE_STATUS_BLOCKED_DETACHED_HEAD = 'BLOCKED_DETACHED_HEAD'
+RECONCILE_STATUS_BLOCKED_NO_ORIGIN = 'BLOCKED_NO_ORIGIN'
+RECONCILE_STATUS_ERROR = 'ERROR'
+RECONCILE_STATUS_NEEDS_ACTION = 'NEEDS_ACTION'
+
+
+def _reconcile_result(
+    status:str,
+    authority_side:str='none',
+    target_branch:str='',
+    target_commit:str='',
+    actions_applied:list[str]|None=None,
+    message:str='',
+) -> dict:
+    '''A helper function that returns the arguments passed in as a dict, sanitizing [actions_applied] to [] if it is None'''
+    if actions_applied is None:
+        actions_applied = []
+    return {
+        'status': status,
+        'authority_side': authority_side,
+        'target_branch': target_branch,
+        'target_commit': target_commit,
+        'actions_applied': actions_applied,
+        'message': message,
+    }
+
+
+def get_local_git_state() -> dict:
+    project_root = get_project_root_path()
+    return get_git_state(project_root)
+
+
+def get_server_git_state(server_addr:tuple[str, int], app_name:str='') -> dict|None:
+    ip, port = server_addr
+    if not app_name:
+        app_name = get_appname()
+
+    url = f'http://{ip}:{port}/git_state/{app_name}'
+    try:
+        resp:Response = requests.get(url)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        print(f'Failed to retrieve server git state: {e}')
+        return None
+
+    try:
+        obj = resp.json()
+    except ValueError:
+        print('Server git state response was not valid JSON')
+        return None
+
+    return obj
+
+
+def _post_server_git_action(server_addr:tuple[str, int], action:str, args:dict|None=None, app_name:str='') -> dict|None:
+    ip, port = server_addr
+    if not app_name:
+        app_name = get_appname()
+    if args is None:
+        args = {}
+
+    url = f'http://{ip}:{port}/git_action/{app_name}'
+    payload = {'action': action, 'args': args}
+    try:
+        resp:Response = requests.post(url, json=payload)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        print(f'Failed to run server git action {action}: {e}')
+        return None
+
+    try:
+        return resp.json()
+    except ValueError:
+        print(f'Server git action response was not valid JSON for action: {action}')
+        return None
+
+
+def _run_local_git_action(action:str, args:dict|None=None) -> dict:
+    return execute_git_action(action, args=args, cwd=get_project_root_path())
+
+
+def compute_reconcile_decision(local_state:dict, server_state:dict) -> dict:
+    local_head = local_state.get('head', '')
+    server_head = server_state.get('head', '')
+    local_branch = local_state.get('current_branch', '')
+    server_branch = server_state.get('current_branch', '')
+
+    if local_head == server_head and local_branch == server_branch:
+        return _reconcile_result(
+            RECONCILE_STATUS_ALIGNED,
+            authority_side='none',
+            target_branch=local_branch,
+            target_commit=local_head,
+            message='Client and server are already on the same branch and commit.',
+        )
+
+    if local_head == server_head and local_branch != server_branch:
+        if local_state.get('is_detached', False):
+            return _reconcile_result(
+                RECONCILE_STATUS_BLOCKED_DETACHED_HEAD,
+                authority_side='client',
+                target_branch='',
+                target_commit=local_head,
+                message='Client is detached; cannot use detached HEAD as authoritative branch target.',
+            )
+        return _reconcile_result(
+            RECONCILE_STATUS_NEEDS_ACTION,
+            authority_side='client',
+            target_branch=local_branch,
+            target_commit=local_head,
+            message='Commits match but branches differ; client branch is authoritative.',
+        )
+
+    ahead_behind = git_ahead_behind(local_head, server_head, cwd=get_project_root_path())
+    if ahead_behind is None:
+        return _reconcile_result(
+            RECONCILE_STATUS_ERROR,
+            authority_side='none',
+            message='Failed to compute ahead/behind relationship between client and server commits.',
+        )
+
+    client_ahead, server_ahead = ahead_behind
+    if client_ahead > 0 and server_ahead > 0:
+        return _reconcile_result(
+            RECONCILE_STATUS_BLOCKED_DIVERGED_HISTORY,
+            authority_side='none',
+            message='Client and server histories have diverged and require manual merge/rebase.',
+        )
+
+    if client_ahead > 0 and server_ahead == 0:
+        if local_state.get('is_detached', False):
+            return _reconcile_result(
+                RECONCILE_STATUS_BLOCKED_DETACHED_HEAD,
+                authority_side='client',
+                target_branch='',
+                target_commit=local_head,
+                message='Client is ahead but detached; cannot reconcile to detached authoritative HEAD.',
+            )
+        return _reconcile_result(
+            RECONCILE_STATUS_NEEDS_ACTION,
+            authority_side='client',
+            target_branch=local_branch,
+            target_commit=local_head,
+            message='Client is strictly ahead and is the authoritative target.',
+        )
+
+    if server_ahead > 0 and client_ahead == 0:
+        if server_state.get('is_detached', False):
+            return _reconcile_result(
+                RECONCILE_STATUS_BLOCKED_DETACHED_HEAD,
+                authority_side='server',
+                target_branch='',
+                target_commit=server_head,
+                message='Server is ahead but detached; cannot reconcile to detached authoritative HEAD.',
+            )
+        return _reconcile_result(
+            RECONCILE_STATUS_NEEDS_ACTION,
+            authority_side='server',
+            target_branch=server_branch,
+            target_commit=server_head,
+            message='Server is strictly ahead and is the authoritative target.',
+        )
+
+    # If ahead/behind reports equal commits, default to client branch authority.
+    if local_state.get('is_detached', False):
+        return _reconcile_result(
+            RECONCILE_STATUS_BLOCKED_DETACHED_HEAD,
+            authority_side='client',
+            target_branch='',
+            target_commit=local_head,
+            message='Client is detached; cannot use detached HEAD as authoritative branch target.',
+        )
+    return _reconcile_result(
+        RECONCILE_STATUS_NEEDS_ACTION,
+        authority_side='client',
+        target_branch=local_branch,
+        target_commit=local_head,
+        message='Commits are equivalent; client branch is authoritative.',
+    )
+
+
+def apply_reconcile_actions(server_addr:tuple[str, int], decision:dict) -> dict:
+    if decision.get('status') != RECONCILE_STATUS_NEEDS_ACTION:
+        return decision
+
+    app_name = get_appname()
+    authority_side = decision.get('authority_side', 'none')
+    target_branch = decision.get('target_branch', '')
+    target_commit = decision.get('target_commit', '')
+    actions_applied = list(decision.get('actions_applied', []))
+
+    if authority_side not in ['client', 'server']:
+        return _reconcile_result(
+            RECONCILE_STATUS_ERROR,
+            authority_side='none',
+            target_branch=target_branch,
+            target_commit=target_commit,
+            actions_applied=actions_applied,
+            message=f'Invalid authority side in decision: {authority_side}',
+        )
+
+    non_authoritative_side = 'server' if authority_side == 'client' else 'client'
+
+    def read_side_state(side:str) -> dict|None:
+        if side == 'client':
+            try:
+                return get_local_git_state()
+            except Exception as e:
+                print(f'Failed to read local git state: {e}')
+                return None
+        return get_server_git_state(server_addr, app_name)
+
+    def run_side_action(side:str, action:str, args:dict) -> dict|None:
+        if side == 'client':
+            result = _run_local_git_action(action, args)
+        else:
+            result = _post_server_git_action(server_addr, action, args=args, app_name=app_name)
+        actions_applied.append(f'{side}:{action}')
+        return result
+
+    target_side_state = read_side_state(non_authoritative_side)
+    if target_side_state is None:
+        return _reconcile_result(
+            RECONCILE_STATUS_ERROR,
+            authority_side=authority_side,
+            target_branch=target_branch,
+            target_commit=target_commit,
+            actions_applied=actions_applied,
+            message=f'Failed to read {non_authoritative_side} git state before applying reconcile actions.',
+        )
+
+    if target_branch in target_side_state.get('branches', []):
+        first_action = 'checkout_branch'
+        first_args = {'branch': target_branch}
+    else:
+        first_action = 'checkout_branch_at_commit'
+        first_args = {'branch': target_branch, 'commit': target_commit}
+
+    first_result = run_side_action(non_authoritative_side, first_action, first_args)
+    if not first_result or not first_result.get('success', False):
+        return _reconcile_result(
+            RECONCILE_STATUS_ERROR,
+            authority_side=authority_side,
+            target_branch=target_branch,
+            target_commit=target_commit,
+            actions_applied=actions_applied,
+            message=f'Failed action {non_authoritative_side}:{first_action}',
+        )
+
+    target_side_state = read_side_state(non_authoritative_side)
+    if target_side_state is None:
+        return _reconcile_result(
+            RECONCILE_STATUS_ERROR,
+            authority_side=authority_side,
+            target_branch=target_branch,
+            target_commit=target_commit,
+            actions_applied=actions_applied,
+            message=f'Failed to read {non_authoritative_side} git state after checkout step.',
+        )
+
+    if target_side_state.get('head', '') != target_commit:
+        ff_result = run_side_action(non_authoritative_side, 'ff_only_to_commit', {'commit': target_commit})
+        if not ff_result or not ff_result.get('success', False):
+            return _reconcile_result(
+                RECONCILE_STATUS_ERROR,
+                authority_side=authority_side,
+                target_branch=target_branch,
+                target_commit=target_commit,
+                actions_applied=actions_applied,
+                message=f'Failed action {non_authoritative_side}:ff_only_to_commit',
+            )
+
+    return _reconcile_result(
+        RECONCILE_STATUS_NEEDS_ACTION,
+        authority_side=authority_side,
+        target_branch=target_branch,
+        target_commit=target_commit,
+        actions_applied=actions_applied,
+        message=decision.get('message', ''),
+    )
+
+
+def reconcile_git_state(server_addr:tuple[str, int], app_name:str='') -> dict:
+    if not app_name:
+        app_name = get_appname()
+    actions_applied:list[str] = []
+
+    try:
+        local_state = get_local_git_state()
+    except Exception as e:
+        return _reconcile_result(RECONCILE_STATUS_ERROR, message=f'Failed to read local git state: {e}')
+
+    server_state = get_server_git_state(server_addr, app_name)
+    if server_state is None:
+        return _reconcile_result(RECONCILE_STATUS_ERROR, message='Failed to retrieve server git state.')
+
+    local_head = local_state.get('head', '')
+    server_head = server_state.get('head', '')
+    local_branch = local_state.get('current_branch', '')
+    server_branch = server_state.get('current_branch', '')
+
+    if local_head == server_head and local_branch == server_branch:
+        return _reconcile_result(
+            RECONCILE_STATUS_ALIGNED,
+            authority_side='none',
+            target_branch=local_branch,
+            target_commit=local_head,
+            actions_applied=actions_applied,
+            message='Client and server are already aligned.',
+        )
+
+    needs_git_change = local_head != server_head or local_branch != server_branch
+    if needs_git_change and (local_state.get('dirty_tracked', False) or server_state.get('dirty_tracked', False)):
+        return _reconcile_result(
+            RECONCILE_STATUS_BLOCKED_DIRTY_WORKTREE,
+            authority_side='none',
+            target_branch='',
+            target_commit='',
+            actions_applied=actions_applied,
+            message='Tracked uncommitted changes detected; reconcile requires a clean tracked worktree on both sides.',
+        )
+
+    local_has_server_head = git_has_commit(server_head, cwd=get_project_root_path())
+    server_has_local_result = _post_server_git_action(
+        server_addr,
+        'has_commit',
+        args={'commit': local_head},
+        app_name=app_name,
+    )
+    if server_has_local_result is None:
+        return _reconcile_result(
+            RECONCILE_STATUS_ERROR,
+            actions_applied=actions_applied,
+            message='Failed while checking whether server can resolve client HEAD commit.',
+        )
+    server_has_local_head = bool(server_has_local_result.get('has_commit', False))
+
+    if not local_has_server_head:
+        if not local_state.get('has_origin', False):
+            return _reconcile_result(
+                RECONCILE_STATUS_BLOCKED_NO_ORIGIN,
+                actions_applied=actions_applied,
+                message='Client is missing server commit and has no origin remote for fetch.',
+            )
+        fetch_local = _run_local_git_action('fetch_origin', {})
+        actions_applied.append('client:fetch_origin')
+        if not fetch_local.get('success', False):
+            return _reconcile_result(
+                RECONCILE_STATUS_BLOCKED_MISSING_COMMIT_OBJECT,
+                actions_applied=actions_applied,
+                message='Client fetch from origin failed while trying to obtain server commit.',
+            )
+
+    if not server_has_local_head:
+        if not server_state.get('has_origin', False):
+            return _reconcile_result(
+                RECONCILE_STATUS_BLOCKED_NO_ORIGIN,
+                actions_applied=actions_applied,
+                message='Server is missing client commit and has no origin remote for fetch.',
+            )
+        fetch_server = _post_server_git_action(server_addr, 'fetch_origin', args={}, app_name=app_name)
+        actions_applied.append('server:fetch_origin')
+        if not fetch_server or not fetch_server.get('success', False):
+            return _reconcile_result(
+                RECONCILE_STATUS_BLOCKED_MISSING_COMMIT_OBJECT,
+                actions_applied=actions_applied,
+                message='Server fetch from origin failed while trying to obtain client commit.',
+            )
+
+    # Re-check commit visibility after fetches.
+    local_has_server_head = git_has_commit(server_head, cwd=get_project_root_path())
+    server_has_local_result = _post_server_git_action(
+        server_addr,
+        'has_commit',
+        args={'commit': local_head},
+        app_name=app_name,
+    )
+    if server_has_local_result is None:
+        return _reconcile_result(
+            RECONCILE_STATUS_ERROR,
+            actions_applied=actions_applied,
+            message='Failed while re-checking server commit visibility after fetch.',
+        )
+    server_has_local_head = bool(server_has_local_result.get('has_commit', False))
+
+    if not local_has_server_head or not server_has_local_head:
+        missing_bits = []
+        if not local_has_server_head:
+            missing_bits.append('client_missing_server_commit')
+        if not server_has_local_head:
+            missing_bits.append('server_missing_client_commit')
+        return _reconcile_result(
+            RECONCILE_STATUS_BLOCKED_MISSING_COMMIT_OBJECT,
+            actions_applied=actions_applied,
+            message='; '.join(missing_bits),
+        )
+
+    decision = compute_reconcile_decision(local_state, server_state)
+    decision['actions_applied'] = actions_applied + list(decision.get('actions_applied', []))
+
+    if decision['status'] in [
+        RECONCILE_STATUS_ALIGNED,
+        RECONCILE_STATUS_BLOCKED_DIVERGED_HISTORY,
+        RECONCILE_STATUS_BLOCKED_DETACHED_HEAD,
+        RECONCILE_STATUS_ERROR,
+    ]:
+        return decision
+
+    if decision['status'] != RECONCILE_STATUS_NEEDS_ACTION:
+        return _reconcile_result(
+            RECONCILE_STATUS_ERROR,
+            actions_applied=decision.get('actions_applied', []),
+            message=f'Unexpected decision status: {decision["status"]}',
+        )
+
+    applied = apply_reconcile_actions(server_addr, decision)
+    if applied['status'] == RECONCILE_STATUS_ERROR:
+        return applied
+
+    target_commit = applied.get('target_commit', '')
+    target_branch = applied.get('target_branch', '')
+    authority_side = applied.get('authority_side', 'none')
+    all_actions = applied.get('actions_applied', [])
+
+    try:
+        final_local = get_local_git_state()
+    except Exception as e:
+        return _reconcile_result(
+            RECONCILE_STATUS_ERROR,
+            authority_side=authority_side,
+            target_branch=target_branch,
+            target_commit=target_commit,
+            actions_applied=all_actions,
+            message=f'Failed to read final local git state: {e}',
+        )
+    final_server = get_server_git_state(server_addr, app_name)
+    if final_server is None:
+        return _reconcile_result(
+            RECONCILE_STATUS_ERROR,
+            authority_side=authority_side,
+            target_branch=target_branch,
+            target_commit=target_commit,
+            actions_applied=all_actions,
+            message='Failed to read final server git state.',
+        )
+
+    if (
+        final_local.get('head', '') == target_commit
+        and final_server.get('head', '') == target_commit
+        and final_local.get('current_branch', '') == target_branch
+        and final_server.get('current_branch', '') == target_branch
+    ):
+        return _reconcile_result(
+            RECONCILE_STATUS_RECONCILED,
+            authority_side=authority_side,
+            target_branch=target_branch,
+            target_commit=target_commit,
+            actions_applied=all_actions,
+            message='Git state reconciled successfully.',
+        )
+
+    return _reconcile_result(
+        RECONCILE_STATUS_ERROR,
+        authority_side=authority_side,
+        target_branch=target_branch,
+        target_commit=target_commit,
+        actions_applied=all_actions,
+        message='Post-reconcile validation failed; client/server branch and commit do not match target.',
+    )
+
+
+def sync_changes_with_server(server_addr:tuple[str, int], sync_branches=False, scope='repo') -> bool:
+    ip, port = server_addr
+    app_name = get_appname()
+    reconcile_result = reconcile_git_state(server_addr, app_name=app_name)
+    reconcile_status = reconcile_result.get('status', RECONCILE_STATUS_ERROR)
+    if reconcile_status not in [RECONCILE_STATUS_ALIGNED, RECONCILE_STATUS_RECONCILED]:
+        print(f'Phase 1 reconcile blocked: {reconcile_status}')
+        print(f"Reason: {reconcile_result.get('message', '')}")
+        if reconcile_result.get('actions_applied'):
+            print(f"Actions applied before stop: {', '.join(reconcile_result['actions_applied'])}")
+        return False
+
+
+    url = f'http://{ip}:{port}/retrieve_changed_file_paths/{app_name}/{scope}'
+    changed_fpaths_client = get_changed_file_paths(scope)
+    changed_plainpaths_client, changed_binarypaths_client = split_paths_by_text_or_binary(changed_fpaths_client)
+
+    try:
+        resp = requests.get(url, stream=True)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        print(f'Failed to retrieve changed file path lst: {e}')
+        return False
+    if not resp.text:
+        print(f'No changed files returned by server (reason not specified)')
+        return False
+
+    resp_json_obj:dict = json.loads(resp.text)
+    changed_plainpaths_server = resp_json_obj['plaintext_file_paths']
+    changed_binarypaths_server = resp_json_obj['binary_file_paths']
+
+    #Lists of paths of files that only have changes on the server
+    server_only_plaintext_paths = [path for path in changed_plainpaths_server if path not in changed_plainpaths_client]
+    server_only_binary_paths = [path for path in changed_binarypaths_server if path not in changed_binarypaths_client]
+
+    #Lists of paths of files that only have changes on the client
+    client_only_plaintext_paths = [path for path in changed_plainpaths_client if path not in changed_plainpaths_server]
+    client_only_binary_paths = [path for path in changed_binarypaths_client if path not in changed_binarypaths_server]
+
+    #Lists of paths of files that have changes on both the client and ther server.  Note this does NOT necessarily mean that they have the SAME changes
+    shared_plaintext_paths = [path for path in changed_plainpaths_client if path in changed_plainpaths_server]
+    shared_binary_paths = [path for path in changed_binarypaths_client if path in changed_binarypaths_server]
+
+
+
+
+
+
+    # print(f'changed_filepaths')
+    # for path in changed_filepaths:
+    #     print(path)
+
+
+
 
     
 
 
-def sync_changes_with_server(server_addr:tuple[str, int]) -> bool:
+    
 
 
-    return
+
+
+
+    return True
     
 
 
@@ -235,6 +811,8 @@ if __name__ == '__main__':
             print('Successfully retrieved changes from the server')
         else:
             print('Failed to retrieve changes from the server')
+    elif 'sync' in arg:
+        sync_changes_with_server(server_addr)
     else:
         print(f'Invalid argument: {arg}')
     

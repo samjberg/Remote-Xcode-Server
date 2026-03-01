@@ -110,6 +110,8 @@ def run_xcodebuild(job_id):
         JOBS[job_id]['status'] = 'error'
         JOBS[job_id]['error'] = str(e)
 
+
+
 @app.route('/retrieve_text_changes/<appname>')
 def send_changes(appname:str):
     git_diff_path, changed_binary_paths = prepare_text_changes()
@@ -122,6 +124,59 @@ def send_changed_binary_paths(appname:str):
     changed_binary_paths = [path for path in changed_file_paths if not is_plaintext(path.split('/')[-1])]
     paths_str = '\n'.join(changed_binary_paths)
     return paths_str
+
+
+
+@app.route('/retrieve_current_commit_hash/<appname>')
+def send_current_commit_hash(appname:str):
+    current_commit_hash = get_current_commit_hash()
+    return current_commit_hash
+
+
+@app.route('/retrieve_git_branches/<appname>/<sort_order>')
+def send_git_branches(appname:str, sort_order:str):
+    git_branches, current_branch = get_git_branches(appname, return_current_branch=True, sort_order=sort_order)
+    return jsonify({'branches': git_branches, 'current_branch': current_branch})
+
+
+@app.route('/git_state/<appname>')
+def send_git_state(appname:str):
+    try:
+        state = get_git_state(get_project_root_path())
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    return jsonify(state)
+
+
+@app.route('/git_action/<appname>', methods=['POST'])
+def run_git_action(appname:str):
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({'success': False, 'error': 'Expected JSON object payload'}), 400
+
+    allowed_payload_keys = {'action', 'args'}
+    unknown_payload_keys = set(payload.keys()) - allowed_payload_keys
+    if unknown_payload_keys:
+        return jsonify({
+            'success': False,
+            'error': f'Unknown top-level payload keys: {sorted(unknown_payload_keys)}',
+        }), 400
+
+    action = payload.get('action', '')
+    if not isinstance(action, str) or not action:
+        return jsonify({'success': False, 'error': 'Field "action" is required and must be a string'}), 400
+
+    action_args = payload.get('args', {})
+    if action_args is None:
+        action_args = {}
+    if not isinstance(action_args, dict):
+        return jsonify({'success': False, 'error': 'Field "args" must be an object if provided'}), 400
+
+    result = execute_git_action(action, action_args, cwd=get_project_root_path())
+    if 'command' not in result and not result.get('success', False):
+        return jsonify(result), 400
+    return jsonify(result)
+
 
 
 #note that <path:path> is NOT representing <variablename:variablename>. The full syntax for route variables is <converter:name>
@@ -285,11 +340,13 @@ def start_build_job(appname):
         return "Some other method besides POST or GET was used.  Don't do that"
         
 
-@app.route('/retrieve_changed_file_paths/<appname>')
-def send_changed_file_paths(appname:str) -> Response:
-    #run "git add ." 
-    get_changed_file_paths()
-    os.system('git add .')
+@app.route('/retrieve_changed_file_paths/<appname>/<scope>')
+def send_changed_file_paths(appname:str, scope:str) -> Response:
+    changed_file_paths = get_changed_file_paths(scope)
+    changed_plaintext_paths = [path for path in changed_file_paths if is_plaintext(path)]
+    changed_binary_paths = [path for path in changed_file_paths if path not in changed_plaintext_paths]
+    obj = {'plaintext_file_paths': changed_plaintext_paths, 'binary_file_paths': changed_binary_paths}
+    return jsonify(obj)
 
 
 
