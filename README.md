@@ -14,13 +14,14 @@ It is especially intended for AI-assisted iOS development workflows, where an ag
 
 At a high level:
 
-1. The client runs inside a Git repo for an iOS project.
+1. The client runs inside a Git repo for an Xcode project.
 2. It generates a patch using `git diff HEAD`.
 3. It sends that patch (`gitdiff.diff`) to the server running on a Mac.
 4. The server saves the patch and runs `git apply` in the project directory.
-5. The server starts `xcodebuild`.
-6. The client polls the server every second for newly appended build log text.
-7. The client prints only the new text, so the terminal behaves like a live local build.
+5. The server starts `xcodebuild` with `stdout` piped (and `stderr` merged into `stdout`).
+6. The client opens a TCP socket connection to the Mac.
+7. The server forwards subprocess output chunks over that socket as they arrive.
+8. The client prints the incoming bytes, so the terminal behaves like a live local build.
 
 ## Why This Exists
 
@@ -30,9 +31,10 @@ Longer term, the plan is to integrate this into editor/agent tooling (for exampl
 
 ## Project Files
 
-- `mcp_server.py`: Flask server that receives a diff, applies it, starts `xcodebuild`, and serves build log progress.
-- `mcp_client.py`: Client that creates/sends the Git diff and polls for build output.
+- `mcp_server.py`: Flask server that receives a diff, applies it, starts `xcodebuild`, and streams build output over a TCP socket.
+- `mcp_client.py`: Client that creates/sends the Git diff, then connects to the server socket and prints streamed build output.
 - `mcp_utils.py`: Shared helpers (path normalization, project root/app name detection, port, etc.).
+- `mcp_sockets.py`: Scratch/experimental socket work (if present locally; not part of the main flow yet).
 - `reset.py`: Utility script (currently not part of the main flow).
 - `parseargs.py`: Early argument parsing helper (not currently integrated into the main client flow).
 
@@ -82,6 +84,7 @@ python mcp_server.py
 Notes:
 
 - The server listens on `0.0.0.0` and port `8751` (from `mcp_utils.py`).
+- The current socket log stream also uses a separate TCP port (`50271` in the current code).
 - The server assumes it is running in the iOS project directory (where the `.xcodeproj` lives).
 
 ### 2. Configure the client IP
@@ -94,16 +97,34 @@ Update this to your Mac’s LAN IP address.
 
 ### 3. Run the client from your project repo
 
-On the client machine, run:
+On the client machine, run one of these:
 
 ```bash
+# Default (same as `build`)
 python mcp_client.py
+
+# Build flow (sync changes + start remote build + stream logs)
+python mcp_client.py build
+
+# Sync-only flow (send changes to server, no build)
+python mcp_client.py sendchanges
 ```
 
 Current expectation:
 
 - Run it from the project root (the code is intended to work from subdirectories too, but this is not fully reliable yet).
 - The repo should have the same base history on both machines so `git apply` works cleanly.
+
+### Client Commands (Temporary / Minimal)
+
+Current `mcp_client.py` CLI behavior is intentionally minimal and temporary:
+
+- `build`: the normal workflow. This is the default if no command is provided.
+- `sendchanges`: syncs local changes to the server without starting a build (convenience for testing/syncing only).
+
+`sendchanges` is intended to package and send the current diff plus changed binary files, so you can sync work-in-progress changes without making a commit/push or manually copying a patch.
+
+Note: the current implementation checks commands using substring matching (e.g. `'build' in arg`), which is temporary and may change.
 
 ## What Gets Created
 
@@ -115,8 +136,11 @@ The scripts create helper directories/files automatically:
 - Server:
   - `uploads/`
   - `uploads/gitdiff.diff`
-  - `uploads/buildlog.txt`
   - `uploads/projectinfo.txt`
+
+Notes:
+
+- `uploads/buildlog.txt` may still be created by older/legacy code paths, but the current primary log path is direct socket streaming from the subprocess pipe.
 
 The code also attempts to add `uploads/` and `diffs/` to `.gitignore`.
 
@@ -125,14 +149,27 @@ The code also attempts to add `uploads/` and `diffs/` to `.gitignore`.
 This project works fundamentally, but it is still early and buggy. Known limitations include:
 
 - Server IP is hardcoded in `mcp_client.py`.
-- No CLI arguments/config file yet.
+- CLI arguments are currently very minimal/temporary (`build`, `sendchanges`, defaulting to `build`), and a proper argument/config system is still needed.
 - Build command is currently fixed and simple (`xcodebuild ... build` with a derived scheme name).
-- Polling is HTTP-based (1s interval), not true streaming/websocket.
+- Log streaming is now socket-based (raw TCP), but the code still contains older HTTP polling endpoints/logic.
 - Error handling is minimal.
 - Patch application assumes compatible repo state and can fail if histories diverge.
 - Client path/root detection is a work in progress.
 - Security is minimal (no auth, no TLS, no request validation beyond basic file handling).
 - Single-user / ad hoc workflow assumptions throughout.
+- Socket stream protocol is intentionally barebones right now (no framing/metadata for stdout/stderr/status).
+
+## Current Streaming Approach (Server)
+
+Current log transport is:
+
+- `xcodebuild` launched via `subprocess.Popen(...)`
+- `stdout=subprocess.PIPE`
+- `stderr=subprocess.STDOUT` (merged)
+- server reads chunks from `proc.stdout`
+- server sends those chunks to the client over a TCP socket
+
+This means the client is receiving a live byte stream, not repeatedly polling for file growth.
 
 ## Current Build Command (Server)
 
