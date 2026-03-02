@@ -8,6 +8,10 @@ from uuid import uuid4
 P = ParamSpec("P")
 R = TypeVar("R", bound=subprocess.CompletedProcess)
 
+KB = 1024
+MB = KB * KB
+
+
 server_port = 8751
 socket_port = 50682
 runtime_dir_name = '.remote-xcode-server'
@@ -117,6 +121,13 @@ def update_gitignore():
                 if lines and not ends_with_newline:
                     f.write('\n')
                 f.writelines(additions)
+
+
+def apply_patch(patch_path:str) -> None:
+    '''Applies the git patch located at patch_path'''
+    command = f'git apply {patch_path}'
+    os.system(command)
+
 
 
 def is_plaintext(path:str):
@@ -568,10 +579,9 @@ def get_changed_file_paths(scope='repo') -> list[str]:
 
     return file_paths
 
-def get_diff_for_files(paths:list[str]) -> str:
+def get_diff_for_files(paths:list[str], diff_filename='specific_files_gitdiff.diff') -> str:
     cwd = unix_path(os.getcwd())
     runtime_dir_path = get_runtime_dir_path(cwd)
-    diff_filename = f'specific_files_gitdiff.diff'
     git_diff_path = os.path.join(runtime_dir_path, diff_filename)
     if os.path.exists(git_diff_path): #my brain would actually explode if this returned true lmao
         os.remove(git_diff_path)

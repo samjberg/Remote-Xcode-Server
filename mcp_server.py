@@ -266,6 +266,14 @@ def receieve_changes(appname):
 
     return "Some other method besides POST or GET was used.  Don't do that"
 
+@app.route('/sendfile/<appname>/<path:path>', methods=['POST'])
+def receive_file(appname:str, path:str):
+    file = request.files['gitdiff']
+    if file:
+        filename = secure_filename(file.filename)
+        if os.path.exists(path):
+            full_path = os.path.join(path, filename)
+            file.save(full_path)
 
 
 @app.route('/appname/<appname>', methods=['GET', 'POST'])

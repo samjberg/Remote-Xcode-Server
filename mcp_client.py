@@ -13,6 +13,35 @@ def configure_stdio():
 def get_jobid_from_resp(resp:Response):
     return json.loads(resp.text)['job_id']
 
+def retrieve_file(server_addr:tuple[str, int], path) -> bool:
+    ip, port = server_addr
+    app_name = get_appname()
+    url = f'http://{ip}:{port}/retrieve_files/{app_name}/{path}'
+    dct = {'paths': [path]}
+    ran_successfully = True
+    try:
+        resp:Response = requests.get(url, dct)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        print(f'Failed to retrieve file {path}.  Error message: {e}')
+        return False
+
+    under_write_count = 0
+    
+    if len(resp.content) < 1*MB:
+        chunk_size = 16 * KB
+        with open(path, 'wb') as f:
+            for chunk in resp.iter_content(chunk_size=chunk_size):
+                num_bytes_written = f.write(chunk)
+                if num_bytes_written != chunk_size:
+                    under_write_count += 1
+
+    #a single "under_write" (writing less than chunk_size bytes) is normal, and expected to happen... well actually about 99.994% of the time.  So it's pretty normal
+    #but I use <=1 instead of just <1 because it IS 99.994% of the time, not 100% (the other 0.006% is when it is 0.  Otherwise something ACTUALLY went wrong)
+    ran_successfully = ran_successfully and (under_write_count <= 1)
+    return ran_successfully
+
+
 def start_build_job(server_addr:tuple[str, int], git_diff_path:str, changed_binary_paths:list[str]=[]) -> str:
     ip, port = server_addr
     app_name = get_appname()
@@ -53,6 +82,107 @@ def wait_for_build_completion(server_addr:tuple[str, int], job_id:str, offset=0)
             full_text += new_text
 
     return full_text
+
+
+def _receive_file_over_socket(s:socket.socket, path:str, chunk_size=16*KB) -> bool:
+    total_bytes_received:int = 0
+    total_bytes_reported_received:int = 0
+    file_size = os.path.getsize(path)
+    print(f'Sending {path}, total size: {file_size} to server over socket')
+    with open(path, 'rb') as f:
+        while total_bytes_sent:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            num_bytes_sent = s.send(chunk)
+            total_bytes_sent += num_bytes_sent
+            if num_bytes_sent != chunk_size or len(chunk) < chunk_size:
+                break
+            resp_bytes = s.recv(32)
+            resp_text = resp_bytes.decode()
+            if not resp_text.startswith('num bytes received:'):
+                print(f'Malformed response from server.  Server response: {resp_text}')
+                return False
+            reported_bytes_received = int(resp_text.split(':')[1].strip())
+            if reported_bytes_received != num_bytes_sent:
+                print(f'Error.  Sent {num_bytes_sent}, but server reported receiving only {reported_bytes_received}')
+                return False
+    print(f'Sent a total of {total_bytes_sent} bytes and server reported receiving a total of {total_bytes_reported_received} bytes')
+    return True
+
+
+def _send_file_over_socket(s:socket.socket, path:str, chunk_size=16*KB) -> bool:
+    total_bytes_sent:int = 0
+    total_bytes_reported_received:int = 0
+    file_size = os.path.getsize(path)
+    print(f'Sending {path}, total size: {file_size} to server over socket')
+    with open(path, 'rb') as f:
+        while total_bytes_sent:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            num_bytes_sent = s.send(chunk)
+            total_bytes_sent += num_bytes_sent
+            if num_bytes_sent != chunk_size or len(chunk) < chunk_size:
+                break
+            resp_bytes = s.recv(32)
+            resp_text = resp_bytes.decode()
+            if not resp_text.startswith('num bytes received:'):
+                print(f'Malformed response from server.  Server response: {resp_text}')
+                return False
+            reported_bytes_received = int(resp_text.split(':')[1].strip())
+            if reported_bytes_received != num_bytes_sent:
+                print(f'Error.  Sent {num_bytes_sent}, but server reported receiving only {reported_bytes_received}')
+                return False
+    print(f'Sent a total of {total_bytes_sent} bytes and server reported receiving a total of {total_bytes_reported_received} bytes')
+    return True
+
+
+
+
+
+
+def send_files(server_addr:tuple[str, int], paths:list[str], filesize_threshold:int=20*MB, total_threshold=50*MB) -> bool:
+    ip, port = server_addr
+    file_sizes = [os.path.getsize(path) for path in paths]
+    if all([size < filesize_threshold for size in file_sizes]) and (sum(file_sizes) < total_threshold):
+        app_name = get_appname()
+        url = f'http://{ip}:{port}/sendchanges/{app_name}'
+        files = {}
+        for i, path in enumerate(paths):
+            path = unix_path(path)
+
+            mimetype, encoding = guess_type(path, strict=False)
+            if not mimetype:
+                if is_plaintext(path):
+                    mimetype = 'text/plain'
+                else:
+                    mimetype = 'application/octet-stream'
+
+            files[f'file{i}'] = (path, open(path, 'rb'), mimetype, {'Expires': 0})
+        resp = requests.post(url, files=files)
+        resp.raise_for_status()
+        return True
+
+    server_socket_port = 50271
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.connect((ip, server_socket_port))
+        for path in paths:
+            sent_successfully = _send_file_over_socket(s, path)
+            if not sent_successfully:
+                print(f'Failed to sent {path} to server')
+
+
+
+
+
+
+
+
+
+
+    
+
 
 #Sort of like git push, but for uncommited changes and specifically from the server
 def send_current_changes(server_addr:tuple[str, int]) -> Response:
@@ -222,7 +352,7 @@ def retrieve_git_branches_from_server(server_addr:tuple[str, int], app_name:str=
         return []
     
     if not resp.text:
-        print(f"Recieved an empty string as server's git branches.  Something almost certainly went wrong")
+        print(f"Received an empty string as server's git branches.  Something almost certainly went wrong")
         return []
 
     resp_obj = json.loads(resp.text)
@@ -787,7 +917,7 @@ def retrieve_diff_for_files(server_addr:tuple[str, int], paths:list[str]) -> str
         return []
 
     runtime_dir_path = get_runtime_dir_path()
-    git_diff_name = 'specific_files_gitdiff'
+    git_diff_name = 'specific_files_gitdiff.diff'
     git_diff_path = os.path.join(runtime_dir_path, git_diff_name)
 
     with open(git_diff_path, 'wb') as diff_file:
@@ -860,10 +990,26 @@ def sync_changes_with_server(server_addr:tuple[str, int], sync_branches=False, s
     shared_plaintext_paths = [path for path in changed_plainpaths_client if path in changed_plainpaths_server]
     shared_binary_paths = [path for path in changed_binarypaths_client if path in changed_binarypaths_server]
 
-    #if there are any plaintext files only on the server
+    #if there are any plaintext files only on the server, retrieve the diff for those specific files, and then apply the patch locally on the client
     if server_only_plaintext_paths:
-        pass
-        # retrieve_diff_for_files()
+        diff_path = retrieve_diff_for_files(server_addr, server_only_plaintext_paths)
+        apply_patch(diff_path)
+
+    #if there are any binary files only on the server, retrieve each files and save to the same path locally on the client
+    if server_only_binary_paths:
+        for path in server_only_binary_paths:
+            success = retrieve_file(server_addr, path)
+            if not success:
+                print(f'Failed to retrieve file from server located at: {path}')
+                return False
+
+    if client_only_plaintext_paths:
+        get_diff_for_files(client_only_plaintext_paths, 'client_plaintext_diff.diff')
+        url = f'http://{ip}:{port}/'
+        send_current_changes
+
+
+
 
 
 
