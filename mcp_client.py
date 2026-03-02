@@ -97,10 +97,7 @@ def retrieve_changed_file_list_on_server(server_addr:tuple[str, int]) -> list[st
     return changed_file_paths
     
 
-
-
-#Sort of like git pull, but for uncommitted changes and specifically to the server
-def retrieve_current_changes(server_addr:tuple[str, int], save_changes=True, save_as_filename='gitdiff.diff') -> bool:
+def retrieve_current_text_changes(server_addr:tuple[str, int], save_as_filename='gitdiff.diff') -> bool:
     ip, port = server_addr
     app_name = get_appname()
     url = f'http://{ip}:{port}/retrieve_text_changes/{app_name}'
@@ -123,8 +120,13 @@ def retrieve_current_changes(server_addr:tuple[str, int], save_changes=True, sav
     #apply patch
     git_apply_command = f'git apply {git_patch_path}'
     os.system(git_apply_command)
+    return ran_successfully
 
-    #request paths for changed binary files
+
+def retrieve_current_binary_changes(server_addr:tuple[str, int]) -> bool:
+    ip, port = server_addr
+    app_name = get_appname()
+    project_root = get_project_root_path()
     url = f'http://{ip}:{port}/retrieve_changed_binary_paths/{app_name}'
     try:
         binary_paths_resp:Response = requests.get(url)
@@ -140,8 +142,21 @@ def retrieve_current_changes(server_addr:tuple[str, int], save_changes=True, sav
     paths = [path for path in paths if path] #remove empty paths
 
     for path in paths:
+        print(f'trying to save binary file to path: {path}')
         #verify that the directory in which we are supposed to write the binary file to already exists.  If not, create it and all intermediate directories with os.makedirs
         parent_dir = os.path.dirname(path)
+
+        #if parent_dir is an empty string, this means that the "path" is actually just a filename.  So
+        if parent_dir == '':
+            parent_dir = get_project_root_path()
+
+        if os.path.isabs(path):
+            if is_subdir(path, project_root):
+                path = os.path.realpath(path)
+            else:
+                print('ERROR: CANNOT ACCEPT FILES FROM OUTSIDE PROJECT ROOT')
+                return False
+
         if not os.path.exists(parent_dir):
             os.makedirs(parent_dir, exist_ok=True)
 
@@ -161,7 +176,17 @@ def retrieve_current_changes(server_addr:tuple[str, int], save_changes=True, sav
             for chunk in resp.iter_content(chunk_size=chunk_size):
                 f.write(chunk)
     
-    return ran_successfully #the idea is just to return True/False based on whether everything runs successfully or not, but I haven't really implemented that yet
+    return True #the idea is just to return True/False based on whether everything runs successfully or not, but I haven't really implemented that yet
+
+
+#Sort of like git pull, but for uncommitted changes and specifically to the server
+def retrieve_current_changes(server_addr:tuple[str, int], exclude_binary_changes=False, save_as_filename='gitdiff.diff') -> bool:
+    retrieved_text_changes = retrieve_current_text_changes(server_addr, save_as_filename)
+    if not exclude_binary_changes:
+        retrieved_binary_changes = retrieve_current_binary_changes(server_addr)
+        return retrieved_text_changes and retrieved_binary_changes
+    return retrieved_text_changes
+
 
 def get_current_server_commit_hash(server_addr:tuple[str, int], app_name:str='') -> str|None:
     ip, port = server_addr
