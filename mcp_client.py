@@ -407,6 +407,7 @@ def send_files(server_addr:tuple[str, int], paths:list[str]|str, filesize_thresh
                 handle.close()
         resp.raise_for_status()
         result = resp.json()
+        print(f'result: {result}')
         if not result.get('ok', False):
             print(f'HTTP file transfer failed: {result}')
             return False
@@ -473,19 +474,17 @@ def send_files(server_addr:tuple[str, int], paths:list[str]|str, filesize_thresh
 
 
 
-def receive_files(server_addr:tuple[str, int]) -> bool:
+def apply_patch_server(server_addr:tuple[str, int], patch_path:str=None) -> Response:
     ip, port = server_addr
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.connect((ip, server_socket_port))
-
-
-
-
-
-
-
-
-
+    app_name = get_appname()
+    if not patch_path:
+        patch_path = os.path.join(get_runtime_dir_path, 'gitdiff.diff')
+    if not os.path.exists(patch_path):
+        patch_path, _ = prepare_text_changes()
+        git_diff_filepath
+    url = f'http://{ip}:{port}/apply-patch-server/{app_name}'
+    resp:Response = requests.get(url, params={'patch_path': patch_path})
+    return resp
     
 
 
@@ -498,8 +497,8 @@ def send_current_changes(server_addr:tuple[str, int]) -> bool:
     send_files(server_addr, paths)
     app_name = get_appname()
     ip, port = server_addr
-    url = f'http://{ip}:{port}/sendchanges/{app_name}'
-    resp:Response = requests.get(url)
+    url = f'http://{ip}:{port}/apply-patch-server/{app_name}'
+    resp:Response = requests.get(url, git_diff_path)
     resp.raise_for_status()
     return True
 
@@ -1288,6 +1287,8 @@ def sync_changes_with_server(server_addr:tuple[str, int], sync_branches=False, s
     changed_plainpaths_server = resp_json_obj['plaintext_file_paths']
     changed_binarypaths_server = resp_json_obj['binary_file_paths']
 
+    print(f'resp_json_obj: {resp_json_obj}')
+
     #Lists of paths of files that only have changes on the server
     server_only_plaintext_paths = [path for path in changed_plainpaths_server if path not in changed_plainpaths_client]
     server_only_binary_paths = [path for path in changed_binarypaths_server if path not in changed_binarypaths_client]
@@ -1313,12 +1314,15 @@ def sync_changes_with_server(server_addr:tuple[str, int], sync_branches=False, s
             return False
     #if there are any plaintext files only on the client, retrieve the diff for those specific files, and then apply the patch locally on the server
     if client_only_plaintext_paths:
+        project_root_path = get_project_root_path()
         client_diff_path = get_diff_for_files(client_only_plaintext_paths, 'client_plaintext_diff.diff')
-        url = f'http://{ip}:{port}/'
+        client_diff_path = _to_repo_relative_posix(client_diff_path, project_root_path)
         success = send_files(server_addr, [client_diff_path])
         if not success:
             print(f'Failed to send client plaintext files patch to server')
             return False
+        resp = apply_patch_server(server_addr, client_diff_path)
+        resp.raise_for_status()
         
     if client_only_binary_paths:
         success = send_files(server_addr, client_only_binary_paths)

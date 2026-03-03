@@ -551,6 +551,16 @@ def send_binary_file(appname:str, path:str):
     return send_file(path, as_attachment=True)
 
 
+@app.route('/apply-patch-server/<appname>', methods=['GET'])
+def apply_patch_server(appname):
+    patch_path = request.args.get('patch_path', None)
+    if not patch_path:
+        print('Error: No patch path received from client')
+        return 'Error: no patch path received from the client'
+    apply_patch(patch_path)
+    return 'successfully applied patch'
+    
+
 @app.route('/sendchanges/<appname>', methods=['GET'])
 def receive_changes(appname):
     runtime_dir = get_runtime_dir_path()

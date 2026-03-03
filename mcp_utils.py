@@ -345,6 +345,16 @@ def git_dirty_untracked_count(cwd:str|None=None) -> int:
 
 
 def get_git_state(cwd:str|None=None) -> dict:
+    """
+    Returns a dict with the following entries (using format 'name: type'))
+        head: str
+        current_branch: str
+        branches: list[str]
+        is_detached: bool
+        has_origin: bool
+        dirty_tracked: bool
+        dirty_untracked_count
+    """
     if cwd is None:
         cwd = get_project_root_path()
 
