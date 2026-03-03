@@ -7,13 +7,13 @@ from uuid import uuid4
 #that use the decorator @handle_process_errors
 P = ParamSpec("P")
 R = TypeVar("R", bound=subprocess.CompletedProcess)
-
 KB = 1024
 MB = KB * KB
 
 
 server_port = 8751
-socket_port = 50682
+server_socket_port = 50271
+file_socket_port = 47283
 runtime_dir_name = '.remote-xcode-server'
 
 def get_server_port() -> int:
@@ -165,6 +165,8 @@ def is_subdir(path, directory):
         return False
     else:
         return True
+
+
 
 #this insane P and R stuff with ParamSpec and TypeVar is just the insanity that is necessary to make typehints show up for functions
 #that use this decorator (i.e. run_process) for some insane reason.

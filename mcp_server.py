@@ -1,6 +1,6 @@
-import os, subprocess, socket
+import os, subprocess, socket, json, struct, hashlib, time
 from flask import Flask, request, send_file, send_from_directory, jsonify, Request, Response
-from threading import Thread
+from threading import Thread, Lock
 from werkzeug.utils import secure_filename
 from mcp_utils import *
 # from requests import Request
@@ -18,6 +18,9 @@ server_socket_port = 50271
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server.bind(('0.0.0.0', server_socket_port))
 server.listen(1)
+filesocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+filesocket.bind(('0.0.0.0', file_socket_port))
+filesocket.listen(1)
 
 update_gitignore()
 
@@ -45,6 +48,10 @@ UPLOAD_FOLDER = unix_path(os.path.join(cwd, server_dir_name))
 JOBS = {}
 app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+TRANSFER_SESSIONS: dict[str, dict] = {}
+OUTBOUND_TRANSFER_SESSIONS: dict[str, dict] = {}
+SESSION_LOCK = Lock()
+SESSION_TTL_SECONDS = 30 * 60
 
 
 
@@ -82,6 +89,329 @@ def get_safe_project_path(client_path:str) -> str:
     return dest_abs
 
 
+def _cleanup_transfer_sessions() -> None:
+    now = time.time()
+    with SESSION_LOCK:
+        stale_ids = [
+            transfer_id
+            for transfer_id, session in TRANSFER_SESSIONS.items()
+            if now - session.get('last_updated', now) > SESSION_TTL_SECONDS
+        ]
+        for transfer_id in stale_ids:
+            TRANSFER_SESSIONS.pop(transfer_id, None)
+        stale_outbound_ids = [
+            transfer_id
+            for transfer_id, session in OUTBOUND_TRANSFER_SESSIONS.items()
+            if now - session.get('last_updated', now) > SESSION_TTL_SECONDS
+        ]
+        for transfer_id in stale_outbound_ids:
+            OUTBOUND_TRANSFER_SESSIONS.pop(transfer_id, None)
+
+
+def _has_active_file_transfer() -> bool:
+    with SESSION_LOCK:
+        inbound_active = any(
+            session.get('status') in ['initialized', 'awaiting_socket', 'receiving']
+            for session in TRANSFER_SESSIONS.values()
+        )
+        outbound_active = any(
+            session.get('status') in ['initialized', 'awaiting_socket', 'sending']
+            for session in OUTBOUND_TRANSFER_SESSIONS.values()
+        )
+    return inbound_active or outbound_active
+
+
+def _recv_exact(conn: socket.socket, num_bytes: int) -> bytes:
+    data = bytearray()
+    while len(data) < num_bytes:
+        chunk = conn.recv(num_bytes - len(data))
+        if not chunk:
+            raise ConnectionError('Socket closed while reading frame')
+        data.extend(chunk)
+    return bytes(data)
+
+
+def _send_frame(conn: socket.socket, header: dict, payload: bytes = b'') -> None:
+    header_bytes = json.dumps(header).encode('utf-8')
+    conn.sendall(struct.pack('!I', len(header_bytes)))
+    conn.sendall(header_bytes)
+    conn.sendall(struct.pack('!I', len(payload)))
+    if payload:
+        conn.sendall(payload)
+
+
+def _recv_frame(conn: socket.socket) -> tuple[dict, bytes]:
+    header_len = struct.unpack('!I', _recv_exact(conn, 4))[0]
+    header = json.loads(_recv_exact(conn, header_len).decode('utf-8'))
+    payload_len = struct.unpack('!I', _recv_exact(conn, 4))[0]
+    payload = _recv_exact(conn, payload_len) if payload_len else b''
+    return header, payload
+
+
+def _update_session(transfer_id: str, **updates) -> None:
+    with SESSION_LOCK:
+        session = TRANSFER_SESSIONS.get(transfer_id)
+        if not session:
+            return
+        session.update(updates)
+        session['last_updated'] = time.time()
+
+
+def _append_session_error(transfer_id: str, message: str) -> None:
+    with SESSION_LOCK:
+        session = TRANSFER_SESSIONS.get(transfer_id)
+        if not session:
+            return
+        session.setdefault('errors', []).append(message)
+        session['status'] = 'error'
+        session['last_updated'] = time.time()
+
+
+def _append_outbound_session_error(transfer_id: str, message: str) -> None:
+    with SESSION_LOCK:
+        session = OUTBOUND_TRANSFER_SESSIONS.get(transfer_id)
+        if not session:
+            return
+        session.setdefault('errors', []).append(message)
+        session['status'] = 'error'
+        session['last_updated'] = time.time()
+
+
+def _file_sha256(path: str, chunk_size: int = 256 * KB) -> str:
+    digest = hashlib.sha256()
+    with open(path, 'rb') as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _handle_file_transfer_session(transfer_id: str) -> None:
+    current_file = None
+    conn = None
+    try:
+        _update_session(transfer_id, status='awaiting_socket')
+        conn, _ = filesocket.accept()
+        conn.settimeout(60)
+        _update_session(transfer_id, status='receiving')
+
+        while True:
+            header, payload = _recv_frame(conn)
+            msg_type = header.get('type', '')
+            incoming_transfer_id = header.get('transfer_id', '')
+
+            if incoming_transfer_id != transfer_id:
+                _append_session_error(transfer_id, f'Unexpected transfer_id: {incoming_transfer_id}')
+                _send_frame(conn, {'type': 'ERROR', 'ok': False, 'error': 'transfer_id mismatch'})
+                return
+
+            if msg_type == 'FILE_START':
+                rel_path = header.get('rel_path', '')
+                with SESSION_LOCK:
+                    session = TRANSFER_SESSIONS.get(transfer_id, {})
+                    expected_map = session.get('expected', {})
+                    expected_meta = expected_map.get(rel_path)
+                if not expected_meta:
+                    _append_session_error(transfer_id, f'FILE_START for unknown path: {rel_path}')
+                    _send_frame(conn, {'type': 'ACK_FILE_START', 'ok': False, 'rel_path': rel_path})
+                    continue
+
+                try:
+                    destination_path = get_safe_project_path(rel_path)
+                except ValueError as e:
+                    _append_session_error(transfer_id, f'Invalid path for FILE_START {rel_path}: {e}')
+                    _send_frame(conn, {'type': 'ACK_FILE_START', 'ok': False, 'rel_path': rel_path})
+                    continue
+
+                parent_dir = os.path.dirname(destination_path)
+                if parent_dir and not os.path.exists(parent_dir):
+                    os.makedirs(parent_dir, exist_ok=True)
+                temp_path = destination_path + '.part'
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+
+                current_file = {
+                    'rel_path': rel_path,
+                    'destination_path': destination_path,
+                    'temp_path': temp_path,
+                    'expected_size': int(expected_meta['size']),
+                    'expected_sha256': expected_meta['sha256'],
+                    'bytes_received': 0,
+                    'hash': hashlib.sha256(),
+                    'handle': open(temp_path, 'wb'),
+                }
+                _send_frame(conn, {'type': 'ACK_FILE_START', 'ok': True, 'rel_path': rel_path})
+
+            elif msg_type == 'FILE_CHUNK':
+                if not current_file:
+                    _append_session_error(transfer_id, 'Received FILE_CHUNK without FILE_START')
+                    continue
+                current_file['handle'].write(payload)
+                current_file['hash'].update(payload)
+                current_file['bytes_received'] += len(payload)
+
+            elif msg_type == 'FILE_END':
+                rel_path = header.get('rel_path', '')
+                if not current_file or rel_path != current_file['rel_path']:
+                    _append_session_error(transfer_id, f'FILE_END mismatch for rel_path={rel_path}')
+                    _send_frame(conn, {'type': 'FILE_RESULT', 'ok': False, 'rel_path': rel_path})
+                    continue
+
+                current_file['handle'].close()
+                actual_size = current_file['bytes_received']
+                actual_sha256 = current_file['hash'].hexdigest()
+                expected_size = current_file['expected_size']
+                expected_sha256 = current_file['expected_sha256']
+                verified = actual_size == expected_size and actual_sha256 == expected_sha256
+                rel_path = current_file['rel_path']
+
+                if verified:
+                    os.replace(current_file['temp_path'], current_file['destination_path'])
+                else:
+                    if os.path.exists(current_file['temp_path']):
+                        os.remove(current_file['temp_path'])
+                    _append_session_error(
+                        transfer_id,
+                        f'Integrity check failed for {rel_path}. expected_size={expected_size}, '
+                        f'actual_size={actual_size}, expected_sha256={expected_sha256}, actual_sha256={actual_sha256}',
+                    )
+
+                with SESSION_LOCK:
+                    session = TRANSFER_SESSIONS.get(transfer_id)
+                    if session is not None:
+                        session['received'][rel_path] = {
+                            'rel_path': rel_path,
+                            'size': actual_size,
+                            'sha256': actual_sha256,
+                            'verified': verified,
+                        }
+                        session['last_updated'] = time.time()
+                _send_frame(conn, {'type': 'FILE_RESULT', 'ok': verified, 'rel_path': rel_path})
+                current_file = None
+
+            elif msg_type == 'TRANSFER_END':
+                with SESSION_LOCK:
+                    session = TRANSFER_SESSIONS.get(transfer_id, {})
+                    expected_paths = set(session.get('expected', {}).keys())
+                    received = session.get('received', {})
+                    received_verified_paths = {
+                        path for path, meta in received.items() if meta.get('verified', False)
+                    }
+                    missing_paths = sorted(expected_paths - received_verified_paths)
+                if missing_paths:
+                    _append_session_error(transfer_id, f'Missing or unverified files: {missing_paths}')
+                    _send_frame(conn, {'type': 'TRANSFER_RECEIVED', 'ok': False, 'missing': missing_paths})
+                else:
+                    _update_session(transfer_id, status='received')
+                    _send_frame(conn, {'type': 'TRANSFER_RECEIVED', 'ok': True})
+                return
+
+            else:
+                _append_session_error(transfer_id, f'Unknown frame type: {msg_type}')
+
+    except Exception as e:
+        _append_session_error(transfer_id, f'Socket transfer exception: {e}')
+    finally:
+        if current_file and current_file.get('handle') and not current_file['handle'].closed:
+            current_file['handle'].close()
+        if current_file and current_file.get('temp_path') and os.path.exists(current_file['temp_path']):
+            os.remove(current_file['temp_path'])
+        if conn:
+            conn.close()
+
+
+def send_files_from_server(transfer_id: str) -> None:
+    conn = None
+    try:
+        with SESSION_LOCK:
+            session = OUTBOUND_TRANSFER_SESSIONS.get(transfer_id)
+        if not session:
+            return
+
+        with SESSION_LOCK:
+            session['status'] = 'awaiting_socket'
+            session['last_updated'] = time.time()
+
+        conn, _ = filesocket.accept()
+        conn.settimeout(60)
+        with SESSION_LOCK:
+            session = OUTBOUND_TRANSFER_SESSIONS.get(transfer_id)
+            if not session:
+                return
+            session['status'] = 'sending'
+            session['last_updated'] = time.time()
+            expected = session.get('expected', {})
+            chunk_size = int(session.get('chunk_size', 64 * KB))
+
+        for rel_path, meta in expected.items():
+            full_path = meta['full_path']
+            expected_size = int(meta['size'])
+            expected_sha256 = meta['sha256']
+            _send_frame(
+                conn,
+                {
+                    'type': 'FILE_START',
+                    'transfer_id': transfer_id,
+                    'rel_path': rel_path,
+                    'size': expected_size,
+                    'sha256': expected_sha256,
+                },
+            )
+            ack_header, _ = _recv_frame(conn)
+            if ack_header.get('type') != 'ACK_FILE_START' or not ack_header.get('ok', False):
+                _append_outbound_session_error(transfer_id, f'Client rejected FILE_START for {rel_path}: {ack_header}')
+                return
+
+            bytes_sent = 0
+            with open(full_path, 'rb') as f:
+                while True:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    _send_frame(conn, {'type': 'FILE_CHUNK', 'transfer_id': transfer_id, 'rel_path': rel_path}, chunk)
+                    bytes_sent += len(chunk)
+            _send_frame(conn, {'type': 'FILE_END', 'transfer_id': transfer_id, 'rel_path': rel_path})
+
+            file_result, _ = _recv_frame(conn)
+            if file_result.get('type') != 'FILE_RESULT' or not file_result.get('ok', False):
+                _append_outbound_session_error(transfer_id, f'Client file verify failed for {rel_path}: {file_result}')
+                return
+            if bytes_sent != expected_size:
+                _append_outbound_session_error(
+                    transfer_id,
+                    f'Bytes sent mismatch for {rel_path}. expected={expected_size}, sent={bytes_sent}',
+                )
+                return
+            with SESSION_LOCK:
+                session = OUTBOUND_TRANSFER_SESSIONS.get(transfer_id)
+                if session is not None:
+                    session['sent'][rel_path] = {
+                        'rel_path': rel_path,
+                        'size': bytes_sent,
+                        'sha256': expected_sha256,
+                        'verified': True,
+                    }
+                    session['last_updated'] = time.time()
+
+        _send_frame(conn, {'type': 'TRANSFER_END', 'transfer_id': transfer_id})
+        transfer_ack, _ = _recv_frame(conn)
+        if transfer_ack.get('type') != 'TRANSFER_RECEIVED' or not transfer_ack.get('ok', False):
+            _append_outbound_session_error(transfer_id, f'Client transfer completion failed: {transfer_ack}')
+            return
+
+        with SESSION_LOCK:
+            session = OUTBOUND_TRANSFER_SESSIONS.get(transfer_id)
+            if session is not None:
+                session['status'] = 'sent'
+                session['last_updated'] = time.time()
+    except Exception as e:
+        _append_outbound_session_error(transfer_id, f'Outbound transfer exception: {e}')
+    finally:
+        if conn:
+            conn.close()
+
 
 
 def run_xcodebuild(job_id):
@@ -108,6 +438,19 @@ def run_xcodebuild(job_id):
     except Exception as e:
         JOBS[job_id]['status'] = 'error'
         JOBS[job_id]['error'] = str(e)
+
+
+def _send_file_over_socket(path:str, chunk_size=32*KB) -> bool:
+    print('Legacy _send_file_over_socket is disabled. Use /sendfilessocket/init and /complete flow.')
+    return False
+
+
+
+def _receive_file_over_socket(conn:socket.socket=server) -> bool:
+    print('Legacy _receive_file_over_socket is disabled. Use framed transfer session handlers.')
+    return True
+
+
 
 
 
@@ -209,7 +552,7 @@ def send_binary_file(appname:str, path:str):
 
 
 @app.route('/sendchanges/<appname>', methods=['POST'])
-def receieve_changes(appname):
+def receive_changes(appname):
     if 'gitdiff' not in request.files:
         print('No diff received')
         return 'No diff received'
@@ -266,14 +609,273 @@ def receieve_changes(appname):
 
     return "Some other method besides POST or GET was used.  Don't do that"
 
-@app.route('/sendfile/<appname>/<path:path>', methods=['POST'])
-def receive_file(appname:str, path:str):
-    file = request.files['gitdiff']
-    if file:
-        filename = secure_filename(file.filename)
-        if os.path.exists(path):
-            full_path = os.path.join(path, filename)
-            file.save(full_path)
+
+@app.route('/sendfileshttp/<appname>', methods=['POST'])
+def receive_files_http(appname:str):
+    saved_files = []
+    errors = []
+    for key in request.files.keys():
+        file = request.files[key]
+        if not file:
+            errors.append(f'No file object for request.files key: {key}')
+            continue
+        rel_path = unix_path(file.filename)
+        try:
+            destination_path = get_safe_project_path(rel_path)
+        except ValueError as e:
+            errors.append(f'Invalid path {rel_path}: {e}')
+            continue
+
+        parent_dir = os.path.dirname(destination_path)
+        if parent_dir and not os.path.exists(parent_dir):
+            os.makedirs(parent_dir, exist_ok=True)
+
+        if os.path.exists(destination_path) and os.path.isdir(destination_path):
+            errors.append(f'Destination path exists as a directory: {rel_path}')
+            continue
+
+        file.save(destination_path)
+        digest = hashlib.sha256()
+        with open(destination_path, 'rb') as f:
+            while True:
+                chunk = f.read(256 * KB)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        saved_files.append(
+            {
+                'rel_path': rel_path,
+                'size': os.path.getsize(destination_path),
+                'sha256': digest.hexdigest(),
+                'verified': True,
+            }
+        )
+    ok = len(errors) == 0
+    status = 200 if ok else 400
+    return jsonify({'ok': ok, 'received_files': saved_files, 'errors': errors}), status
+
+
+@app.route('/sendfilessocket/init/<appname>', methods=['POST'])
+def init_receive_files_socket(appname:str):
+    _cleanup_transfer_sessions()
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({'ok': False, 'errors': ['Expected JSON object payload']}), 400
+
+    transfer_id = payload.get('transfer_id', '')
+    files = payload.get('files', [])
+    chunk_size = int(payload.get('chunk_size', 64 * KB))
+    if not isinstance(transfer_id, str) or not transfer_id:
+        return jsonify({'ok': False, 'errors': ['Field "transfer_id" is required and must be a string']}), 400
+    if not isinstance(files, list) or not files:
+        return jsonify({'ok': False, 'errors': ['Field "files" must be a non-empty list']}), 400
+
+    expected = {}
+    errors = []
+    for entry in files:
+        if not isinstance(entry, dict):
+            errors.append('Each "files" entry must be an object')
+            continue
+        rel_path = entry.get('rel_path', '')
+        size = entry.get('size', -1)
+        sha256 = entry.get('sha256', '')
+        if not isinstance(rel_path, str) or not rel_path:
+            errors.append(f'Invalid rel_path: {rel_path}')
+            continue
+        try:
+            get_safe_project_path(rel_path)
+        except ValueError as e:
+            errors.append(f'Invalid rel_path "{rel_path}": {e}')
+            continue
+        if not isinstance(size, int) or size < 0:
+            errors.append(f'Invalid size for {rel_path}: {size}')
+            continue
+        if not isinstance(sha256, str) or len(sha256) != 64:
+            errors.append(f'Invalid sha256 for {rel_path}')
+            continue
+        expected[rel_path] = {'size': size, 'sha256': sha256}
+
+    if errors:
+        return jsonify({'ok': False, 'transfer_id': transfer_id, 'errors': errors}), 400
+
+    if _has_active_file_transfer():
+        return jsonify({'ok': False, 'errors': ['Another file transfer is currently active']}), 409
+    with SESSION_LOCK:
+        TRANSFER_SESSIONS[transfer_id] = {
+            'transfer_id': transfer_id,
+            'status': 'initialized',
+            'chunk_size': chunk_size,
+            'expected': expected,
+            'received': {},
+            'errors': [],
+            'created_at': time.time(),
+            'last_updated': time.time(),
+        }
+
+    t = Thread(target=_handle_file_transfer_session, args=(transfer_id,), daemon=True)
+    t.start()
+    return jsonify({'ok': True, 'transfer_id': transfer_id, 'file_socket_port': file_socket_port, 'errors': []})
+
+
+@app.route('/sendfilesfromserver/init/<appname>', methods=['POST'])
+def init_send_files_from_server(appname: str):
+    _cleanup_transfer_sessions()
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({'ok': False, 'errors': ['Expected JSON object payload']}), 400
+
+    transfer_id = payload.get('transfer_id', '')
+    paths = payload.get('paths', [])
+    chunk_size = int(payload.get('chunk_size', 64 * KB))
+    if not isinstance(transfer_id, str) or not transfer_id:
+        return jsonify({'ok': False, 'errors': ['Field "transfer_id" is required and must be a string']}), 400
+    if not isinstance(paths, list) or not paths:
+        return jsonify({'ok': False, 'errors': ['Field "paths" must be a non-empty list']}), 400
+    if _has_active_file_transfer():
+        return jsonify({'ok': False, 'errors': ['Another file transfer is currently active']}), 409
+
+    expected = {}
+    errors = []
+    for path in paths:
+        if not isinstance(path, str) or not path:
+            errors.append(f'Invalid path value: {path}')
+            continue
+        rel_path = unix_path(path)
+        try:
+            full_path = get_safe_project_path(rel_path)
+        except ValueError as e:
+            errors.append(f'Invalid rel_path "{rel_path}": {e}')
+            continue
+        if not os.path.exists(full_path) or not os.path.isfile(full_path):
+            errors.append(f'Path does not exist as a regular file on server: {rel_path}')
+            continue
+        expected[rel_path] = {
+            'full_path': full_path,
+            'size': os.path.getsize(full_path),
+            'sha256': _file_sha256(full_path),
+        }
+    if errors:
+        return jsonify({'ok': False, 'transfer_id': transfer_id, 'errors': errors}), 400
+
+    with SESSION_LOCK:
+        OUTBOUND_TRANSFER_SESSIONS[transfer_id] = {
+            'transfer_id': transfer_id,
+            'status': 'initialized',
+            'chunk_size': chunk_size,
+            'expected': expected,
+            'sent': {},
+            'errors': [],
+            'created_at': time.time(),
+            'last_updated': time.time(),
+        }
+    t = Thread(target=send_files_from_server, args=(transfer_id,), daemon=True)
+    t.start()
+    manifest = [
+        {'rel_path': rel_path, 'size': meta['size'], 'sha256': meta['sha256']}
+        for rel_path, meta in expected.items()
+    ]
+    return jsonify(
+        {
+            'ok': True,
+            'transfer_id': transfer_id,
+            'file_socket_port': file_socket_port,
+            'files': manifest,
+            'errors': [],
+        }
+    )
+
+
+@app.route('/sendfilesfromserver/complete/<appname>', methods=['POST'])
+def complete_send_files_from_server(appname: str):
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({'ok': False, 'errors': ['Expected JSON object payload']}), 400
+    transfer_id = payload.get('transfer_id', '')
+    if not isinstance(transfer_id, str) or not transfer_id:
+        return jsonify({'ok': False, 'errors': ['Field "transfer_id" is required and must be a string']}), 400
+
+    wait_deadline = time.time() + 10
+    while time.time() < wait_deadline:
+        with SESSION_LOCK:
+            session = OUTBOUND_TRANSFER_SESSIONS.get(transfer_id)
+            status = session.get('status', '') if session else ''
+        if not session:
+            return jsonify({'ok': False, 'errors': [f'Unknown transfer_id: {transfer_id}']}), 404
+        if status in ['sent', 'error']:
+            break
+        time.sleep(0.1)
+
+    with SESSION_LOCK:
+        session = OUTBOUND_TRANSFER_SESSIONS.get(transfer_id)
+        if not session:
+            return jsonify({'ok': False, 'errors': [f'Unknown transfer_id: {transfer_id}']}), 404
+        expected_paths = set(session.get('expected', {}).keys())
+        sent_map = session.get('sent', {})
+        sent_paths = {path for path, meta in sent_map.items() if meta.get('verified', False)}
+        missing_paths = sorted(expected_paths - sent_paths)
+        errors = list(session.get('errors', []))
+        if missing_paths:
+            errors.append(f'Missing or unverified files: {missing_paths}')
+        ok = len(errors) == 0 and len(sent_paths) == len(expected_paths)
+        session['status'] = 'completed' if ok else 'error'
+        session['last_updated'] = time.time()
+        sent_files = list(sent_map.values())
+    return jsonify({'ok': ok, 'sent_files': sent_files, 'errors': errors}), (200 if ok else 400)
+
+
+@app.route('/sendfilessocket/complete/<appname>', methods=['POST'])
+def complete_receive_files_socket(appname:str):
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({'ok': False, 'errors': ['Expected JSON object payload']}), 400
+    transfer_id = payload.get('transfer_id', '')
+    if not isinstance(transfer_id, str) or not transfer_id:
+        return jsonify({'ok': False, 'errors': ['Field "transfer_id" is required and must be a string']}), 400
+
+    wait_deadline = time.time() + 10
+    while time.time() < wait_deadline:
+        with SESSION_LOCK:
+            session = TRANSFER_SESSIONS.get(transfer_id)
+            status = session.get('status', '') if session else ''
+        if not session:
+            return jsonify({'ok': False, 'errors': [f'Unknown transfer_id: {transfer_id}']}), 404
+        if status in ['received', 'error']:
+            break
+        time.sleep(0.1)
+
+    with SESSION_LOCK:
+        session = TRANSFER_SESSIONS.get(transfer_id)
+        if not session:
+            return jsonify({'ok': False, 'errors': [f'Unknown transfer_id: {transfer_id}']}), 404
+        expected_paths = set(session.get('expected', {}).keys())
+        received_map = session.get('received', {})
+        verified_paths = {path for path, meta in received_map.items() if meta.get('verified', False)}
+        missing_paths = sorted(expected_paths - verified_paths)
+        errors = list(session.get('errors', []))
+        if missing_paths:
+            errors.append(f'Missing or unverified files: {missing_paths}')
+        ok = len(errors) == 0 and len(verified_paths) == len(expected_paths)
+        session['status'] = 'completed' if ok else 'error'
+        session['last_updated'] = time.time()
+        received_files = list(received_map.values())
+    status_code = 200 if ok else 400
+    return jsonify({'ok': ok, 'received_files': received_files, 'errors': errors}), status_code
+
+
+@app.route('/sendfilessocket/<appname>', methods=['POST'])
+def receive_files_socket_legacy(appname:str):
+    try:
+        data = request.get_json(silent=True) or {}
+        paths = data.get('filepaths', [])
+    except Exception:
+        paths = []
+    return jsonify(
+        {
+            'ok': False,
+            'errors': ['Legacy route no longer supported. Use /sendfilessocket/init/<appname> and /sendfilessocket/complete/<appname>.'],
+            'paths_seen': paths,
+        }
+    ), 410
 
 
 @app.route('/appname/<appname>', methods=['GET', 'POST'])
