@@ -92,7 +92,12 @@ def _receive_file_over_socket(server_addr:tuple[str, int]) -> bool:
 def _recv_exact(s: socket.socket, num_bytes: int) -> bytes:
     data = bytearray()
     while len(data) < num_bytes:
-        chunk = s.recv(num_bytes - len(data))
+        try:
+            chunk = s.recv(num_bytes - len(data))
+        except socket.timeout as e:
+            raise TimeoutError(
+                f'Socket read timed out while waiting for {num_bytes} bytes; received {len(data)} so far'
+            ) from e
         if not chunk:
             raise ConnectionError('Socket closed while reading expected bytes')
         data.extend(chunk)
@@ -109,9 +114,15 @@ def _send_frame(s: socket.socket, header: dict, payload: bytes = b'') -> None:
 
 
 def _recv_frame(s: socket.socket) -> tuple[dict, bytes]:
+    max_header_len = 64 * KB
+    max_payload_len = 8 * MB
     header_len = struct.unpack('!I', _recv_exact(s, 4))[0]
+    if header_len <= 0 or header_len > max_header_len:
+        raise ValueError(f'Invalid frame header length: {header_len}')
     header = json.loads(_recv_exact(s, header_len).decode('utf-8'))
     payload_len = struct.unpack('!I', _recv_exact(s, 4))[0]
+    if payload_len < 0 or payload_len > max_payload_len:
+        raise ValueError(f'Invalid frame payload length: {payload_len}')
     payload = _recv_exact(s, payload_len) if payload_len else b''
     return header, payload
 
@@ -320,11 +331,26 @@ def receive_files_from_server(server_addr: tuple[str, int], paths: list[str] | s
                 else:
                     print(f'Unknown frame type from server: {msg_type}')
                     return False
+        except TimeoutError as e:
+            active_rel_path = current_file.get('rel_path', '') if isinstance(current_file, dict) else ''
+            if active_rel_path:
+                print(f'Timed out receiving server file transfer while handling {active_rel_path}: {e}')
+            else:
+                print(f'Timed out receiving server file transfer: {e}')
+            return False
+        except (ConnectionError, ValueError, json.JSONDecodeError) as e:
+            print(f'Protocol/connection error while receiving files from server: {e}')
+            return False
         finally:
-            if current_file and current_file.get('handle') and not current_file['handle'].closed:
-                current_file['handle'].close()
-            if current_file and current_file.get('temp_path') and os.path.exists(current_file['temp_path']):
-                os.remove(current_file['temp_path'])
+            handle = None
+            temp_path = ''
+            if isinstance(current_file, dict):
+                handle = current_file.get('handle', None)
+                temp_path = current_file.get('temp_path', '')
+            if handle is not None and hasattr(handle, 'closed') and not handle.closed:
+                handle.close()
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
 
     complete_url = f'http://{ip}:{port}/sendfilesfromserver/complete/{app_name}'
     try:
@@ -464,28 +490,18 @@ def receive_files(server_addr:tuple[str, int]) -> bool:
 
 
 #Sort of like git push, but for uncommited changes and specifically from the server
-def send_current_changes(server_addr:tuple[str, int]) -> Response:
+def send_current_changes(server_addr:tuple[str, int]) -> bool:
     git_diff_path, changed_binary_paths = prepare_text_changes()
-
-    ip, port = server_addr
+    paths = [os.path.join(get_runtime_dir_path(), 'gitdiff.diff'), *changed_binary_paths]
+    print('sending paths:')
+    print(paths)
+    send_files(server_addr, paths)
     app_name = get_appname()
+    ip, port = server_addr
     url = f'http://{ip}:{port}/sendchanges/{app_name}'
-    filename = 'gitdiff.diff'
-
-    files = {'gitdiff': (filename, open(git_diff_path, 'rb'), 'text/plain', {'Expires': 0})}
-
-    
-    for i, path in enumerate(changed_binary_paths):
-        path = unix_path(path)
-        print(f'Adding {path} to POST request')
-        mimetype, encoding = guess_type(path, strict=False)
-        if not mimetype:
-            mimetype = 'application/octet-stream'
-        files[f'binaryfile{i}'] = (path, open(path, 'rb'), mimetype, {'Expires': 0})
-    print(f'Sending changes located at {git_diff_path} to {url}\n')
-    resp = requests.post(url, files=files)
-    return resp
-
+    resp:Response = requests.get(url)
+    resp.raise_for_status()
+    return True
 
 
 def retrieve_changed_file_list_on_server(server_addr:tuple[str, int]) -> list[str]:
@@ -592,7 +608,24 @@ def retrieve_current_binary_changes(server_addr:tuple[str, int]) -> bool:
 def retrieve_current_changes(server_addr:tuple[str, int], exclude_binary_changes=False, save_as_filename='gitdiff.diff') -> bool:
     retrieved_text_changes = retrieve_current_text_changes(server_addr, save_as_filename)
     if not exclude_binary_changes:
-        retrieved_binary_changes = retrieve_current_binary_changes(server_addr)
+        project_root = get_project_root_path()
+        ip, port = server_addr
+        app_name = get_appname()
+        url = f'http://{ip}:{port}/retrieve_changed_binary_paths/{app_name}'
+        try:
+            binary_paths_resp:Response = requests.get(url)
+            binary_paths_resp.raise_for_status()
+        except requests.RequestException as e:
+            print(f'Failed to retrieve binary path list: {e}')
+            return False
+        if not binary_paths_resp.text:
+            print('No changed binary files returned by server')
+
+        #split binary file paths into a list
+        paths = [path.strip() for path in binary_paths_resp.text.split('\n')]
+        paths = [path for path in paths if path] #remove empty paths
+        retrieved_binary_changes = receive_files_from_server(server_addr, paths)
+        # retrieved_binary_changes = retrieve_current_binary_changes(server_addr)
         return retrieved_text_changes and retrieved_binary_changes
     return retrieved_text_changes
 
