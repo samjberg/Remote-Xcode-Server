@@ -551,7 +551,7 @@ def send_binary_file(appname:str, path:str):
     return send_file(path, as_attachment=True)
 
 
-@app.route('/sendchanges/<appname>', methods=['POST'])
+@app.route('/sendchanges/<appname>', methods=['GET'])
 def receive_changes(appname):
     runtime_dir = get_runtime_dir_path()
     patch_path = os.path.join(runtime_dir, 'gitdiff.diff')
@@ -834,7 +834,7 @@ def receive_files_socket_legacy(appname:str):
     ), 410
 
 
-@app.route('/appname/<appname>', methods=['GET', 'POST'])
+@app.route('/start-build-job/<appname>', methods=['GET', 'POST'])
 def start_build_job(appname):
     print(f'appname: {appname}')
 

@@ -45,7 +45,7 @@ def retrieve_file(server_addr:tuple[str, int], path) -> bool:
 def start_build_job(server_addr:tuple[str, int], git_diff_path:str, changed_binary_paths:list[str]=[]) -> str:
     ip, port = server_addr
     app_name = get_appname()
-    url = f'http://{ip}:{port}/appname/{app_name}'
+    url = f'http://{ip}:{port}/start-build-job/{app_name}'
     filename = git_diff_path.split('/')[-1]
 
     files = {'gitdiff': (filename, open(git_diff_path, 'rb'), 'text/plain', {'Expires': 0})}
@@ -542,9 +542,7 @@ def retrieve_current_text_changes(server_addr:tuple[str, int], save_as_filename=
     with open(git_patch_path, 'wb') as f:
         f.write(diff_resp.content)
 
-    #apply patch
-    git_apply_command = f'git apply {git_patch_path}'
-    os.system(git_apply_command)
+    apply_patch(git_patch_path)
     return ran_successfully
 
 
