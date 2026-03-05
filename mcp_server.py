@@ -530,6 +530,17 @@ def run_git_action(appname:str):
     return jsonify(result)
 
 
+@app.route('/create-update-bundle/<appname>/<client_head>', methods=['GET'])
+def send_update_bundle(appname:str, client_head:str):
+    runtime_dir_path = get_runtime_dir_path()
+    bundle_name = 'update.bundle'
+    save_path = os.path.join(runtime_dir_path, bundle_name)
+    if not client_head:
+        print(f'Error: {client_head} not found in request.values.keys')
+        return f'Error: {client_head} not found in request.values.keys'
+    git_create_update_bundle(client_head, 'HEAD', save_path)
+    return save_path
+
 
 #note that <path:path> is NOT representing <variablename:variablename>. The full syntax for route variables is <converter:name>
 #so it is just a coincidence that the thing I'm trying to pass here as a variable in the url IS literally a path, which happens to be

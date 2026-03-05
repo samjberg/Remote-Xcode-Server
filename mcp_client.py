@@ -627,6 +627,30 @@ def retrieve_current_changes(server_addr:tuple[str, int], exclude_binary_changes
     return retrieved_text_changes
 
 
+def retrieve_git_update_bundle(server_addr:tuple[str, int], start_ref:str='HEAD') -> str:
+    ip, port = server_addr
+    app_name = get_appname()
+    start_ref = get_current_commit_hash(app_name) if start_ref == 'HEAD' else start_ref
+    url = f'http://{ip}:{port}/create-update-bundle/{app_name}/{start_ref}'
+    resp:Response = requests.get(url)
+    resp.raise_for_status()
+    if not resp.text:
+        print('Error: No response received from server.  Expected path to update bundle')
+
+    path = resp.text.strip()
+    success = receive_files_from_server(server_addr, [path])
+    if success:
+        return path
+    return None
+
+def send_git_update_bundle(server_addr:tuple[str, int], path:str='') -> bool:
+    if not path:
+        path = os.path.join(get_runtime_dir_path, 'update.bundle')
+    success = send_files(server_addr, [path])
+    return success
+    
+
+
 def get_current_server_commit_hash(server_addr:tuple[str, int], app_name:str='') -> str|None:
     ip, port = server_addr
     if app_name == '':
@@ -754,6 +778,14 @@ def _post_server_git_action(server_addr:tuple[str, int], action:str, args:dict|N
 
 def _run_local_git_action(action:str, args:dict|None=None) -> dict:
     return execute_git_action(action, args=args, cwd=get_project_root_path())
+
+
+def _get_reconcile_bundle_paths(filename:str='update.bundle') -> tuple[str, str]:
+    project_root = get_project_root_path()
+    runtime_dir = get_runtime_dir_path(project_root)
+    bundle_abs_path = os.path.join(runtime_dir, filename)
+    bundle_rel_path = _to_repo_relative_posix(bundle_abs_path, project_root)
+    return bundle_abs_path, bundle_rel_path
 
 
 def _format_action_failure(action_label:str, result:dict|None) -> str:
@@ -1062,71 +1094,152 @@ def reconcile_git_state(server_addr:tuple[str, int], app_name:str='') -> dict:
             target_branch='',
             target_commit='',
             actions_applied=actions_applied,
-            message='Tracked uncommitted changes detected; reconcile requires a clean tracked worktree on both sides.',
+            message='Tracked uncommitted changes detected; reconcile requires a clean tracked worktree on both sides. No fetch or bundle transfer was attempted.',
         )
 
-    local_has_server_head = git_has_commit(server_head, cwd=get_project_root_path())
-    server_has_local_result = _post_server_git_action(
-        server_addr,
-        'has_commit',
-        args={'commit': local_head},
-        app_name=app_name,
-    )
-    if server_has_local_result is None:
+    def recheck_commit_visibility() -> tuple[bool, bool] | None:
+        local_visibility = git_has_commit(server_head, cwd=get_project_root_path())
+        server_has_local_result_inner = _post_server_git_action(
+            server_addr,
+            'has_commit',
+            args={'commit': local_head},
+            app_name=app_name,
+        )
+        if server_has_local_result_inner is None:
+            return None
+        server_visibility = bool(server_has_local_result_inner.get('has_commit', False))
+        return local_visibility, server_visibility
+
+    initial_visibility = recheck_commit_visibility()
+    if initial_visibility is None:
         return _reconcile_result(
             RECONCILE_STATUS_ERROR,
             actions_applied=actions_applied,
             message='Failed while checking whether server can resolve client HEAD commit.',
         )
-    server_has_local_head = bool(server_has_local_result.get('has_commit', False))
+    local_has_server_head, server_has_local_head = initial_visibility
 
+    fetch_failures:list[str] = []
     if not local_has_server_head:
-        if not local_state.get('has_origin', False):
-            return _reconcile_result(
-                RECONCILE_STATUS_BLOCKED_NO_ORIGIN,
-                actions_applied=actions_applied,
-                message='Client is missing server commit and has no origin remote for fetch.',
-            )
         fetch_local = _run_local_git_action('fetch_origin', {})
         actions_applied.append('client:fetch_origin')
         if not fetch_local.get('success', False):
-            return _reconcile_result(
-                RECONCILE_STATUS_BLOCKED_MISSING_COMMIT_OBJECT,
-                actions_applied=actions_applied,
-                message='Client fetch from origin failed while trying to obtain server commit.',
-            )
+            fetch_failures.append(_format_action_failure('client:fetch_origin', fetch_local))
 
     if not server_has_local_head:
-        if not server_state.get('has_origin', False):
-            return _reconcile_result(
-                RECONCILE_STATUS_BLOCKED_NO_ORIGIN,
-                actions_applied=actions_applied,
-                message='Server is missing client commit and has no origin remote for fetch.',
-            )
         fetch_server = _post_server_git_action(server_addr, 'fetch_origin', args={}, app_name=app_name)
         actions_applied.append('server:fetch_origin')
         if not fetch_server or not fetch_server.get('success', False):
-            return _reconcile_result(
-                RECONCILE_STATUS_BLOCKED_MISSING_COMMIT_OBJECT,
-                actions_applied=actions_applied,
-                message='Server fetch from origin failed while trying to obtain client commit.',
-            )
+            fetch_failures.append(_format_action_failure('server:fetch_origin', fetch_server))
 
-    # Re-check commit visibility after fetches.
-    local_has_server_head = git_has_commit(server_head, cwd=get_project_root_path())
-    server_has_local_result = _post_server_git_action(
-        server_addr,
-        'has_commit',
-        args={'commit': local_head},
-        app_name=app_name,
-    )
-    if server_has_local_result is None:
+    # Re-check commit visibility after fetch attempts.
+    post_fetch_visibility = recheck_commit_visibility()
+    if post_fetch_visibility is None:
         return _reconcile_result(
             RECONCILE_STATUS_ERROR,
             actions_applied=actions_applied,
             message='Failed while re-checking server commit visibility after fetch.',
         )
-    server_has_local_head = bool(server_has_local_result.get('has_commit', False))
+    local_has_server_head, server_has_local_head = post_fetch_visibility
+
+    bundle_fallback_attempted = False
+    if not local_has_server_head and server_has_local_head:
+        bundle_abs_path, bundle_rel_path = _get_reconcile_bundle_paths()
+        create_server_bundle = _post_server_git_action(
+            server_addr,
+            'create_update_bundle',
+            {'path': bundle_rel_path, 'start_ref': local_head, 'end_ref': 'HEAD'},
+            app_name=app_name,
+        )
+        actions_applied.append('server:create_update_bundle')
+        if not create_server_bundle or not create_server_bundle.get('success', False):
+            return _reconcile_result(
+                RECONCILE_STATUS_ERROR,
+                actions_applied=actions_applied,
+                message=_format_action_failure('server:create_update_bundle', create_server_bundle),
+            )
+
+        success = receive_files_from_server(server_addr, [bundle_rel_path])
+        actions_applied.append('client:receive_update_bundle')
+        if not success:
+            return _reconcile_result(
+                RECONCILE_STATUS_ERROR,
+                actions_applied=actions_applied,
+                message='Failed to transfer update bundle from server.',
+            )
+
+        if not os.path.exists(bundle_abs_path):
+            return _reconcile_result(
+                RECONCILE_STATUS_ERROR,
+                actions_applied=actions_applied,
+                message=f'Update bundle missing after server transfer: {bundle_abs_path}',
+            )
+
+        apply_local_bundle = _run_local_git_action('apply_update_bundle', {'path': bundle_abs_path})
+        actions_applied.append('client:apply_update_bundle')
+        if not apply_local_bundle.get('success', False):
+            return _reconcile_result(
+                RECONCILE_STATUS_ERROR,
+                actions_applied=actions_applied,
+                message=_format_action_failure('client:apply_update_bundle', apply_local_bundle),
+            )
+        bundle_fallback_attempted = True
+    elif local_has_server_head and not server_has_local_head:
+        bundle_abs_path, bundle_rel_path = _get_reconcile_bundle_paths()
+        create_local_bundle = _run_local_git_action(
+            'create_update_bundle',
+            {'path': bundle_abs_path, 'start_ref': server_head, 'end_ref': 'HEAD'},
+        )
+        actions_applied.append('client:create_update_bundle')
+        if not create_local_bundle.get('success', False):
+            return _reconcile_result(
+                RECONCILE_STATUS_ERROR,
+                actions_applied=actions_applied,
+                message=_format_action_failure('client:create_update_bundle', create_local_bundle),
+            )
+
+        sent_bundle = send_files(server_addr, [bundle_abs_path])
+        actions_applied.append('client:send_update_bundle')
+        if not sent_bundle:
+            return _reconcile_result(
+                RECONCILE_STATUS_ERROR,
+                actions_applied=actions_applied,
+                message='Failed to send update bundle to server.',
+            )
+
+        apply_server_bundle = _post_server_git_action(
+            server_addr,
+            'apply_update_bundle',
+            args={'path': bundle_rel_path},
+            app_name=app_name,
+        )
+        actions_applied.append('server:apply_update_bundle')
+        if not apply_server_bundle or not apply_server_bundle.get('success', False):
+            return _reconcile_result(
+                RECONCILE_STATUS_ERROR,
+                actions_applied=actions_applied,
+                message=_format_action_failure('server:apply_update_bundle', apply_server_bundle),
+            )
+        bundle_fallback_attempted = True
+    elif not local_has_server_head and not server_has_local_head:
+        message = 'both_sides_missing_commits_after_fetch; bundle_fallback_skipped'
+        if fetch_failures:
+            message = f'{message}; {' | '.join(fetch_failures)}'
+        return _reconcile_result(
+            RECONCILE_STATUS_BLOCKED_MISSING_COMMIT_OBJECT,
+            actions_applied=actions_applied,
+            message=message,
+        )
+
+    if bundle_fallback_attempted:
+        post_bundle_visibility = recheck_commit_visibility()
+        if post_bundle_visibility is None:
+            return _reconcile_result(
+                RECONCILE_STATUS_ERROR,
+                actions_applied=actions_applied,
+                message='Failed while re-checking server commit visibility after bundle fallback.',
+            )
+        local_has_server_head, server_has_local_head = post_bundle_visibility
 
     if not local_has_server_head or not server_has_local_head:
         missing_bits = []
@@ -1134,6 +1247,8 @@ def reconcile_git_state(server_addr:tuple[str, int], app_name:str='') -> dict:
             missing_bits.append('client_missing_server_commit')
         if not server_has_local_head:
             missing_bits.append('server_missing_client_commit')
+        if fetch_failures:
+            missing_bits.extend(fetch_failures)
         return _reconcile_result(
             RECONCILE_STATUS_BLOCKED_MISSING_COMMIT_OBJECT,
             actions_applied=actions_applied,
