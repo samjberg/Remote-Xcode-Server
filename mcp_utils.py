@@ -543,7 +543,7 @@ def execute_git_action(action:str, args:dict|None=None, cwd:str|None=None) -> di
         command = ['git', 'bundle', 'create', args['path'], f'{args['start_ref']}..{args['end_ref']}', '--all']
     elif action == 'apply_update_bundle':
         if is_subdir(args['path'], get_project_root_path()):
-            command = ['git', 'fetch', args['path'], "'+refs/heads/*:refs/heads/*'", "'+refs/tags/*:refs/tags/*'"]
+            command = ['git', 'fetch', args['path'], '+refs/heads/*:refs/heads/*', '+refs/tags/*:refs/tags/*']
         else:
             raise PermissionError('path argument must be inside of repo')
     else:
