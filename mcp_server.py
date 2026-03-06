@@ -440,19 +440,6 @@ def run_xcodebuild(job_id):
         JOBS[job_id]['error'] = str(e)
 
 
-def _send_file_over_socket(path:str, chunk_size=32*KB) -> bool:
-    print('Legacy _send_file_over_socket is disabled. Use /sendfilessocket/init and /complete flow.')
-    return False
-
-
-
-def _receive_file_over_socket(conn:socket.socket=server) -> bool:
-    print('Legacy _receive_file_over_socket is disabled. Use framed transfer session handlers.')
-    return True
-
-
-
-
 
 @app.route('/retrieve_text_changes/<appname>')
 def send_changes(appname:str):

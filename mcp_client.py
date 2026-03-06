@@ -10,8 +10,6 @@ def configure_stdio():
         sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 
-def get_jobid_from_resp(resp:Response):
-    return json.loads(resp.text)['job_id']
 
 def retrieve_file(server_addr:tuple[str, int], path) -> bool:
     ip, port = server_addr
@@ -82,11 +80,6 @@ def wait_for_build_completion(server_addr:tuple[str, int], job_id:str, offset=0)
             full_text += new_text
 
     return full_text
-
-
-def _receive_file_over_socket(server_addr:tuple[str, int]) -> bool:
-    print('Legacy _receive_file_over_socket is disabled. Use send_files() transfer APIs.')
-    return False
 
 
 def _recv_exact(s: socket.socket, num_bytes: int) -> bytes:
@@ -502,25 +495,6 @@ def send_current_changes(server_addr:tuple[str, int]) -> bool:
     resp.raise_for_status()
     return True
 
-
-def retrieve_changed_file_list_on_server(server_addr:tuple[str, int]) -> list[str]:
-    ip, port = server_addr
-    app_name = get_appname()
-    url = f'http://{ip}:{port}/retrieve_changed_file_paths/{app_name}'
-    try:
-        diff_resp:Response = requests.get(url, stream=True)
-    except requests.RequestException as e:
-        print(f'Failed to retrieve list of changed file paths: {e}')
-        return []
-    
-    if not diff_resp.text:
-        print('Received empty path list')
-        return []
-
-    changed_file_paths = diff_resp.text.split('\n')
-    return changed_file_paths
-    
-
 def retrieve_current_text_changes(server_addr:tuple[str, int], save_as_filename='gitdiff.diff') -> bool:
     ip, port = server_addr
     app_name = get_appname()
@@ -545,62 +519,6 @@ def retrieve_current_text_changes(server_addr:tuple[str, int], save_as_filename=
     return ran_successfully
 
 
-def retrieve_current_binary_changes(server_addr:tuple[str, int]) -> bool:
-    ip, port = server_addr
-    app_name = get_appname()
-    project_root = get_project_root_path()
-    url = f'http://{ip}:{port}/retrieve_changed_binary_paths/{app_name}'
-    try:
-        binary_paths_resp:Response = requests.get(url)
-        binary_paths_resp.raise_for_status()
-    except requests.RequestException as e:
-        print(f'Failed to retrieve binary path list: {e}')
-        return False
-    if not binary_paths_resp.text:
-        print('No changed binary files returned by server')
-
-    #split binary file paths into a list
-    paths = [path.strip() for path in binary_paths_resp.text.split('\n')]
-    paths = [path for path in paths if path] #remove empty paths
-
-    for path in paths:
-        print(f'trying to save binary file to path: {path}')
-        #verify that the directory in which we are supposed to write the binary file to already exists.  If not, create it and all intermediate directories with os.makedirs
-        parent_dir = os.path.dirname(path)
-
-        #if parent_dir is an empty string, this means that the "path" is actually just a filename.  So
-        if parent_dir == '':
-            parent_dir = get_project_root_path()
-
-        if os.path.isabs(path):
-            if is_subdir(path, project_root):
-                path = os.path.realpath(path)
-            else:
-                print('ERROR: CANNOT ACCEPT FILES FROM OUTSIDE PROJECT ROOT')
-                return False
-
-        if not os.path.exists(parent_dir):
-            os.makedirs(parent_dir, exist_ok=True)
-
-        filename = os.path.split(path)[-1]
-        print(f'Retrieving {filename} from server')
-        sanitized_path = urllib.parse.quote(path, safe='/')
-        url = f'http://{ip}:{port}/retrieve_binary_file/{app_name}/{sanitized_path}'
-        try:
-            resp:Response = requests.get(url, stream=True)
-            resp.raise_for_status()
-        except requests.RequestException as e:
-            print(f'Failed to retrieve binary file {path}: {e}')
-            ran_successfully = False
-            continue
-        chunk_size = 1024 * 8
-        with open(path, 'wb') as f:
-            for chunk in resp.iter_content(chunk_size=chunk_size):
-                f.write(chunk)
-    
-    return True #the idea is just to return True/False based on whether everything runs successfully or not, but I haven't really implemented that yet
-
-
 #Sort of like git pull, but for uncommitted changes and specifically to the server
 def retrieve_current_changes(server_addr:tuple[str, int], exclude_binary_changes=False, save_as_filename='gitdiff.diff') -> bool:
     retrieved_text_changes = retrieve_current_text_changes(server_addr, save_as_filename)
@@ -622,76 +540,10 @@ def retrieve_current_changes(server_addr:tuple[str, int], exclude_binary_changes
         paths = [path.strip() for path in binary_paths_resp.text.split('\n')]
         paths = [path for path in paths if path] #remove empty paths
         retrieved_binary_changes = receive_files_from_server(server_addr, paths)
-        # retrieved_binary_changes = retrieve_current_binary_changes(server_addr)
         return retrieved_text_changes and retrieved_binary_changes
     return retrieved_text_changes
 
 
-def retrieve_git_update_bundle(server_addr:tuple[str, int], start_ref:str='HEAD') -> str:
-    ip, port = server_addr
-    app_name = get_appname()
-    start_ref = get_current_commit_hash(app_name) if start_ref == 'HEAD' else start_ref
-    url = f'http://{ip}:{port}/create-update-bundle/{app_name}/{start_ref}'
-    resp:Response = requests.get(url)
-    resp.raise_for_status()
-    if not resp.text:
-        print('Error: No response received from server.  Expected path to update bundle')
-
-    path = resp.text.strip()
-    success = receive_files_from_server(server_addr, [path])
-    if success:
-        return path
-    return None
-
-def send_git_update_bundle(server_addr:tuple[str, int], path:str='') -> bool:
-    if not path:
-        path = os.path.join(get_runtime_dir_path, 'update.bundle')
-    success = send_files(server_addr, [path])
-    return success
-    
-
-
-def get_current_server_commit_hash(server_addr:tuple[str, int], app_name:str='') -> str|None:
-    ip, port = server_addr
-    if app_name == '':
-        app_name = get_appname()
-
-    url = f'http://{ip}:{port}/retrieve_current_commit_hash/{app_name}'
-
-    try:
-        resp:Response = requests.get(url)
-    except requests.RequestException as e:
-        print(f"Failed to retrieve server's current commit hash")
-        return None
-    
-    if not resp.text:
-        print(f"Received empty string as server's current commit hash")
-        return None
-
-    commit_hash = resp.text.strip()
-    return commit_hash
-
-
-def retrieve_git_branches_from_server(server_addr:tuple[str, int], app_name:str='', sort_order:str='creatordate') -> list[str] | tuple[list[str], str]:
-    ip, port = server_addr
-    valid_sort_orders = ['creatordate', 'committerdate', 'taggerdate', 'authordate']
-    if not sort_order in valid_sort_orders:
-        sort_order = valid_sort_orders[0]
-    url = f'http://{ip}:{port}/retrieve_git_branches/{app_name}/{sort_order}'
-    try:
-        resp = requests.get(url)
-    except requests.RequestException as e:
-        print("Failed to retrieve server's local git branches")
-        return []
-    
-    if not resp.text:
-        print(f"Received an empty string as server's git branches.  Something almost certainly went wrong")
-        return []
-
-    resp_obj = json.loads(resp.text)
-    server_branches = resp_obj['branches']
-    server_current_branch = resp_obj['current_branch']
-    return server_branches, server_current_branch
 
 
 RECONCILE_STATUS_ALIGNED = 'ALIGNED'
