@@ -490,8 +490,9 @@ def send_current_changes(server_addr:tuple[str, int]) -> bool:
     send_files(server_addr, paths)
     app_name = get_appname()
     ip, port = server_addr
-    url = f'http://{ip}:{port}/apply-patch-server/{app_name}'
-    resp:Response = requests.get(url, git_diff_path)
+    # Server route expects a repo-relative patch path under query key "patch_path".
+    patch_rel_path = _to_repo_relative_posix(git_diff_path, get_project_root_path())
+    resp:Response = apply_patch_server(server_addr, patch_rel_path)
     resp.raise_for_status()
     return True
 
@@ -538,9 +539,10 @@ def retrieve_current_changes(server_addr:tuple[str, int], exclude_binary_changes
 
         #split binary file paths into a list
         paths = [path.strip() for path in binary_paths_resp.text.split('\n')]
-        paths = [path for path in paths if path] #remove empty paths
-        retrieved_binary_changes = receive_files_from_server(server_addr, paths)
-        return retrieved_text_changes and retrieved_binary_changes
+        paths = [_to_repo_relative_posix(path, project_root) for path in paths if path] #remove empty paths
+        if paths: #only send binary changes if there are binary changes to be sent.  Otherwise we get a 400 error
+            retrieved_binary_changes = receive_files_from_server(server_addr, paths)
+            return retrieved_text_changes and retrieved_binary_changes
     return retrieved_text_changes
 
 
