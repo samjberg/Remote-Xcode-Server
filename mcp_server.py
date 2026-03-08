@@ -5,8 +5,27 @@ from werkzeug.utils import secure_filename
 from mcp_utils import *
 # from requests import Request
 
+server_port = 8751
+server_socket_port = 50271
+discovery_socket_port = 9346
+file_socket_port = 47283
+
+def get_server_port() -> int:
+    return server_port
+
+def start_discovery_listener():
+    #use SOCK_DGRAM for UDP instead of TCP
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(('0.0.0.0', discovery_socket_port))
+    while True:
+        msg_bytes, addr = s.recvfrom(1*KB)
+        if msg_bytes.startswith(b'RXS_DISCOVERY_REQ'):
+            resp_str = f'RXS_SERVER_HERE\nports|server_port:{server_port},server_socket_port:{server_socket_port},file_socket_port:{file_socket_port}'
+            s.sendto(resp_str.encode(errors='replace'), addr)
 
 
+
+#establish several filesystem level global variables
 cwd = unix_path(os.getcwd())
 project_name = get_project_name()
 server_dir_name = get_runtime_dir_name()
@@ -14,13 +33,17 @@ server_dir_path = os.path.join(cwd, server_dir_name)
 project_info_filename = 'projectinfo.txt'
 project_info_filepath = os.path.join(server_dir_path, project_info_filename)
 
-server_socket_port = 50271 
+#set up sockets for streaming xcode commands (server) and sending/receiving files (filesocket)
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server.bind(('0.0.0.0', server_socket_port))
 server.listen(1)
 filesocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 filesocket.bind(('0.0.0.0', file_socket_port))
 filesocket.listen(1)
+
+#launch thread that reports back to client on server discovery broadcast requests
+discovery_thread = Thread(target=start_discovery_listener, args=[], daemon=True)
+discovery_thread.start()
 
 update_gitignore()
 

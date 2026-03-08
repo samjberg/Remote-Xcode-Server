@@ -2,6 +2,8 @@ import sys, os, socket, requests, json, urllib, hashlib, struct
 from requests import Response
 from mcp_utils import *
 
+discovery_socket_port = 9346
+
 def configure_stdio():
     """Ensure redirected output can represent UTF-8 build logs on Windows."""
     if hasattr(sys.stdout, 'reconfigure'):
@@ -40,6 +42,52 @@ def retrieve_file(server_addr:tuple[str, int], path) -> bool:
     return ran_successfully
 
 
+def discover_server() -> tuple[str, dict[str, int]]:
+    '''Attempts to discover the server on the local network using UDP broadcasting.  If successful, returns [server_ip, ports_dict], where
+        server_ip: Self explanitory, the IP address of the server on the local network
+        ports_dict: a dictionary containing relevant port numbers
+    '''
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    s.settimeout(2.0)
+
+    s.sendto(b'RXS_DISCOVERY_REQ', ('<broadcast>', discovery_socket_port))
+    try:
+        resp_bytes, addr = s.recvfrom(1*KB)
+        resp = resp_bytes.decode()
+        discovered_server_ip = addr[0]
+
+    except socket.timeout:
+        return None
+
+    resp_parts = resp.splitlines()
+    if len(resp_parts) == 2:
+        respcode, ports_part = resp_parts
+    elif len(resp_parts) > 2:
+        print(f'Too many lines in discovery response from server. Server returned:\n{resp}')
+        return None
+    else: #resp_parts < 2
+        print(f'Too few lines in discovery response from server.  Server returned:\n{resp}')
+        return None
+
+    if respcode.strip() != 'RXS_SERVER_HERE':
+        print(f'ERROR: Did not receive valid server discovery response code: RXS_SERVER_HERE\nInstead, receieved: {respcode.strip()}')
+        return None
+    elif not ports_part.startswith('ports|'):
+        print(f'ERROR: Did not receive valid port list from server in discovery response.  Receieved: {ports_part}')
+        return None
+    
+    ports_dict_str = ports_part.split('|')[-1]
+    ports_dict = {}
+
+    for entry in ports_dict_str.split(','):
+        key, val = entry.split(':')
+        port = int(val.strip())
+        ports_dict[key] = port
+    
+    return discovered_server_ip, ports_dict
+
+
 def start_build_job(server_addr:tuple[str, int], git_diff_path:str, changed_binary_paths:list[str]=[]) -> str:
     ip, port = server_addr
     app_name = get_appname()
@@ -64,9 +112,8 @@ def check_build_job(server_addr:tuple[str, int], job_id:str, offset:int=0) -> Re
     resp = requests.get(url)
     return resp
 
-def wait_for_build_completion(server_addr:tuple[str, int], job_id:str, offset=0) -> str:
+def wait_for_build_completion(server_addr:tuple[str, int], job_id:str, server_socket_port:int, offset=0) -> str:
     ip, port = server_addr
-    server_socket_port = 50271
     chunk_size = 4096
     full_text = ''
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -237,7 +284,7 @@ def receive_files_from_server(server_addr: tuple[str, int], paths: list[str] | s
     project_root = get_project_root_path(os.getcwd())
     received_verified: set[str] = set()
     current_file = None
-    sock_port = int(init_obj.get('file_socket_port', file_socket_port))
+    sock_port = int(init_obj['file_socket_port'])
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.connect((ip, sock_port))
         s.settimeout(60)
@@ -433,7 +480,7 @@ def send_files(server_addr:tuple[str, int], paths:list[str]|str, filesize_thresh
         print(f"Server rejected init for transfer {transfer_id}: {init_obj.get('errors', [])}")
         return False
 
-    sock_port = int(init_obj.get('file_socket_port', file_socket_port))
+    sock_port = int(init_obj['file_socket_port'])
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.connect((ip, sock_port))
         s.settimeout(60)
@@ -1341,33 +1388,58 @@ if __name__ == '__main__':
     configure_stdio()
 
     cwd = unix_path(os.getcwd())
-    server_ip, server_port = '192.168.7.189', get_server_port() 
-    server_addr = (server_ip, server_port)
     BUILD_SUCCESS = '** BUILD SUCCEEDED **'
     BUILD_FAILED = '** BUILD FAILED **'
 
 
 
-    runtime_dir = get_runtime_dir_name()
-    diffs_path = unix_path(os.path.join(cwd, runtime_dir))
+    runtime_dir_name = get_runtime_dir_name()
+    runtime_dir = unix_path(os.path.join(cwd, runtime_dir_name))
     gitignore_path = os.path.join(cwd, '.gitignore')
-    git_diff_filepath = unix_path(os.path.join(diffs_path, 'gitdiff.diff'))
+    git_diff_filepath = unix_path(os.path.join(runtime_dir, 'gitdiff.diff'))
     git_add_command = 'git add .'
 
+    #ensure that runtime_dir (location where created/received files will go) exists, and if not, create it
+    if os.path.exists(runtime_dir):
+        if not os.path.isdir(runtime_dir): #diffs_path exists but is a file instead of a directory.  Delete it, and a make a directory in its place
+            os.remove(runtime_dir)
+            os.mkdir(runtime_dir)
+    else:
+        os.mkdir(runtime_dir)
+    #End of all first-run initialization
 
+
+    #Try to find saved server info (ip and various ports) in serverinfo.txt
+    serverinfo_path = os.path.join(runtime_dir, 'serverinfo.txt')
+    if os.path.exists(serverinfo_path):
+        with open(serverinfo_path, 'r') as f:
+            serverinfo_dict = json.load(f)
+            
+    else:
+        # server_ip, serverinfo_dict = discover_server()
+        server_ip, serverinfo_dict = '192.168.7.189', {'server_ip': '192.168.7.189', 'server_port': 8751, 'server_socket_port': 50271, 'file_socket_port': 47283}
+        if not 'server_ip' in serverinfo_dict.keys():
+            serverinfo_dict['server_ip'] = server_ip
+
+        with open(serverinfo_path, 'w') as f:
+            json.dump(serverinfo_dict, f)
+
+    required_keys = ['server_ip', 'server_port', 'server_socket_port', 'file_socket_port']
+    missing_keys = [key for key in required_keys if key not in serverinfo_dict]
+    if missing_keys:
+        raise KeyError(f'serverinfo.txt is missing required keys: {missing_keys}')
+
+    server_ip = serverinfo_dict['server_ip']
+    server_port = int(serverinfo_dict['server_port'])
+    server_socket_port = int(serverinfo_dict['server_socket_port'])
+    file_socket_port = int(serverinfo_dict['file_socket_port'])
+    server_addr = (server_ip, server_port)
+ 
 
     update_gitignore()
 
 
-    #if 
-    if os.path.exists(diffs_path):
-        if not os.path.isdir(diffs_path): #diffs_path exists but is a file instead of a directory.  Delete it, and a make a directory in its place
-            os.remove(diffs_path)
-            os.mkdir(diffs_path)
-    else:
-        os.mkdir(diffs_path)
-    #End of all first-run initialization
-
+    
 
 
 
@@ -1382,7 +1454,7 @@ if __name__ == '__main__':
         resp:Response = start_build_job(server_addr, git_diff_filepath, changed_binary_paths)
         json_obj = json.loads(resp.text)
         job_id = json_obj['job_id']
-        build_log_str = wait_for_build_completion(server_addr, job_id)
+        build_log_str = wait_for_build_completion(server_addr, job_id, server_socket_port)
         # print('final build log')
         # print(build_log_str)
     elif 'sendchanges' in arg:

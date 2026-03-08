@@ -5,7 +5,7 @@ from mcp_client import send_files
 args = sys.argv[1:]
 from_ref = args[0]
 to_ref = args[1] if len(args) > 1 else 'HEAD'
-server_addr = ('192.168.7.189', get_server_port())
+server_addr = ('192.168.7.189', 8751)
 
 
 bundle_path = git_create_update_bundle(from_ref, to_ref, 'update.bundle')

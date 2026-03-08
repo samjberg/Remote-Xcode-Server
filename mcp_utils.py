@@ -9,15 +9,7 @@ P = ParamSpec("P")
 R = TypeVar("R", bound=subprocess.CompletedProcess)
 KB = 1024
 MB = KB * KB
-
-
-server_port = 8751
-server_socket_port = 50271
-file_socket_port = 47283
 runtime_dir_name = '.remote-xcode-server'
-
-def get_server_port() -> int:
-    return server_port
 
 def get_runtime_dir_name() -> str:
     return runtime_dir_name
