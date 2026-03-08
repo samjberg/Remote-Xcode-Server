@@ -1416,8 +1416,7 @@ if __name__ == '__main__':
             serverinfo_dict = json.load(f)
             
     else:
-        # server_ip, serverinfo_dict = discover_server()
-        server_ip, serverinfo_dict = '192.168.7.189', {'server_ip': '192.168.7.189', 'server_port': 8751, 'server_socket_port': 50271, 'file_socket_port': 47283}
+        server_ip, serverinfo_dict = discover_server()
         if not 'server_ip' in serverinfo_dict.keys():
             serverinfo_dict['server_ip'] = server_ip
 
