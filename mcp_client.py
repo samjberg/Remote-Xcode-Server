@@ -2,6 +2,8 @@ import sys, os, socket, requests, json, urllib, hashlib, struct
 from requests import Response
 from mcp_utils import *
 
+discovery_socket_port = 9346
+
 def configure_stdio():
     """Ensure redirected output can represent UTF-8 build logs on Windows."""
     if hasattr(sys.stdout, 'reconfigure'):
@@ -10,8 +12,6 @@ def configure_stdio():
         sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 
-def get_jobid_from_resp(resp:Response):
-    return json.loads(resp.text)['job_id']
 
 def retrieve_file(server_addr:tuple[str, int], path) -> bool:
     ip, port = server_addr
@@ -42,6 +42,52 @@ def retrieve_file(server_addr:tuple[str, int], path) -> bool:
     return ran_successfully
 
 
+def discover_server() -> tuple[str, dict[str, int]]:
+    '''Attempts to discover the server on the local network using UDP broadcasting.  If successful, returns [server_ip, ports_dict], where
+        server_ip: Self explanitory, the IP address of the server on the local network
+        ports_dict: a dictionary containing relevant port numbers
+    '''
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    s.settimeout(2.0)
+
+    s.sendto(b'RXS_DISCOVERY_REQ', ('<broadcast>', discovery_socket_port))
+    try:
+        resp_bytes, addr = s.recvfrom(1*KB)
+        resp = resp_bytes.decode()
+        discovered_server_ip = addr[0]
+
+    except socket.timeout:
+        return None
+
+    resp_parts = resp.splitlines()
+    if len(resp_parts) == 2:
+        respcode, ports_part = resp_parts
+    elif len(resp_parts) > 2:
+        print(f'Too many lines in discovery response from server. Server returned:\n{resp}')
+        return None
+    else: #resp_parts < 2
+        print(f'Too few lines in discovery response from server.  Server returned:\n{resp}')
+        return None
+
+    if respcode.strip() != 'RXS_SERVER_HERE':
+        print(f'ERROR: Did not receive valid server discovery response code: RXS_SERVER_HERE\nInstead, receieved: {respcode.strip()}')
+        return None
+    elif not ports_part.startswith('ports|'):
+        print(f'ERROR: Did not receive valid port list from server in discovery response.  Receieved: {ports_part}')
+        return None
+    
+    ports_dict_str = ports_part.split('|')[-1]
+    ports_dict = {}
+
+    for entry in ports_dict_str.split(','):
+        key, val = entry.split(':')
+        port = int(val.strip())
+        ports_dict[key] = port
+    
+    return discovered_server_ip, ports_dict
+
+
 def start_build_job(server_addr:tuple[str, int], git_diff_path:str, changed_binary_paths:list[str]=[]) -> str:
     ip, port = server_addr
     app_name = get_appname()
@@ -66,9 +112,8 @@ def check_build_job(server_addr:tuple[str, int], job_id:str, offset:int=0) -> Re
     resp = requests.get(url)
     return resp
 
-def wait_for_build_completion(server_addr:tuple[str, int], job_id:str, offset=0) -> str:
+def wait_for_build_completion(server_addr:tuple[str, int], job_id:str, server_socket_port:int, offset=0) -> str:
     ip, port = server_addr
-    server_socket_port = 50271
     chunk_size = 4096
     full_text = ''
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -82,11 +127,6 @@ def wait_for_build_completion(server_addr:tuple[str, int], job_id:str, offset=0)
             full_text += new_text
 
     return full_text
-
-
-def _receive_file_over_socket(server_addr:tuple[str, int]) -> bool:
-    print('Legacy _receive_file_over_socket is disabled. Use send_files() transfer APIs.')
-    return False
 
 
 def _recv_exact(s: socket.socket, num_bytes: int) -> bytes:
@@ -244,7 +284,7 @@ def receive_files_from_server(server_addr: tuple[str, int], paths: list[str] | s
     project_root = get_project_root_path(os.getcwd())
     received_verified: set[str] = set()
     current_file = None
-    sock_port = int(init_obj.get('file_socket_port', file_socket_port))
+    sock_port = int(init_obj['file_socket_port'])
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.connect((ip, sock_port))
         s.settimeout(60)
@@ -440,7 +480,7 @@ def send_files(server_addr:tuple[str, int], paths:list[str]|str, filesize_thresh
         print(f"Server rejected init for transfer {transfer_id}: {init_obj.get('errors', [])}")
         return False
 
-    sock_port = int(init_obj.get('file_socket_port', file_socket_port))
+    sock_port = int(init_obj['file_socket_port'])
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.connect((ip, sock_port))
         s.settimeout(60)
@@ -497,29 +537,11 @@ def send_current_changes(server_addr:tuple[str, int]) -> bool:
     send_files(server_addr, paths)
     app_name = get_appname()
     ip, port = server_addr
-    url = f'http://{ip}:{port}/apply-patch-server/{app_name}'
-    resp:Response = requests.get(url, git_diff_path)
+    # Server route expects a repo-relative patch path under query key "patch_path".
+    patch_rel_path = _to_repo_relative_posix(git_diff_path, get_project_root_path())
+    resp:Response = apply_patch_server(server_addr, patch_rel_path)
     resp.raise_for_status()
     return True
-
-
-def retrieve_changed_file_list_on_server(server_addr:tuple[str, int]) -> list[str]:
-    ip, port = server_addr
-    app_name = get_appname()
-    url = f'http://{ip}:{port}/retrieve_changed_file_paths/{app_name}'
-    try:
-        diff_resp:Response = requests.get(url, stream=True)
-    except requests.RequestException as e:
-        print(f'Failed to retrieve list of changed file paths: {e}')
-        return []
-    
-    if not diff_resp.text:
-        print('Received empty path list')
-        return []
-
-    changed_file_paths = diff_resp.text.split('\n')
-    return changed_file_paths
-    
 
 def retrieve_current_text_changes(server_addr:tuple[str, int], save_as_filename='gitdiff.diff') -> bool:
     ip, port = server_addr
@@ -545,62 +567,6 @@ def retrieve_current_text_changes(server_addr:tuple[str, int], save_as_filename=
     return ran_successfully
 
 
-def retrieve_current_binary_changes(server_addr:tuple[str, int]) -> bool:
-    ip, port = server_addr
-    app_name = get_appname()
-    project_root = get_project_root_path()
-    url = f'http://{ip}:{port}/retrieve_changed_binary_paths/{app_name}'
-    try:
-        binary_paths_resp:Response = requests.get(url)
-        binary_paths_resp.raise_for_status()
-    except requests.RequestException as e:
-        print(f'Failed to retrieve binary path list: {e}')
-        return False
-    if not binary_paths_resp.text:
-        print('No changed binary files returned by server')
-
-    #split binary file paths into a list
-    paths = [path.strip() for path in binary_paths_resp.text.split('\n')]
-    paths = [path for path in paths if path] #remove empty paths
-
-    for path in paths:
-        print(f'trying to save binary file to path: {path}')
-        #verify that the directory in which we are supposed to write the binary file to already exists.  If not, create it and all intermediate directories with os.makedirs
-        parent_dir = os.path.dirname(path)
-
-        #if parent_dir is an empty string, this means that the "path" is actually just a filename.  So
-        if parent_dir == '':
-            parent_dir = get_project_root_path()
-
-        if os.path.isabs(path):
-            if is_subdir(path, project_root):
-                path = os.path.realpath(path)
-            else:
-                print('ERROR: CANNOT ACCEPT FILES FROM OUTSIDE PROJECT ROOT')
-                return False
-
-        if not os.path.exists(parent_dir):
-            os.makedirs(parent_dir, exist_ok=True)
-
-        filename = os.path.split(path)[-1]
-        print(f'Retrieving {filename} from server')
-        sanitized_path = urllib.parse.quote(path, safe='/')
-        url = f'http://{ip}:{port}/retrieve_binary_file/{app_name}/{sanitized_path}'
-        try:
-            resp:Response = requests.get(url, stream=True)
-            resp.raise_for_status()
-        except requests.RequestException as e:
-            print(f'Failed to retrieve binary file {path}: {e}')
-            ran_successfully = False
-            continue
-        chunk_size = 1024 * 8
-        with open(path, 'wb') as f:
-            for chunk in resp.iter_content(chunk_size=chunk_size):
-                f.write(chunk)
-    
-    return True #the idea is just to return True/False based on whether everything runs successfully or not, but I haven't really implemented that yet
-
-
 #Sort of like git pull, but for uncommitted changes and specifically to the server
 def retrieve_current_changes(server_addr:tuple[str, int], exclude_binary_changes=False, save_as_filename='gitdiff.diff') -> bool:
     retrieved_text_changes = retrieve_current_text_changes(server_addr, save_as_filename)
@@ -620,54 +586,13 @@ def retrieve_current_changes(server_addr:tuple[str, int], exclude_binary_changes
 
         #split binary file paths into a list
         paths = [path.strip() for path in binary_paths_resp.text.split('\n')]
-        paths = [path for path in paths if path] #remove empty paths
-        retrieved_binary_changes = receive_files_from_server(server_addr, paths)
-        # retrieved_binary_changes = retrieve_current_binary_changes(server_addr)
-        return retrieved_text_changes and retrieved_binary_changes
+        paths = [_to_repo_relative_posix(path, project_root) for path in paths if path] #remove empty paths
+        if paths: #only send binary changes if there are binary changes to be sent.  Otherwise we get a 400 error
+            retrieved_binary_changes = receive_files_from_server(server_addr, paths)
+            return retrieved_text_changes and retrieved_binary_changes
     return retrieved_text_changes
 
 
-def get_current_server_commit_hash(server_addr:tuple[str, int], app_name:str='') -> str|None:
-    ip, port = server_addr
-    if app_name == '':
-        app_name = get_appname()
-
-    url = f'http://{ip}:{port}/retrieve_current_commit_hash/{app_name}'
-
-    try:
-        resp:Response = requests.get(url)
-    except requests.RequestException as e:
-        print(f"Failed to retrieve server's current commit hash")
-        return None
-    
-    if not resp.text:
-        print(f"Received empty string as server's current commit hash")
-        return None
-
-    commit_hash = resp.text.strip()
-    return commit_hash
-
-
-def retrieve_git_branches_from_server(server_addr:tuple[str, int], app_name:str='', sort_order:str='creatordate') -> list[str] | tuple[list[str], str]:
-    ip, port = server_addr
-    valid_sort_orders = ['creatordate', 'committerdate', 'taggerdate', 'authordate']
-    if not sort_order in valid_sort_orders:
-        sort_order = valid_sort_orders[0]
-    url = f'http://{ip}:{port}/retrieve_git_branches/{app_name}/{sort_order}'
-    try:
-        resp = requests.get(url)
-    except requests.RequestException as e:
-        print("Failed to retrieve server's local git branches")
-        return []
-    
-    if not resp.text:
-        print(f"Received an empty string as server's git branches.  Something almost certainly went wrong")
-        return []
-
-    resp_obj = json.loads(resp.text)
-    server_branches = resp_obj['branches']
-    server_current_branch = resp_obj['current_branch']
-    return server_branches, server_current_branch
 
 
 RECONCILE_STATUS_ALIGNED = 'ALIGNED'
@@ -754,6 +679,14 @@ def _post_server_git_action(server_addr:tuple[str, int], action:str, args:dict|N
 
 def _run_local_git_action(action:str, args:dict|None=None) -> dict:
     return execute_git_action(action, args=args, cwd=get_project_root_path())
+
+
+def _get_reconcile_bundle_paths(filename:str='update.bundle') -> tuple[str, str]:
+    project_root = get_project_root_path()
+    runtime_dir = get_runtime_dir_path(project_root)
+    bundle_abs_path = os.path.join(runtime_dir, filename)
+    bundle_rel_path = _to_repo_relative_posix(bundle_abs_path, project_root)
+    return bundle_abs_path, bundle_rel_path
 
 
 def _format_action_failure(action_label:str, result:dict|None) -> str:
@@ -1062,71 +995,152 @@ def reconcile_git_state(server_addr:tuple[str, int], app_name:str='') -> dict:
             target_branch='',
             target_commit='',
             actions_applied=actions_applied,
-            message='Tracked uncommitted changes detected; reconcile requires a clean tracked worktree on both sides.',
+            message='Tracked uncommitted changes detected; reconcile requires a clean tracked worktree on both sides. No fetch or bundle transfer was attempted.',
         )
 
-    local_has_server_head = git_has_commit(server_head, cwd=get_project_root_path())
-    server_has_local_result = _post_server_git_action(
-        server_addr,
-        'has_commit',
-        args={'commit': local_head},
-        app_name=app_name,
-    )
-    if server_has_local_result is None:
+    def recheck_commit_visibility() -> tuple[bool, bool] | None:
+        local_visibility = git_has_commit(server_head, cwd=get_project_root_path())
+        server_has_local_result_inner = _post_server_git_action(
+            server_addr,
+            'has_commit',
+            args={'commit': local_head},
+            app_name=app_name,
+        )
+        if server_has_local_result_inner is None:
+            return None
+        server_visibility = bool(server_has_local_result_inner.get('has_commit', False))
+        return local_visibility, server_visibility
+
+    initial_visibility = recheck_commit_visibility()
+    if initial_visibility is None:
         return _reconcile_result(
             RECONCILE_STATUS_ERROR,
             actions_applied=actions_applied,
             message='Failed while checking whether server can resolve client HEAD commit.',
         )
-    server_has_local_head = bool(server_has_local_result.get('has_commit', False))
+    local_has_server_head, server_has_local_head = initial_visibility
 
+    fetch_failures:list[str] = []
     if not local_has_server_head:
-        if not local_state.get('has_origin', False):
-            return _reconcile_result(
-                RECONCILE_STATUS_BLOCKED_NO_ORIGIN,
-                actions_applied=actions_applied,
-                message='Client is missing server commit and has no origin remote for fetch.',
-            )
         fetch_local = _run_local_git_action('fetch_origin', {})
         actions_applied.append('client:fetch_origin')
         if not fetch_local.get('success', False):
-            return _reconcile_result(
-                RECONCILE_STATUS_BLOCKED_MISSING_COMMIT_OBJECT,
-                actions_applied=actions_applied,
-                message='Client fetch from origin failed while trying to obtain server commit.',
-            )
+            fetch_failures.append(_format_action_failure('client:fetch_origin', fetch_local))
 
     if not server_has_local_head:
-        if not server_state.get('has_origin', False):
-            return _reconcile_result(
-                RECONCILE_STATUS_BLOCKED_NO_ORIGIN,
-                actions_applied=actions_applied,
-                message='Server is missing client commit and has no origin remote for fetch.',
-            )
         fetch_server = _post_server_git_action(server_addr, 'fetch_origin', args={}, app_name=app_name)
         actions_applied.append('server:fetch_origin')
         if not fetch_server or not fetch_server.get('success', False):
-            return _reconcile_result(
-                RECONCILE_STATUS_BLOCKED_MISSING_COMMIT_OBJECT,
-                actions_applied=actions_applied,
-                message='Server fetch from origin failed while trying to obtain client commit.',
-            )
+            fetch_failures.append(_format_action_failure('server:fetch_origin', fetch_server))
 
-    # Re-check commit visibility after fetches.
-    local_has_server_head = git_has_commit(server_head, cwd=get_project_root_path())
-    server_has_local_result = _post_server_git_action(
-        server_addr,
-        'has_commit',
-        args={'commit': local_head},
-        app_name=app_name,
-    )
-    if server_has_local_result is None:
+    # Re-check commit visibility after fetch attempts.
+    post_fetch_visibility = recheck_commit_visibility()
+    if post_fetch_visibility is None:
         return _reconcile_result(
             RECONCILE_STATUS_ERROR,
             actions_applied=actions_applied,
             message='Failed while re-checking server commit visibility after fetch.',
         )
-    server_has_local_head = bool(server_has_local_result.get('has_commit', False))
+    local_has_server_head, server_has_local_head = post_fetch_visibility
+
+    bundle_fallback_attempted = False
+    if not local_has_server_head and server_has_local_head:
+        bundle_abs_path, bundle_rel_path = _get_reconcile_bundle_paths()
+        create_server_bundle = _post_server_git_action(
+            server_addr,
+            'create_update_bundle',
+            {'path': bundle_rel_path, 'start_ref': local_head, 'end_ref': 'HEAD'},
+            app_name=app_name,
+        )
+        actions_applied.append('server:create_update_bundle')
+        if not create_server_bundle or not create_server_bundle.get('success', False):
+            return _reconcile_result(
+                RECONCILE_STATUS_ERROR,
+                actions_applied=actions_applied,
+                message=_format_action_failure('server:create_update_bundle', create_server_bundle),
+            )
+
+        success = receive_files_from_server(server_addr, [bundle_rel_path])
+        actions_applied.append('client:receive_update_bundle')
+        if not success:
+            return _reconcile_result(
+                RECONCILE_STATUS_ERROR,
+                actions_applied=actions_applied,
+                message='Failed to transfer update bundle from server.',
+            )
+
+        if not os.path.exists(bundle_abs_path):
+            return _reconcile_result(
+                RECONCILE_STATUS_ERROR,
+                actions_applied=actions_applied,
+                message=f'Update bundle missing after server transfer: {bundle_abs_path}',
+            )
+
+        apply_local_bundle = _run_local_git_action('apply_update_bundle', {'path': bundle_abs_path})
+        actions_applied.append('client:apply_update_bundle')
+        if not apply_local_bundle.get('success', False):
+            return _reconcile_result(
+                RECONCILE_STATUS_ERROR,
+                actions_applied=actions_applied,
+                message=_format_action_failure('client:apply_update_bundle', apply_local_bundle),
+            )
+        bundle_fallback_attempted = True
+    elif local_has_server_head and not server_has_local_head:
+        bundle_abs_path, bundle_rel_path = _get_reconcile_bundle_paths()
+        create_local_bundle = _run_local_git_action(
+            'create_update_bundle',
+            {'path': bundle_abs_path, 'start_ref': server_head, 'end_ref': 'HEAD'},
+        )
+        actions_applied.append('client:create_update_bundle')
+        if not create_local_bundle.get('success', False):
+            return _reconcile_result(
+                RECONCILE_STATUS_ERROR,
+                actions_applied=actions_applied,
+                message=_format_action_failure('client:create_update_bundle', create_local_bundle),
+            )
+
+        sent_bundle = send_files(server_addr, [bundle_abs_path])
+        actions_applied.append('client:send_update_bundle')
+        if not sent_bundle:
+            return _reconcile_result(
+                RECONCILE_STATUS_ERROR,
+                actions_applied=actions_applied,
+                message='Failed to send update bundle to server.',
+            )
+
+        apply_server_bundle = _post_server_git_action(
+            server_addr,
+            'apply_update_bundle',
+            args={'path': bundle_rel_path},
+            app_name=app_name,
+        )
+        actions_applied.append('server:apply_update_bundle')
+        if not apply_server_bundle or not apply_server_bundle.get('success', False):
+            return _reconcile_result(
+                RECONCILE_STATUS_ERROR,
+                actions_applied=actions_applied,
+                message=_format_action_failure('server:apply_update_bundle', apply_server_bundle),
+            )
+        bundle_fallback_attempted = True
+    elif not local_has_server_head and not server_has_local_head:
+        message = 'both_sides_missing_commits_after_fetch; bundle_fallback_skipped'
+        if fetch_failures:
+            message = f'{message}; {' | '.join(fetch_failures)}'
+        return _reconcile_result(
+            RECONCILE_STATUS_BLOCKED_MISSING_COMMIT_OBJECT,
+            actions_applied=actions_applied,
+            message=message,
+        )
+
+    if bundle_fallback_attempted:
+        post_bundle_visibility = recheck_commit_visibility()
+        if post_bundle_visibility is None:
+            return _reconcile_result(
+                RECONCILE_STATUS_ERROR,
+                actions_applied=actions_applied,
+                message='Failed while re-checking server commit visibility after bundle fallback.',
+            )
+        local_has_server_head, server_has_local_head = post_bundle_visibility
 
     if not local_has_server_head or not server_has_local_head:
         missing_bits = []
@@ -1134,6 +1148,8 @@ def reconcile_git_state(server_addr:tuple[str, int], app_name:str='') -> dict:
             missing_bits.append('client_missing_server_commit')
         if not server_has_local_head:
             missing_bits.append('server_missing_client_commit')
+        if fetch_failures:
+            missing_bits.extend(fetch_failures)
         return _reconcile_result(
             RECONCILE_STATUS_BLOCKED_MISSING_COMMIT_OBJECT,
             actions_applied=actions_applied,
@@ -1372,33 +1388,58 @@ if __name__ == '__main__':
     configure_stdio()
 
     cwd = unix_path(os.getcwd())
-    server_ip, server_port = '192.168.7.189', get_server_port() 
-    server_addr = (server_ip, server_port)
     BUILD_SUCCESS = '** BUILD SUCCEEDED **'
     BUILD_FAILED = '** BUILD FAILED **'
 
 
 
-    runtime_dir = get_runtime_dir_name()
-    diffs_path = unix_path(os.path.join(cwd, runtime_dir))
+    runtime_dir_name = get_runtime_dir_name()
+    runtime_dir = unix_path(os.path.join(cwd, runtime_dir_name))
     gitignore_path = os.path.join(cwd, '.gitignore')
-    git_diff_filepath = unix_path(os.path.join(diffs_path, 'gitdiff.diff'))
+    git_diff_filepath = unix_path(os.path.join(runtime_dir, 'gitdiff.diff'))
     git_add_command = 'git add .'
 
+    #ensure that runtime_dir (location where created/received files will go) exists, and if not, create it
+    if os.path.exists(runtime_dir):
+        if not os.path.isdir(runtime_dir): #diffs_path exists but is a file instead of a directory.  Delete it, and a make a directory in its place
+            os.remove(runtime_dir)
+            os.mkdir(runtime_dir)
+    else:
+        os.mkdir(runtime_dir)
+    #End of all first-run initialization
 
+
+    #Try to find saved server info (ip and various ports) in serverinfo.txt
+    serverinfo_path = os.path.join(runtime_dir, 'serverinfo.txt')
+    if os.path.exists(serverinfo_path):
+        with open(serverinfo_path, 'r') as f:
+            serverinfo_dict = json.load(f)
+            
+    else:
+        # server_ip, serverinfo_dict = discover_server()
+        server_ip, serverinfo_dict = '192.168.7.189', {'server_ip': '192.168.7.189', 'server_port': 8751, 'server_socket_port': 50271, 'file_socket_port': 47283}
+        if not 'server_ip' in serverinfo_dict.keys():
+            serverinfo_dict['server_ip'] = server_ip
+
+        with open(serverinfo_path, 'w') as f:
+            json.dump(serverinfo_dict, f)
+
+    required_keys = ['server_ip', 'server_port', 'server_socket_port', 'file_socket_port']
+    missing_keys = [key for key in required_keys if key not in serverinfo_dict]
+    if missing_keys:
+        raise KeyError(f'serverinfo.txt is missing required keys: {missing_keys}')
+
+    server_ip = serverinfo_dict['server_ip']
+    server_port = int(serverinfo_dict['server_port'])
+    server_socket_port = int(serverinfo_dict['server_socket_port'])
+    file_socket_port = int(serverinfo_dict['file_socket_port'])
+    server_addr = (server_ip, server_port)
+ 
 
     update_gitignore()
 
 
-    #if 
-    if os.path.exists(diffs_path):
-        if not os.path.isdir(diffs_path): #diffs_path exists but is a file instead of a directory.  Delete it, and a make a directory in its place
-            os.remove(diffs_path)
-            os.mkdir(diffs_path)
-    else:
-        os.mkdir(diffs_path)
-    #End of all first-run initialization
-
+    
 
 
 
@@ -1413,7 +1454,7 @@ if __name__ == '__main__':
         resp:Response = start_build_job(server_addr, git_diff_filepath, changed_binary_paths)
         json_obj = json.loads(resp.text)
         job_id = json_obj['job_id']
-        build_log_str = wait_for_build_completion(server_addr, job_id)
+        build_log_str = wait_for_build_completion(server_addr, job_id, server_socket_port)
         # print('final build log')
         # print(build_log_str)
     elif 'sendchanges' in arg:

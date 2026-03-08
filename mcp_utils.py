@@ -9,15 +9,7 @@ P = ParamSpec("P")
 R = TypeVar("R", bound=subprocess.CompletedProcess)
 KB = 1024
 MB = KB * KB
-
-
-server_port = 8751
-server_socket_port = 50271
-file_socket_port = 47283
 runtime_dir_name = '.remote-xcode-server'
-
-def get_server_port() -> int:
-    return server_port
 
 def get_runtime_dir_name() -> str:
     return runtime_dir_name
@@ -195,9 +187,9 @@ def handle_process_errors(f: Callable[P, R]) -> Callable[P, R]:
 
 
 @handle_process_errors
-def run_process(command:str|list[str], stdout=subprocess.STDOUT, stderr=subprocess.STDOUT, cwd:str=None) -> subprocess.CompletedProcess:
+def run_process(command:str|list[str], stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd:str=None) -> subprocess.CompletedProcess:
     if cwd is None:
-        cwd = os.getcwd()
+        cwd = get_project_root_path()
     command_arg = command if type(command) == list else shlex.split(command)
     proc = subprocess.run(command_arg, stdout=stdout, stderr=stderr, cwd=cwd)
     return proc
@@ -227,6 +219,68 @@ def get_commit_date(branch:str) -> datetime.datetime|None:
     creation_dt = datetime.datetime(year=year, month=month, day=day, hour=hour, minute=minute, second=second)
     return creation_dt
     
+
+def get_commits_between(start_ref:str, end_ref:str='HEAD') -> list[str]:
+    '''Returns a list of all commits "between" start_ref and end_ref, inclusive'''
+    cmd = shlex.split(f'git rev-list {start_ref} ^{end_ref}')
+    proc:subprocess.CompletedProcess = _run_git_capture(cmd)
+    proc.check_returncode()
+    try:
+        res_str:str = proc.stdout.decode(errors='replace')
+    except UnicodeDecodeError as err:
+        print(f'Failed to decode output for command: {cmd}\nError message: {err}')
+    commits = [line.strip() for line in res_str.splitlines()]
+    return commits
+
+def git_create_update_bundle(start_ref:str, end_ref:str='HEAD', save_path='update.bundle') -> str:
+    '''Creates an incremental .bundle, which will bring all commits missing (reachable) from start_ref but ARE present in (reachable from) end_ref'''
+    cmd = shlex.split(f'git bundle create {save_path} {start_ref}..{end_ref} --all')
+    proc = _run_git_capture(cmd)
+    proc.check_returncode()
+    try:
+        res = proc.stdout.decode(errors='replace')
+    except UnicodeDecodeError as err:
+        print(f'Error decoding output from command: {' '.join(cmd)}\nError Message: {err}')
+    return save_path
+
+def git_verify_bundle(bundle_path:str) -> tuple[bool, list[str]]:
+    '''Verifies that the git bundle is both a valid bundle in general, and also can be successfully applied to the current repo without errors'''
+    project_root = get_project_root_path()
+    if not is_subdir(bundle_path, project_root):
+        raise FileNotFoundError('')
+    verify_bundle_command = shlex.split(f'git bundle verify {bundle_path}')
+    proc:subprocess.CompletedProcess = _run_git_capture(verify_bundle_command)
+    proc.check_returncode()
+    if not proc:
+        print(f'git bundle verify {bundle_path} produced no output')
+    try:
+        res:str = proc.stdout.decode(errors='replace')
+    except UnicodeDecodeError as err:
+        print(f'Error decoding output from command {' '.split(verify_bundle_command)}\nError Message: {err}')
+    
+    lines = res.splitlines()
+    for line in lines:
+        if line.startswith('error'):
+            return False
+    return True
+
+
+
+def git_apply_update_bundle(bundle_path:str) -> bool:
+    '''Applies an update bundle located at bundle_path to the current directory.  All branches/refs will be updated, the entire repo should become identical to the source'''
+    valid_bundle = git_verify_bundle(bundle_path)
+    if not valid_bundle:
+        print('Error: bundle was inv')
+        return False
+    heads_part = '+refs/heads/*:refs/heads/*'
+    tags_part = '+refs/tags/*:refs/tags/*'
+    command_str = f"git fetch {bundle_path} '{heads_part}' '{tags_part}'"
+    command = shlex.split(command_str)
+    proc = _run_git_capture(command)
+    proc.check_returncode()
+    return True
+
+
 
 def get_git_branches(app_name:str='', return_current_branch=False, sort_order='creatordate') -> list[str] | tuple[list[str], str]:
     if not app_name:
@@ -405,6 +459,8 @@ def execute_git_action(action:str, args:dict|None=None, cwd:str|None=None) -> di
         'has_commit': {'commit'},
         'ahead_behind': {'left', 'right'},
         'backup_remove_gitignore': set(),
+        'create_update_bundle': {'path', 'start_ref', 'end_ref'},
+        'apply_update_bundle': {'path'}
     }
 
     if action not in allowed_arg_keys:
@@ -475,6 +531,13 @@ def execute_git_action(action:str, args:dict|None=None, cwd:str|None=None) -> di
         command = ['git', 'cat-file', '-e', f"{args['commit']}^{{commit}}"]
     elif action == 'ahead_behind':
         command = ['git', 'rev-list', '--left-right', '--count', f"{args['left']}...{args['right']}"]
+    elif action == 'create_update_bundle':
+        command = ['git', 'bundle', 'create', args['path'], f'{args['start_ref']}..{args['end_ref']}', '--all']
+    elif action == 'apply_update_bundle':
+        if is_subdir(args['path'], get_project_root_path()):
+            command = ['git', 'fetch', args['path'], '+refs/heads/*:refs/heads/*', '+refs/tags/*:refs/tags/*']
+        else:
+            raise PermissionError('path argument must be inside of repo')
     else:
         # Defensive fallback even though action is validated above.
         return {'success': False, 'action': action, 'error': f'Unhandled action: {action}'}

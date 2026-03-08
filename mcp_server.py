@@ -5,8 +5,27 @@ from werkzeug.utils import secure_filename
 from mcp_utils import *
 # from requests import Request
 
+server_port = 8751
+server_socket_port = 50271
+discovery_socket_port = 9346
+file_socket_port = 47283
+
+def get_server_port() -> int:
+    return server_port
+
+def start_discovery_listener():
+    #use SOCK_DGRAM for UDP instead of TCP
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(('0.0.0.0', discovery_socket_port))
+    while True:
+        msg_bytes, addr = s.recvfrom(1*KB)
+        if msg_bytes.startswith(b'RXS_DISCOVERY_REQ'):
+            resp_str = f'RXS_SERVER_HERE\nports|server_port:{server_port},server_socket_port:{server_socket_port},file_socket_port:{file_socket_port}'
+            s.sendto(resp_str.encode(errors='replace'), addr)
 
 
+
+#establish several filesystem level global variables
 cwd = unix_path(os.getcwd())
 project_name = get_project_name()
 server_dir_name = get_runtime_dir_name()
@@ -14,13 +33,17 @@ server_dir_path = os.path.join(cwd, server_dir_name)
 project_info_filename = 'projectinfo.txt'
 project_info_filepath = os.path.join(server_dir_path, project_info_filename)
 
-server_socket_port = 50271 
+#set up sockets for streaming xcode commands (server) and sending/receiving files (filesocket)
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server.bind(('0.0.0.0', server_socket_port))
 server.listen(1)
 filesocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 filesocket.bind(('0.0.0.0', file_socket_port))
 filesocket.listen(1)
+
+#launch thread that reports back to client on server discovery broadcast requests
+discovery_thread = Thread(target=start_discovery_listener, args=[], daemon=True)
+discovery_thread.start()
 
 update_gitignore()
 
@@ -440,19 +463,6 @@ def run_xcodebuild(job_id):
         JOBS[job_id]['error'] = str(e)
 
 
-def _send_file_over_socket(path:str, chunk_size=32*KB) -> bool:
-    print('Legacy _send_file_over_socket is disabled. Use /sendfilessocket/init and /complete flow.')
-    return False
-
-
-
-def _receive_file_over_socket(conn:socket.socket=server) -> bool:
-    print('Legacy _receive_file_over_socket is disabled. Use framed transfer session handlers.')
-    return True
-
-
-
-
 
 @app.route('/retrieve_text_changes/<appname>')
 def send_changes(appname:str):
@@ -529,6 +539,17 @@ def run_git_action(appname:str):
         return jsonify(result), 400
     return jsonify(result)
 
+
+@app.route('/create-update-bundle/<appname>/<client_head>', methods=['GET'])
+def send_update_bundle(appname:str, client_head:str):
+    runtime_dir_path = get_runtime_dir_path()
+    bundle_name = 'update.bundle'
+    save_path = os.path.join(runtime_dir_path, bundle_name)
+    if not client_head:
+        print(f'Error: {client_head} not found in request.values.keys')
+        return f'Error: {client_head} not found in request.values.keys'
+    git_create_update_bundle(client_head, 'HEAD', save_path)
+    return save_path
 
 
 #note that <path:path> is NOT representing <variablename:variablename>. The full syntax for route variables is <converter:name>
