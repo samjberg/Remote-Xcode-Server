@@ -149,7 +149,6 @@ def split_paths_by_text_or_binary(paths:list[str]) -> tuple[list[str], list[str]
 def is_subdir(path, directory):
     path = os.path.realpath(path)
     directory = os.path.realpath(directory)
-    split_paths_by_text_or_binary
 
     relative = os.path.relpath(path, directory)
 

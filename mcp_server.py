@@ -1,4 +1,4 @@
-import os, subprocess, socket, json, struct, hashlib, time
+import os, subprocess, socket, json, struct, hashlib, time, re
 from flask import Flask, request, send_file, send_from_directory, jsonify, Request, Response
 from threading import Thread, Lock
 from werkzeug.utils import secure_filename
@@ -435,32 +435,118 @@ def send_files_from_server(transfer_id: str) -> None:
         if conn:
             conn.close()
 
+_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/].+")
+def _looks_like_path_arg(value: str):
+    if not value:
+        return False
+    s = value.strip()
+    if not s:
+        return False
+    return (
+        s.startswith(('/', './', '../', '~', '~/'))
+        or '\\' in s
+        or _DRIVE_PATH_RE.match(s) is not None
+    )
+
+def _get_invalid_xcodebuild_args(args:list[str]) -> list[str]:
+    '''Returns a list of invalid arguments'''
+    project_root = get_project_root_path()
+    path_bearing_flags = ['-project', '-workspace', '-xcconfig', '-sdk', '-derivedDataPath', '-resultBundlePath', '-resultStreamPath',
+                          '-archivePath', '-exportPath', '-exportOptionsPlist', '-localizationPath', '-xctestrun', '-testProductsPath',
+                          '-clonedSourcePackagesDirPath', '-packageCachePath', '-authenticationKeyPath', '-framework', '-library', '-headers', '-output']
+    
+    flags:list[tuple[int, str]] = []
+    invalid_args:list[str] = []
+    #establish flags and their indices within args
+    for i, arg in enumerate(args):
+        if len(arg) > 0:
+            if arg[0] == '-':
+                flags.append((i, arg))
+    
+    #we need indices so that we can check the "next argument" in the case of "-flag arg" syntax, since arg is the "next argument" in that situation
+    for i, arg in flags:
+        #handle "-flag=value" syntax
+        if '=' in arg:
+            arg_parts = arg.split('=')
+            if len(arg_parts) != 2:
+                invalid_args.append(arg)
+            else:
+                flag_name, path = arg_parts
+                if flag_name in path_bearing_flags:
+                    #handle special -sdk case, since its value can be either a path or not a path, so it needs special handling
+                    if flag_name == '-sdk':
+                        if _looks_like_path_arg(path) and not is_subdir(path, project_root):
+                            invalid_args.append(arg)
+                    #handle regular case where flag_name is not -sdk
+                    elif not is_subdir(path, project_root):
+                        invalid_args.append(arg)
+        #handle the "-flag value" syntax
+        else:
+            flag_name = arg
+            if i+1 < len(args):
+                path = args[i+1]
+                if flag_name in path_bearing_flags:
+                    if flag_name == '-sdk':
+                        if _looks_like_path_arg(path) and not is_subdir(path, project_root):
+                            invalid_args.append(arg)
+                    elif not is_subdir(path, project_root):
+                        invalid_args.append(arg)
+            else:
+                #since this is specifically the "-flag value" syntax, not having a next arg means that the flag has no value.  However
+                #there are some flags that ARE just a flag with no additional value, so this does not inherently prove the flag is invalid
+                #but it's likely enough that I felt like I should create this else statement and leave this comment here at least
+                pass
+
+    return invalid_args
 
 
-def run_xcodebuild(job_id):
-    conn, addr = server.accept()
-    print(f'Received connection from {addr}')
+def run_xcodebuild(job_id, xcodebuild_args):
+    conn = None
+    proc = None
+    log_write = None
     try:
+        conn, addr = server.accept()
+        print(f'Received connection from {addr}')
         job = JOBS[job_id]
-        job['status'] = 'running'
-        xcodebuild_command: str = f"xcodebuild -scheme \"{project_name}\" -destination 'generic/platform=iOS Simulator' build"
-        proc = subprocess.Popen(xcodebuild_command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0, shell=True)
-        chunk_size = 4096
         log_write = job['file']
+        invalid_args = _get_invalid_xcodebuild_args(xcodebuild_args)
+        if invalid_args:
+            msg = f'Error (invalid args): '
+            for arg in invalid_args[:-1]:
+                msg += f'"{arg}", '
+            msg += invalid_args[-1]
+            job['status'] = 'error'
+            job['error'] = msg
+            conn.sendall(msg.encode())
+            return
+
+        job['status'] = 'running'
+        xcodebuild_command: list[str] = ['xcodebuild', *xcodebuild_args]
+        proc = subprocess.Popen(xcodebuild_command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0, shell=False)
+        chunk_size = 4096
         while True:
             chunk = proc.stdout.read(chunk_size)
             if not chunk:
                 break
-            log_write.write(chunk.decode())
+            log_write.write(chunk.decode(errors='replace'))
             conn.sendall(chunk)
 
-        log_write.close()
-        proc.wait()
-        conn.close()
-
+        return_code = proc.wait()
+        if return_code == 0:
+            job['status'] = 'done'
+        else:
+            job['status'] = 'error'
+            job['error'] = f'xcodebuild exited with return code {return_code}'
     except Exception as e:
         JOBS[job_id]['status'] = 'error'
         JOBS[job_id]['error'] = str(e)
+    finally:
+        if log_write and not log_write.closed:
+            log_write.close()
+        if conn:
+            conn.close()
+        
+
 
 
 
@@ -868,6 +954,7 @@ def receive_files_socket_legacy(appname:str):
 @app.route('/start-build-job/<appname>', methods=['GET', 'POST'])
 def start_build_job(appname):
     print(f'appname: {appname}')
+    xcodebuild_args = request.form.getlist('xcodebuild_args')
 
     if request.method == 'POST' or request.method == 'GET':
         if 'gitdiff' not in request.files:
@@ -937,7 +1024,7 @@ def start_build_job(appname):
             build_log_file = open(build_log_path, 'w')
             JOBS[job_id] = {"status": "pending", "result": '', "error": None, "file": build_log_file}
 
-            t = Thread(target=run_xcodebuild, args=([job_id]), daemon=True)
+            t = Thread(target=run_xcodebuild, args=([job_id, xcodebuild_args]), daemon=True)
             t.start()
             return jsonify({"job_id": job_id}), 202
         else:

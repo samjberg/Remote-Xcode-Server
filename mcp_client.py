@@ -58,6 +58,7 @@ def discover_server() -> tuple[str, dict[str, int]]:
         discovered_server_ip = addr[0]
 
     except socket.timeout:
+        print('Socket timed out')
         return None
 
     resp_parts = resp.splitlines()
@@ -88,7 +89,7 @@ def discover_server() -> tuple[str, dict[str, int]]:
     return discovered_server_ip, ports_dict
 
 
-def start_build_job(server_addr:tuple[str, int], git_diff_path:str, changed_binary_paths:list[str]=[]) -> str:
+def start_build_job(server_addr:tuple[str, int], git_diff_path:str, changed_binary_paths:list[str]=[], args:list[str]=[]) -> str:
     ip, port = server_addr
     app_name = get_appname()
     url = f'http://{ip}:{port}/start-build-job/{app_name}'
@@ -103,7 +104,8 @@ def start_build_job(server_addr:tuple[str, int], git_diff_path:str, changed_bina
             mimetype = 'application/octet-stream'
         files[f'binaryfile{i}'] = (path, open(path, 'rb'), mimetype, {'Expires': 0})
     print(f'Starting build job by making POST request to {url} sending a diff file located at {git_diff_path}\n')
-    resp = requests.post(url, files=files)
+    args_data = [('xcodebuild_args', xcodebuild_arg) for xcodebuild_arg in args]
+    resp = requests.post(url, data=args_data, files=files)
     return resp
 
 def check_build_job(server_addr:tuple[str, int], job_id:str, offset:int=0) -> Response:
@@ -1448,9 +1450,12 @@ if __name__ == '__main__':
         arg = 'build'
 
 
-    if 'build' in arg: #for now, just to allow for flexibility in testing
+    if arg == 'build': #for now, just to allow for flexibility in testing
+        xcodebuild_args = []
+        if len(sys.argv) > 2:
+            xcodebuild_args = sys.argv[2:]
         git_diff_filepath, changed_binary_paths = prepare_text_changes()
-        resp:Response = start_build_job(server_addr, git_diff_filepath, changed_binary_paths)
+        resp:Response = start_build_job(server_addr, git_diff_filepath, changed_binary_paths, xcodebuild_args)
         json_obj = json.loads(resp.text)
         job_id = json_obj['job_id']
         build_log_str = wait_for_build_completion(server_addr, job_id, server_socket_port)
