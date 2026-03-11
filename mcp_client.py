@@ -1,6 +1,7 @@
 import sys, os, socket, requests, json, urllib, hashlib, struct
 from requests import Response
 from mcp_utils import *
+from environment_setup import ensure_environment_setup
 
 discovery_socket_port = 9346
 
@@ -1388,6 +1389,8 @@ def sync_changes_with_server(server_addr:tuple[str, int], sync_branches=False, s
 
 if __name__ == '__main__':
     configure_stdio()
+    if not os.path.exists(os.path.join(os.path.expanduser('~'), '.remote_xcode_env')):
+        ensure_environment_setup()
 
     cwd = unix_path(os.getcwd())
     BUILD_SUCCESS = '** BUILD SUCCEEDED **'

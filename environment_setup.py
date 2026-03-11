@@ -1,21 +1,145 @@
-import os, sys, pathlib
-from mcp_utils import get_project_root_path, get_runtime_dir_path
+import os
+from sys import platform
+from mcp_utils import get_project_root_path, get_runtime_dir_path, unix_path
+from subprocess import run
 
 cwd = os.getcwd()
 project_root_path = get_project_root_path(cwd)
+rxs_root_path = os.path.dirname(os.path.realpath(__file__)) #the root path where THIS SCRIPT is located.  Needed for locating the client script, which is in the same directory
 runtime_dir_path = get_runtime_dir_path(cwd)
 executables_path = os.path.join(runtime_dir_path, 'executables')
+client_script_name = 'mcp_client.py'
+client_script_path = os.path.join(rxs_root_path, client_script_name)
 
-if __name__ == '__main__':
+
+def _normalize_path_for_compare(path: str) -> str:
+    normalized = os.path.normpath(os.path.expandvars(os.path.expanduser(path.strip())))
+    if os.name == 'nt':
+        return os.path.normcase(normalized)
+    return normalized #any "Code is structurally unreachable" warning on this line is caused by Pylance doing static analysis and assuming it will always be run
+                      #on the current OS.  It is not an actual bug or anything to worry about.
+
+
+def update_windows_path(new_path_directory):
+    import winreg, ctypes
+    # Open the User Environment key
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Environment', 0, winreg.KEY_ALL_ACCESS) as key:
+        try:
+            current_path, _ = winreg.QueryValueEx(key, 'Path')
+        except FileNotFoundError:
+            current_path = ""
+
+        path_elements = [_normalize_path_for_compare(ele) for ele in current_path.split(os.pathsep) if ele.strip()]
+        normalized_new_path = _normalize_path_for_compare(new_path_directory)
+
+        # Avoid duplicates
+        if normalized_new_path not in path_elements:
+            updated_path = f"{new_path_directory};{current_path}"
+            winreg.SetValueEx(key, 'Path', 0, winreg.REG_EXPAND_SZ, updated_path)
+            
+            # Broadcast environment change without risking an indefinite hang.
+            HWND_BROADCAST = 0xFFFF
+            WM_SETTINGCHANGE = 0x001A
+            SMTO_ABORTIFHUNG = 0x0002
+            send_result = ctypes.c_ulong()
+            ctypes.windll.user32.SendMessageTimeoutW(
+                HWND_BROADCAST,
+                WM_SETTINGCHANGE,
+                0,
+                "Environment",
+                SMTO_ABORTIFHUNG,
+                5000,
+                ctypes.byref(send_result),
+            )
+
+def update_posix_path(new_path_directory):
+    user_home_path = os.path.expanduser('~')
+    env_script_name = '.remote_xcode_env'
+    env_script_path = os.path.join(user_home_path, env_script_name)
+    new_path_directory = unix_path(new_path_directory) #just in case
+    script_content = f'#!/bin/bash\nexport PATH="$PATH{os.pathsep}{new_path_directory}"\n'
+    #creates a centralized script for updating PATH which lives in runtime_dir
+    with open(env_script_path, 'w') as f:
+        f.write(script_content)
+
+    #inject the env_script into the most common profiles, .bashrc and .zshrc
+    bashrc_path = os.path.join(user_home_path, '.bashrc')
+    zshrc_path = os.path.join(user_home_path, '.zshrc')
+    path_injection_str = f'[[ -f ~/{env_script_name} ]] && source ~/{env_script_name}'
+
+
+    if os.path.exists(bashrc_path):
+        with open(bashrc_path, 'r') as f:
+            bashrc_lines = [line.strip() for line in f.readlines()]
+    else:
+        bashrc_lines = []
+    if path_injection_str not in bashrc_lines:
+        with open(bashrc_path, 'a') as f:
+            f.write(path_injection_str + '\n')
+
+    if os.path.exists(zshrc_path):
+        with open(zshrc_path, 'r') as f:
+            zshrc_lines = [line.strip() for line in f.readlines()]
+    else:
+        zshrc_lines = []
+    if path_injection_str not in zshrc_lines:
+        with open(zshrc_path, 'a') as f:
+            f.write(path_injection_str + '\n')
+
+
+
+def ensure_environment_setup():
     #Create all necessary directories if they do not exist
     if not os.path.exists(runtime_dir_path):
         os.makedirs(runtime_dir_path)
     else:
         if not os.path.isdir(runtime_dir_path):
             os.remove(runtime_dir_path)
+            os.makedirs(runtime_dir_path)
 
     if not os.path.exists(executables_path):
         os.makedirs(executables_path)
     else:
         if not os.path.isdir(executables_path):
+            os.remove(executables_path)
             os.makedirs(executables_path)
+
+
+    #determine whether this is running on a posix or windows environment
+    posix_os = os.name == 'posix' or platform == 'darwin'
+
+    #Ensure that executables_path is in the system PATH (this is what enables xcodebuild to register as a command)
+    curr_path = os.environ['PATH']
+    path_elements = [_normalize_path_for_compare(path) for path in curr_path.split(os.pathsep) if path.strip()]
+    normalized_executables_path = _normalize_path_for_compare(executables_path)
+    if normalized_executables_path not in path_elements:
+        if posix_os:
+            update_posix_path(executables_path)
+        else:
+            update_windows_path(executables_path)
+
+    
+
+    #if this is a windows machine
+    if not posix_os:
+        shim_script_name = 'xcodebuild.cmd'
+        shim_script_path = os.path.join(executables_path, shim_script_name)
+        shim_script_content = f'@echo off\npython "{client_script_path}" build %*'
+    #if this is a posix machine 
+    else:
+        shim_script_name = 'xcodebuild'
+        shim_script_path = os.path.join(executables_path, shim_script_name)
+        shim_script_content = f'#!/bin/bash\npython "{client_script_path}" build "$@"'
+
+
+    with open(shim_script_path, 'w') as f:
+        f.write(shim_script_content + '\n')
+
+    if posix_os:
+        proc = run(['chmod', '+x', shim_script_path])
+        if proc.returncode != 0:
+            print(f'Error running command: chmod +x {shim_script_path}')
+
+
+if __name__ == '__main__':
+    ensure_environment_setup()
