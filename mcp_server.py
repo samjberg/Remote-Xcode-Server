@@ -467,7 +467,7 @@ def _get_invalid_xcodebuild_args(args:list[str]) -> list[str]:
     for i, arg in flags:
         #handle "-flag=value" syntax
         if '=' in arg:
-            arg_parts = arg.split('=')
+            arg_parts = arg.split('=', 1)
             if len(arg_parts) != 2:
                 invalid_args.append(arg)
             else:
@@ -951,7 +951,7 @@ def receive_files_socket_legacy(appname:str):
     ), 410
 
 
-@app.route('/start-build-job/<appname>', methods=['GET', 'POST'])
+@app.route('/start-build-job/<appname>', methods=['POST'])
 def start_build_job(appname):
     print(f'appname: {appname}')
     xcodebuild_args = request.form.getlist('xcodebuild_args')
@@ -1048,6 +1048,8 @@ def check_progress(job_id:str, offset:int) -> Response:
     job = JOBS[job_id]
     if job['status'] == 'done':
         return 'Build already Complete'
+    elif job['status'] == 'error':
+        return f'Job status returned error.  Error message: {job['error']}'
 
     build_log_path = get_build_log_path(job_id)
     if not os.path.exists(build_log_path):
