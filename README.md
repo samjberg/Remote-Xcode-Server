@@ -177,7 +177,7 @@ This project works fundamentally, but it is still early and buggy. Known limitat
 - All operational HTTP routes require HMAC auth headers and run over HTTPS.
 - Raw TCP channels (build log stream + file transfer sockets) are TLS-wrapped and require an HMAC handshake before payload traffic.
 - Pairing discovery response includes:
-  - `certificate:<base64-pem>`
+  - `certificate:<single-line-pem-with-<nl>-separators>`
   - `secret_key:<shared-secret>`
   - `pairing_expires_unix:<epoch-seconds>`
 - Existing legacy `serverinfo.txt` (IP/ports only) is migrated on next successful pairing.

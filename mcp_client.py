@@ -8,6 +8,8 @@ from environment_setup import ensure_environment_setup
 discovery_socket_port = 9346
 allowed_timestamp_skew_s = 120
 SECURITY_SCHEMA_VERSION = 2
+discovery_response_max_bytes = 64 * KB
+discovery_attempts = 3
 
 SERVER_INFO: dict = {}
 SERVER_CERT_PATH = ''
@@ -134,14 +136,17 @@ def _ensure_pairing_material(serverinfo_path: str, runtime_dir: str, existing_in
     if discovery_result is None:
         raise RuntimeError('Pairing required. Enable pairing on server and retry within 60 seconds.')
     server_ip, discovery_info = discovery_result
-    cert_b64 = discovery_info.get('certificate', '')
+    cert_payload = discovery_info.get('certificate', '')
     secret = discovery_info.get('secret_key', '')
-    if not cert_b64 or not secret:
+    if not cert_payload or not secret:
         raise RuntimeError('Pairing response missing certificate or secret key.')
-    try:
-        cert_text = base64.b64decode(cert_b64.encode('ascii')).decode('utf-8', errors='replace').strip()
-    except Exception as e:
-        raise RuntimeError(f'Failed to decode paired certificate payload: {e}') from e
+    if '<nl>' in cert_payload:
+        cert_text = cert_payload.replace('<nl>', '\n').strip()
+    else:
+        try:
+            cert_text = base64.b64decode(cert_payload.encode('ascii')).decode('utf-8', errors='replace').strip()
+        except Exception as e:
+            raise RuntimeError(f'Failed to decode paired certificate payload: {e}') from e
     os.makedirs(os.path.dirname(cert_path), exist_ok=True)
     os.makedirs(os.path.dirname(secret_path), exist_ok=True)
     with open(cert_path, 'w', encoding='utf-8', newline='\n') as f:
@@ -253,14 +258,19 @@ def discover_server(require_pairing: bool = False) -> tuple[str, dict] | None:
     s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     s.settimeout(2.0)
 
-    s.sendto(b'RXS_DISCOVERY_REQ', ('<broadcast>', discovery_socket_port))
-    try:
-        resp_bytes, addr = s.recvfrom(1*KB)
-        resp = resp_bytes.decode()
-        discovered_server_ip = addr[0]
-
-    except socket.timeout:
-        print('Socket timed out')
+    resp = ''
+    discovered_server_ip = ''
+    for _ in range(discovery_attempts):
+        s.sendto(b'RXS_DISCOVERY_REQ', ('<broadcast>', discovery_socket_port))
+        try:
+            resp_bytes, addr = s.recvfrom(discovery_response_max_bytes)
+            resp = resp_bytes.decode()
+            discovered_server_ip = addr[0]
+            break
+        except socket.timeout:
+            continue
+    if not resp:
+        print('Socket timed out during server discovery')
         return None
 
     resp_parts = [line.strip() for line in resp.splitlines() if line.strip()]

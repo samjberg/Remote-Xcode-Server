@@ -1,4 +1,4 @@
-import os, subprocess, socket, json, struct, hashlib, time, re, datetime, secrets, ssl, hmac, base64
+import os, subprocess, socket, json, struct, hashlib, time, re, datetime, secrets, ssl, hmac
 from flask import Flask, request, send_file, send_from_directory, jsonify, Request, Response
 from threading import Thread, Lock
 from functools import wraps
@@ -253,8 +253,8 @@ def start_discovery_listener():
         ]
         pairing_enabled, expires_at = pairing_window_state()
         if pairing_enabled:
-            cert_b64 = base64.b64encode(get_certificate().encode('utf-8')).decode('ascii')
-            response_lines.append(f'certificate:{cert_b64}')
+            cert_one_line = get_certificate().replace('\n', '<nl>')
+            response_lines.append(f'certificate:{cert_one_line}')
             response_lines.append(f'secret_key:{get_hmac_secret()}')
             response_lines.append(f'pairing_expires_unix:{expires_at}')
         s.sendto('\n'.join(response_lines).encode('utf-8', errors='replace'), addr)
