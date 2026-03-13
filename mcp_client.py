@@ -33,6 +33,7 @@ class _PinnedCertAdapter(HTTPAdapter):
         ctx = ssl.create_default_context(cafile=self._cafile)
         ctx.check_hostname = False
         pool_kwargs['ssl_context'] = ctx
+        pool_kwargs['assert_hostname'] = False
         return super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
 
 
@@ -132,7 +133,8 @@ def _ensure_pairing_material(serverinfo_path: str, runtime_dir: str, existing_in
     if has_security_files and has_security_meta and info.get('schema_version') == SECURITY_SCHEMA_VERSION:
         return info
 
-    discovery_result = discover_server(require_pairing=True)
+    discovery_hint_ip = str(info.get('server_ip', '')).strip() if info.get('server_ip') else None
+    discovery_result = discover_server(require_pairing=True, target_ip=discovery_hint_ip)
     if discovery_result is None:
         raise RuntimeError('Pairing required. Enable pairing on server and retry within 60 seconds.')
     server_ip, discovery_info = discovery_result
@@ -249,7 +251,7 @@ def retrieve_file(server_addr:tuple[str, int], path) -> bool:
     return ran_successfully
 
 
-def discover_server(require_pairing: bool = False) -> tuple[str, dict] | None:
+def discover_server(require_pairing: bool = False, target_ip: str | None = None) -> tuple[str, dict] | None:
     '''Attempts to discover the server on the local network using UDP broadcasting.  If successful, returns [server_ip, ports_dict], where
         server_ip: Self explanitory, the IP address of the server on the local network
         ports_dict: a dictionary containing relevant port numbers
@@ -260,15 +262,23 @@ def discover_server(require_pairing: bool = False) -> tuple[str, dict] | None:
 
     resp = ''
     discovered_server_ip = ''
+    targets = []
+    if target_ip:
+        targets.append((target_ip, discovery_socket_port))
+    targets.append(('<broadcast>', discovery_socket_port))
+
     for _ in range(discovery_attempts):
-        s.sendto(b'RXS_DISCOVERY_REQ', ('<broadcast>', discovery_socket_port))
-        try:
-            resp_bytes, addr = s.recvfrom(discovery_response_max_bytes)
-            resp = resp_bytes.decode()
-            discovered_server_ip = addr[0]
+        for target in targets:
+            s.sendto(b'RXS_DISCOVERY_REQ', target)
+            try:
+                resp_bytes, addr = s.recvfrom(discovery_response_max_bytes)
+                resp = resp_bytes.decode()
+                discovered_server_ip = addr[0]
+                break
+            except socket.timeout:
+                continue
+        if resp:
             break
-        except socket.timeout:
-            continue
     if not resp:
         print('Socket timed out during server discovery')
         return None
@@ -1664,7 +1674,7 @@ if __name__ == '__main__':
     required_conn_keys = ['server_ip', 'server_port', 'server_socket_port', 'file_socket_port']
     missing_conn = [key for key in required_conn_keys if key not in serverinfo_dict]
     if missing_conn:
-        discovery_result = discover_server(require_pairing=False)
+        discovery_result = discover_server(require_pairing=False, target_ip=str(serverinfo_dict.get('server_ip', '')).strip() or None)
         if discovery_result is None:
             raise RuntimeError('Unable to discover server connection metadata over UDP.')
         server_ip_discovered, discovered_info = discovery_result
