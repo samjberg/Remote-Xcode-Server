@@ -154,6 +154,10 @@ Notes:
 
 - `uploads/buildlog.txt` may still be created by older/legacy code paths, but the current primary log path is direct socket streaming from the subprocess pipe.
 
+Notes:
+
+- `uploads/buildlog.txt` may still be created by older/legacy code paths, but the current primary log path is direct socket streaming from the subprocess pipe.
+
 The code also attempts to add `uploads/` and `diffs/` to `.gitignore`.
 
 ## Important Limitations (Current State)

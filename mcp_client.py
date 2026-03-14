@@ -461,6 +461,19 @@ def _get_safe_local_project_path(rel_path: str, project_root: str) -> str:
         raise ValueError(f'Path escapes project root: {rel}')
     return dest_abs
 
+def retrieve_changed_file_list_on_server(server_addr:tuple[str, int]) -> list[str]:
+    ip, port = server_addr
+    app_name = get_appname()
+    url = f'http://{ip}:{port}/retrieve_changed_file_paths/{app_name}'
+    try:
+        diff_resp:Response = requests.get(url, stream=True)
+    except requests.RequestException as e:
+        print(f'Failed to retrieve list of changed file paths: {e}')
+        return []
+    
+    if not diff_resp.text:
+        print('Received empty path list')
+        return []
 
 def _send_file_over_socket(
     s: socket.socket,
@@ -960,6 +973,10 @@ def _format_action_failure(action_label:str, result:dict|None) -> str:
         return f'Failed action {action_label} (returncode={returncode}).'
     return f'Failed action {action_label}.'
 
+def get_current_server_commit_hash(server_addr:tuple[str, int], app_name:str='') -> str|None:
+    ip, port = server_addr
+    if app_name == '':
+        app_name = get_appname()
 
 def _is_gitignore_overwrite_conflict(result:dict|None) -> bool:
     if result is None:
