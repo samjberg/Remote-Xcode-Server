@@ -1,4 +1,4 @@
-import sys, os, socket, requests, json, urllib, hashlib, struct, ssl, hmac, secrets, base64, time
+import sys, os, socket, requests, json, urllib, hashlib, struct, ssl, hmac, secrets, base64, time, subprocess, re
 from requests import Response
 from requests.adapters import HTTPAdapter
 from urllib3.poolmanager import PoolManager
@@ -50,10 +50,14 @@ def _load_hmac_secret() -> str:
 
 
 def _sign_http_request(method: str, path_url: str, timestamp: str, nonce: str, body_bytes: bytes) -> str:
+    # Match Flask request canonicalization: decoded path + raw encoded query string.
+    split = urllib.parse.urlsplit(path_url)
+    canonical_path = urllib.parse.unquote(split.path)
+    canonical_target = canonical_path if not split.query else f'{canonical_path}?{split.query}'
     payload = '\n'.join(
         [
             method.upper(),
-            path_url,
+            canonical_target,
             timestamp,
             nonce,
             _bytes_to_sha256_hex(body_bytes),
@@ -128,6 +132,43 @@ def _fetch_pairing_bundle_https(server_ip: str, server_port: int = 8751) -> tupl
     if not obj.get('ok', False) or not required.issubset(set(obj.keys())):
         return None
     return server_ip, obj
+
+
+def _candidate_ips_from_arp(max_candidates: int = 64) -> list[str]:
+    try:
+        proc = subprocess.run(['arp', '-a'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3)
+    except Exception:
+        return []
+    if proc.returncode != 0 or not proc.stdout:
+        return []
+    text = proc.stdout.decode(errors='replace')
+    ips = []
+    seen = set()
+    for match in re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', text):
+        ip = match.strip()
+        if ip in seen:
+            continue
+        parts = ip.split('.')
+        if len(parts) != 4:
+            continue
+        try:
+            octets = [int(x) for x in parts]
+        except ValueError:
+            continue
+        if any(x < 0 or x > 255 for x in octets):
+            continue
+        is_private = (
+            octets[0] == 10
+            or (octets[0] == 192 and octets[1] == 168)
+            or (octets[0] == 172 and 16 <= octets[1] <= 31)
+        )
+        if not is_private:
+            continue
+        seen.add(ip)
+        ips.append(ip)
+        if len(ips) >= max_candidates:
+            break
+    return ips
 
 
 def _load_global_serverinfo_cache() -> dict:
@@ -328,9 +369,20 @@ def discover_server(require_pairing: bool = False, target_ip: str | None = None)
     resp = ''
     discovered_server_ip = ''
     targets = []
+    seen_targets = set()
+    def _add_target(ip: str):
+        key = (ip, discovery_socket_port)
+        if key in seen_targets:
+            return
+        seen_targets.add(key)
+        targets.append(key)
+
     if target_ip:
-        targets.append((target_ip, discovery_socket_port))
-    targets.append(('<broadcast>', discovery_socket_port))
+        _add_target(target_ip)
+    _add_target('<broadcast>')
+    _add_target('255.255.255.255')
+    for ip in _candidate_ips_from_arp():
+        _add_target(ip)
 
     for _ in range(discovery_attempts):
         for target in targets:

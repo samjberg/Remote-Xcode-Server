@@ -78,6 +78,19 @@ def get_appname(cwd:str='') -> str:
     return os.path.split(root_path)[-1]
     # return root_path.split('/')[-1]#.replace(' ', '_')
 
+def get_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(0)
+    try:
+        # random IP doesn't even have to be reachable
+        s.connect(('10.254.254.254', 1))
+        IP = s.getsockname()[0]
+    except Exception:
+        IP = '127.0.0.1'
+    finally:
+        s.close()
+    return IP
+
 
 def update_gitignore():
     start_dir = os.getcwd()
