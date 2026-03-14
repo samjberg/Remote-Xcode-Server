@@ -308,7 +308,7 @@ SESSION_TTL_SECONDS = 30 * 60
 
 @app.before_request
 def _global_auth_gate():
-    if request.path in ['/', '/enable_pairing']:
+    if request.path in ['/', '/enable_pairing', '/pairing-bootstrap']:
         return None
     ok, status_code, error = _verify_hmac_request(request)
     if not ok:
@@ -795,6 +795,26 @@ def run_xcodebuild(job_id, xcodebuild_args):
 def enable_pairing():
     expires_at = enable_pairing_window(pairing_duration_s)
     return jsonify({'ok': True, 'pairing_enabled': True, 'expires_at_unix': expires_at})
+
+
+@app.route('/pairing-bootstrap')
+def pairing_bootstrap():
+    pairing_enabled, expires_at = pairing_window_state()
+    if not pairing_enabled:
+        return jsonify({'ok': False, 'error': 'pairing_disabled_or_expired'}), 403
+    cert_one_line = get_certificate().replace('\n', '<nl>')
+    return jsonify(
+        {
+            'ok': True,
+            'pairing_enabled': True,
+            'expires_at_unix': expires_at,
+            'server_port': server_port,
+            'server_socket_port': server_socket_port,
+            'file_socket_port': file_socket_port,
+            'certificate': cert_one_line,
+            'secret_key': get_hmac_secret(),
+        }
+    )
 
 
 

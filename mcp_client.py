@@ -110,6 +110,25 @@ def _build_server_url(server_addr: tuple[str, int], path: str) -> str:
     return f'https://{ip}:{port}{path}'
 
 
+def _fetch_pairing_bundle_https(server_ip: str, server_port: int = 8751) -> tuple[str, dict] | None:
+    if not server_ip:
+        return None
+    url = f'https://{server_ip}:{int(server_port)}/pairing-bootstrap'
+    try:
+        resp = requests.get(url, verify=False, timeout=5)
+        resp.raise_for_status()
+    except requests.RequestException:
+        return None
+    try:
+        obj = resp.json()
+    except ValueError:
+        return None
+    required = {'server_port', 'server_socket_port', 'file_socket_port', 'certificate', 'secret_key', 'expires_at_unix'}
+    if not obj.get('ok', False) or not required.issubset(set(obj.keys())):
+        return None
+    return server_ip, obj
+
+
 def _get_client_security_paths(runtime_dir: str) -> tuple[str, str]:
     cert_dir = os.path.join(runtime_dir, 'certs')
     cred_dir = os.path.join(runtime_dir, 'credentials')
@@ -136,7 +155,15 @@ def _ensure_pairing_material(serverinfo_path: str, runtime_dir: str, existing_in
     discovery_hint_ip = str(info.get('server_ip', '')).strip() if info.get('server_ip') else None
     discovery_result = discover_server(require_pairing=True, target_ip=discovery_hint_ip)
     if discovery_result is None:
-        raise RuntimeError('Pairing required. Enable pairing on server and retry within 60 seconds.')
+        env_ip = os.environ.get('RXS_SERVER_IP', '').strip()
+        fallback_ip = discovery_hint_ip or env_ip
+        fallback_port = int(info.get('server_port', 8751)) if info.get('server_port') else 8751
+        discovery_result = _fetch_pairing_bundle_https(fallback_ip, fallback_port)
+    if discovery_result is None:
+        raise RuntimeError(
+            'Pairing required. Enable pairing and retry within 60 seconds. '
+            'If UDP discovery is blocked, set RXS_SERVER_IP to the server LAN IP and retry.'
+        )
     server_ip, discovery_info = discovery_result
     cert_payload = discovery_info.get('certificate', '')
     secret = discovery_info.get('secret_key', '')
@@ -250,6 +277,13 @@ def retrieve_file(server_addr:tuple[str, int], path) -> bool:
     ran_successfully = ran_successfully and (under_write_count <= 1)
     return ran_successfully
 
+def enable_pairing(server_addr:tuple[str, int]) -> bool:
+    url = _build_server_url(server_addr, '/enable_pairing')
+    resp:Response = requests.get(url)
+    if not resp.ok:
+        print('Error enabling pairing')
+        return False
+    return True
 
 def discover_server(require_pairing: bool = False, target_ip: str | None = None) -> tuple[str, dict] | None:
     '''Attempts to discover the server on the local network using UDP broadcasting.  If successful, returns [server_ip, ports_dict], where
@@ -1674,9 +1708,15 @@ if __name__ == '__main__':
     required_conn_keys = ['server_ip', 'server_port', 'server_socket_port', 'file_socket_port']
     missing_conn = [key for key in required_conn_keys if key not in serverinfo_dict]
     if missing_conn:
-        discovery_result = discover_server(require_pairing=False, target_ip=str(serverinfo_dict.get('server_ip', '')).strip() or None)
+        hint_ip = str(serverinfo_dict.get('server_ip', '')).strip() or os.environ.get('RXS_SERVER_IP', '').strip() or None
+        discovery_result = discover_server(require_pairing=False, target_ip=hint_ip)
+        if discovery_result is None and hint_ip:
+            discovery_result = _fetch_pairing_bundle_https(hint_ip, int(serverinfo_dict.get('server_port', 8751)))
         if discovery_result is None:
-            raise RuntimeError('Unable to discover server connection metadata over UDP.')
+            raise RuntimeError(
+                'Unable to discover server connection metadata over UDP. '
+                'Set RXS_SERVER_IP to the server LAN IP and retry.'
+            )
         server_ip_discovered, discovered_info = discovery_result
         serverinfo_dict['server_ip'] = server_ip_discovered
         serverinfo_dict['server_port'] = int(discovered_info['server_port'])
@@ -1719,6 +1759,7 @@ if __name__ == '__main__':
         git_diff_filepath, changed_binary_paths = prepare_text_changes()
         resp:Response = start_build_job(server_addr, git_diff_filepath, changed_binary_paths, xcodebuild_args)
         json_obj = json.loads(resp.text)
+        print(json_obj)
         job_id = json_obj['job_id']
         build_log_str = wait_for_build_completion(server_addr, job_id, server_socket_port)
         # print('final build log')
@@ -1732,6 +1773,10 @@ if __name__ == '__main__':
             print('Successfully retrieved changes from the server')
         else:
             print('Failed to retrieve changes from the server')
+    elif 'pair' in arg:
+        pairing_enabled = enable_pairing(server_addr)
+        if pairing_enabled:
+            print('Pairing enabled.  Please run any command in the next 60 seconds to complete pairing process')
     elif 'sync' in arg:
         sync_changes_with_server(server_addr)
     elif 'sendfiles' in arg:
