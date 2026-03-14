@@ -15,6 +15,7 @@ SERVER_INFO: dict = {}
 SERVER_CERT_PATH = ''
 SERVER_SECRET_PATH = ''
 SERVER_REQUEST_SESSION: requests.Session | None = None
+GLOBAL_SERVERINFO_CACHE_PATH = os.path.join(os.path.expanduser('~'), '.remote_xcode_server_serverinfo.json')
 
 def configure_stdio():
     """Ensure redirected output can represent UTF-8 build logs on Windows."""
@@ -127,6 +128,36 @@ def _fetch_pairing_bundle_https(server_ip: str, server_port: int = 8751) -> tupl
     if not obj.get('ok', False) or not required.issubset(set(obj.keys())):
         return None
     return server_ip, obj
+
+
+def _load_global_serverinfo_cache() -> dict:
+    if not os.path.exists(GLOBAL_SERVERINFO_CACHE_PATH):
+        return {}
+    try:
+        with open(GLOBAL_SERVERINFO_CACHE_PATH, 'r', encoding='utf-8') as f:
+            obj = json.load(f)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_global_serverinfo_cache(serverinfo: dict) -> None:
+    if not isinstance(serverinfo, dict):
+        return
+    keys = ['server_ip', 'server_port', 'server_socket_port', 'file_socket_port']
+    if any(key not in serverinfo for key in keys):
+        return
+    obj = {
+        'server_ip': str(serverinfo['server_ip']),
+        'server_port': int(serverinfo['server_port']),
+        'server_socket_port': int(serverinfo['server_socket_port']),
+        'file_socket_port': int(serverinfo['file_socket_port']),
+    }
+    try:
+        with open(GLOBAL_SERVERINFO_CACHE_PATH, 'w', encoding='utf-8') as f:
+            json.dump(obj, f)
+    except Exception:
+        pass
 
 
 def _get_client_security_paths(runtime_dir: str) -> tuple[str, str]:
@@ -292,7 +323,7 @@ def discover_server(require_pairing: bool = False, target_ip: str | None = None)
     '''
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    s.settimeout(2.0)
+    s.settimeout(3.0)
 
     resp = ''
     discovered_server_ip = ''
@@ -1704,6 +1735,12 @@ if __name__ == '__main__':
     else:
         serverinfo_dict = {}
 
+    # Merge in cross-project cached metadata (helps when project-local runtime dirs were deleted).
+    cached_serverinfo = _load_global_serverinfo_cache()
+    for key in ['server_ip', 'server_port', 'server_socket_port', 'file_socket_port']:
+        if key not in serverinfo_dict and key in cached_serverinfo:
+            serverinfo_dict[key] = cached_serverinfo[key]
+
     # If connection metadata is missing, do a non-pairing discovery pass to bootstrap IP/ports.
     required_conn_keys = ['server_ip', 'server_port', 'server_socket_port', 'file_socket_port']
     missing_conn = [key for key in required_conn_keys if key not in serverinfo_dict]
@@ -1714,8 +1751,8 @@ if __name__ == '__main__':
             discovery_result = _fetch_pairing_bundle_https(hint_ip, int(serverinfo_dict.get('server_port', 8751)))
         if discovery_result is None:
             raise RuntimeError(
-                'Unable to discover server connection metadata over UDP. '
-                'Set RXS_SERVER_IP to the server LAN IP and retry.'
+                'Unable to discover server connection metadata. '
+                'Set RXS_SERVER_IP to the server LAN IP (PowerShell: $env:RXS_SERVER_IP="<ip>") and retry.'
             )
         server_ip_discovered, discovered_info = discovery_result
         serverinfo_dict['server_ip'] = server_ip_discovered
@@ -1726,6 +1763,7 @@ if __name__ == '__main__':
     # Ensure we have paired cert + shared secret; this requires active pairing window when missing.
     serverinfo_dict = _ensure_pairing_material(serverinfo_path, runtime_dir, existing_info=serverinfo_dict)
     _initialize_security_context(runtime_dir, serverinfo_dict)
+    _save_global_serverinfo_cache(serverinfo_dict)
 
     required_keys = required_conn_keys
     missing_keys = [key for key in required_keys if key not in serverinfo_dict]
