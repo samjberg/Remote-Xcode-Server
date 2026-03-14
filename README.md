@@ -87,13 +87,22 @@ Notes:
 - The current socket log stream also uses a separate TCP port (`50271` in the current code).
 - The server assumes it is running in the iOS project directory (where the `.xcodeproj` lives).
 
-### 2. Configure the client IP
+### 2. Pairing (required before secured requests)
 
-In `mcp_client.py`, the server IP is currently hardcoded:
+Before the client can call secured endpoints, pairing must be enabled on the server:
 
-- `server_ip = '192.168.7.189'` (example from current code)
+1. Trigger pairing mode (60 seconds):
 
-Update this to your Mac’s LAN IP address.
+```bash
+curl -k https://<server-ip>:8751/enable_pairing
+```
+
+2. Run the client while pairing is active. It will discover the server over UDP, then persist:
+- pinned server certificate
+- shared HMAC secret
+- updated `serverinfo.txt` metadata
+
+If pairing is not active and local credentials are missing, client startup will fail and ask you to pair.
 
 ### 3. Run the client from your project repo
 
@@ -131,12 +140,15 @@ Note: the current implementation checks commands using substring matching (e.g. 
 The scripts create helper directories/files automatically:
 
 - Client:
-  - `diffs/`
-  - `diffs/gitdiff.diff`
+  - `.remote-xcode-server/serverinfo.txt`
+  - `.remote-xcode-server/certs/server_cert.pem`
+  - `.remote-xcode-server/credentials/hmac_secret.txt`
+  - `.remote-xcode-server/gitdiff.diff`
 - Server:
-  - `uploads/`
-  - `uploads/gitdiff.diff`
-  - `uploads/projectinfo.txt`
+  - `.remote-xcode-server/projectinfo.txt`
+  - `.remote-xcode-server/.secrets/tls/key.pem`
+  - `.remote-xcode-server/.secrets/tls/cert.pem`
+  - `.remote-xcode-server/.secrets/auth/hmac_secret.txt`
 
 Notes:
 
@@ -155,9 +167,30 @@ This project works fundamentally, but it is still early and buggy. Known limitat
 - Error handling is minimal.
 - Patch application assumes compatible repo state and can fail if histories diverge.
 - Client path/root detection is a work in progress.
-- Security is minimal (no auth, no TLS, no request validation beyond basic file handling).
+- Self-signed TLS is used; certificate trust is TOFU via pairing.
+- Pairing mode trigger (`/enable_pairing`) is intentionally unauthenticated in this version.
 - Single-user / ad hoc workflow assumptions throughout.
-- Socket stream protocol is intentionally barebones right now (no framing/metadata for stdout/stderr/status).
+- Socket stream protocol is intentionally simple after authenticated handshake.
+
+## Security and Pairing Notes
+
+- All operational HTTP routes require HMAC auth headers and run over HTTPS.
+- Raw TCP channels (build log stream + file transfer sockets) are TLS-wrapped and require an HMAC handshake before payload traffic.
+- Pairing discovery response includes:
+  - `certificate:<single-line-pem-with-<nl>-separators>`
+  - `secret_key:<shared-secret>`
+  - `pairing_expires_unix:<epoch-seconds>`
+- Existing legacy `serverinfo.txt` (IP/ports only) is migrated on next successful pairing.
+
+### Re-pair / Reset
+
+If credentials become invalid (clock skew, cert mismatch, signature errors), delete:
+
+- `.remote-xcode-server/serverinfo.txt`
+- `.remote-xcode-server/certs/server_cert.pem`
+- `.remote-xcode-server/credentials/hmac_secret.txt`
+
+Then re-enable pairing on the server and rerun the client.
 
 ## Current Streaming Approach (Server)
 

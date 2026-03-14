@@ -1,9 +1,20 @@
-import sys, os, socket, requests, json, urllib, hashlib, struct
+import sys, os, socket, requests, json, urllib, hashlib, struct, ssl, hmac, secrets, base64, time
 from requests import Response
+from requests.adapters import HTTPAdapter
+from urllib3.poolmanager import PoolManager
 from mcp_utils import *
 from environment_setup import ensure_environment_setup
 
 discovery_socket_port = 9346
+allowed_timestamp_skew_s = 120
+SECURITY_SCHEMA_VERSION = 2
+discovery_response_max_bytes = 64 * KB
+discovery_attempts = 3
+
+SERVER_INFO: dict = {}
+SERVER_CERT_PATH = ''
+SERVER_SECRET_PATH = ''
+SERVER_REQUEST_SESSION: requests.Session | None = None
 
 def configure_stdio():
     """Ensure redirected output can represent UTF-8 build logs on Windows."""
@@ -13,15 +24,212 @@ def configure_stdio():
         sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 
+class _PinnedCertAdapter(HTTPAdapter):
+    def __init__(self, cafile: str, *args, **kwargs):
+        self._cafile = cafile
+        super().__init__(*args, **kwargs)
+
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        ctx = ssl.create_default_context(cafile=self._cafile)
+        ctx.check_hostname = False
+        pool_kwargs['ssl_context'] = ctx
+        pool_kwargs['assert_hostname'] = False
+        return super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
+
+
+def _bytes_to_sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _load_hmac_secret() -> str:
+    if not SERVER_SECRET_PATH:
+        raise RuntimeError('Client HMAC secret path not initialized')
+    with open(SERVER_SECRET_PATH, 'r', encoding='utf-8') as f:
+        return f.read().strip()
+
+
+def _sign_http_request(method: str, path_url: str, timestamp: str, nonce: str, body_bytes: bytes) -> str:
+    payload = '\n'.join(
+        [
+            method.upper(),
+            path_url,
+            timestamp,
+            nonce,
+            _bytes_to_sha256_hex(body_bytes),
+        ]
+    )
+    secret = _load_hmac_secret().encode('utf-8')
+    return hmac.new(secret, payload.encode('utf-8'), hashlib.sha256).hexdigest()
+
+
+def _get_request_session() -> requests.Session:
+    global SERVER_REQUEST_SESSION
+    if SERVER_REQUEST_SESSION is None:
+        if not SERVER_CERT_PATH or not os.path.exists(SERVER_CERT_PATH):
+            raise RuntimeError('Server certificate is not available locally; pairing is required.')
+        s = requests.Session()
+        s.mount('https://', _PinnedCertAdapter(SERVER_CERT_PATH))
+        SERVER_REQUEST_SESSION = s
+    return SERVER_REQUEST_SESSION
+
+
+def _secure_request(
+    method: str,
+    url: str,
+    *,
+    params=None,
+    data=None,
+    json_data=None,
+    files=None,
+    stream: bool = False,
+    timeout: int = 60,
+    headers: dict | None = None,
+) -> Response:
+    session = _get_request_session()
+    req_headers = {} if headers is None else dict(headers)
+    req = requests.Request(method=method.upper(), url=url, params=params, data=data, json=json_data, files=files, headers=req_headers)
+    prepared = session.prepare_request(req)
+    body = prepared.body
+    if body is None:
+        body_bytes = b''
+    elif isinstance(body, bytes):
+        body_bytes = body
+    else:
+        body_bytes = str(body).encode('utf-8')
+    timestamp = str(int(time.time()))
+    nonce = secrets.token_urlsafe(24)
+    signature = _sign_http_request(prepared.method, prepared.path_url, timestamp, nonce, body_bytes)
+    prepared.headers['X-RXS-Timestamp'] = timestamp
+    prepared.headers['X-RXS-Nonce'] = nonce
+    prepared.headers['X-RXS-Signature'] = signature
+    return session.send(prepared, stream=stream, timeout=timeout, allow_redirects=True)
+
+
+def _build_server_url(server_addr: tuple[str, int], path: str) -> str:
+    ip, port = server_addr
+    return f'https://{ip}:{port}{path}'
+
+
+def _get_client_security_paths(runtime_dir: str) -> tuple[str, str]:
+    cert_dir = os.path.join(runtime_dir, 'certs')
+    cred_dir = os.path.join(runtime_dir, 'credentials')
+    return os.path.join(cert_dir, 'server_cert.pem'), os.path.join(cred_dir, 'hmac_secret.txt')
+
+
+def _cert_fingerprint(cert_text: str) -> str:
+    return _bytes_to_sha256_hex(cert_text.encode('utf-8'))
+
+
+def _ensure_pairing_material(serverinfo_path: str, runtime_dir: str, existing_info: dict | None = None) -> dict:
+    info = {} if not isinstance(existing_info, dict) else dict(existing_info)
+    cert_path, secret_path = _get_client_security_paths(runtime_dir)
+    security = info.get('security', {}) if isinstance(info.get('security', {}), dict) else {}
+    has_security_files = os.path.exists(cert_path) and os.path.exists(secret_path)
+    has_security_meta = (
+        isinstance(security.get('cert_relpath', ''), str)
+        and isinstance(security.get('secret_relpath', ''), str)
+        and isinstance(security.get('cert_fingerprint_sha256', ''), str)
+    )
+    if has_security_files and has_security_meta and info.get('schema_version') == SECURITY_SCHEMA_VERSION:
+        return info
+
+    discovery_hint_ip = str(info.get('server_ip', '')).strip() if info.get('server_ip') else None
+    discovery_result = discover_server(require_pairing=True, target_ip=discovery_hint_ip)
+    if discovery_result is None:
+        raise RuntimeError('Pairing required. Enable pairing on server and retry within 60 seconds.')
+    server_ip, discovery_info = discovery_result
+    cert_payload = discovery_info.get('certificate', '')
+    secret = discovery_info.get('secret_key', '')
+    if not cert_payload or not secret:
+        raise RuntimeError('Pairing response missing certificate or secret key.')
+    if '<nl>' in cert_payload:
+        cert_text = cert_payload.replace('<nl>', '\n').strip()
+    else:
+        try:
+            cert_text = base64.b64decode(cert_payload.encode('ascii')).decode('utf-8', errors='replace').strip()
+        except Exception as e:
+            raise RuntimeError(f'Failed to decode paired certificate payload: {e}') from e
+    os.makedirs(os.path.dirname(cert_path), exist_ok=True)
+    os.makedirs(os.path.dirname(secret_path), exist_ok=True)
+    with open(cert_path, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(cert_text + '\n')
+    with open(secret_path, 'w', encoding='utf-8') as f:
+        f.write(secret.strip())
+
+    info['schema_version'] = SECURITY_SCHEMA_VERSION
+    info['server_ip'] = server_ip
+    info['server_port'] = int(discovery_info['server_port'])
+    info['server_socket_port'] = int(discovery_info['server_socket_port'])
+    info['file_socket_port'] = int(discovery_info['file_socket_port'])
+    info['security'] = {
+        'cert_relpath': unix_path(os.path.relpath(cert_path, runtime_dir)),
+        'secret_relpath': unix_path(os.path.relpath(secret_path, runtime_dir)),
+        'cert_fingerprint_sha256': _cert_fingerprint(cert_text),
+    }
+    with open(serverinfo_path, 'w', encoding='utf-8') as f:
+        json.dump(info, f)
+    return info
+
+
+def _initialize_security_context(runtime_dir: str, serverinfo_dict: dict) -> None:
+    global SERVER_INFO, SERVER_CERT_PATH, SERVER_SECRET_PATH, SERVER_REQUEST_SESSION
+    SERVER_INFO = dict(serverinfo_dict)
+    security = SERVER_INFO.get('security', {})
+    cert_rel = security.get('cert_relpath', 'certs/server_cert.pem')
+    secret_rel = security.get('secret_relpath', 'credentials/hmac_secret.txt')
+    SERVER_CERT_PATH = os.path.join(runtime_dir, cert_rel)
+    SERVER_SECRET_PATH = os.path.join(runtime_dir, secret_rel)
+    if not os.path.exists(SERVER_CERT_PATH) or not os.path.exists(SERVER_SECRET_PATH):
+        raise RuntimeError('Missing paired security files. Re-run pairing.')
+    expected_fp = str(security.get('cert_fingerprint_sha256', '')).strip()
+    if expected_fp:
+        with open(SERVER_CERT_PATH, 'r', encoding='utf-8') as f:
+            actual_fp = _cert_fingerprint(f.read().strip())
+        if actual_fp != expected_fp:
+            raise RuntimeError('Local server certificate fingerprint mismatch. Re-run pairing.')
+    SERVER_REQUEST_SESSION = None
+
+
+def _make_client_tls_context() -> ssl.SSLContext:
+    if not SERVER_CERT_PATH:
+        raise RuntimeError('Missing local server certificate path')
+    ctx = ssl.create_default_context(cafile=SERVER_CERT_PATH)
+    ctx.check_hostname = False
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    return ctx
+
+
+def _socket_auth_signature(channel: str, session_id: str, timestamp: str, nonce: str) -> str:
+    payload = '\n'.join([channel, session_id, timestamp, nonce])
+    return hmac.new(_load_hmac_secret().encode('utf-8'), payload.encode('utf-8'), hashlib.sha256).hexdigest()
+
+
+def _send_socket_auth(conn: socket.socket, channel: str, session_id: str) -> None:
+    timestamp = str(int(time.time()))
+    nonce = secrets.token_urlsafe(24)
+    _send_frame(
+        conn,
+        {
+            'type': 'AUTH',
+            'channel': channel,
+            'session_id': session_id,
+            'timestamp': timestamp,
+            'nonce': nonce,
+            'signature': _socket_auth_signature(channel, session_id, timestamp, nonce),
+        },
+    )
+    ack, _ = _recv_frame(conn)
+    if ack.get('type') != 'AUTH_ACK' or not ack.get('ok', False):
+        raise PermissionError(f'Server rejected socket auth for channel {channel}')
+
 
 def retrieve_file(server_addr:tuple[str, int], path) -> bool:
-    ip, port = server_addr
     app_name = get_appname()
-    url = f'http://{ip}:{port}/retrieve_files/{app_name}/{path}'
+    url = _build_server_url(server_addr, f'/retrieve_files/{app_name}/{path}')
     dct = {'paths': [path]}
     ran_successfully = True
     try:
-        resp:Response = requests.get(url, dct)
+        resp:Response = _secure_request('GET', url, params=dct)
         resp.raise_for_status()
     except requests.RequestException as e:
         print(f'Failed to retrieve file {path}.  Error message: {e}')
@@ -43,7 +251,7 @@ def retrieve_file(server_addr:tuple[str, int], path) -> bool:
     return ran_successfully
 
 
-def discover_server() -> tuple[str, dict[str, int]]:
+def discover_server(require_pairing: bool = False, target_ip: str | None = None) -> tuple[str, dict] | None:
     '''Attempts to discover the server on the local network using UDP broadcasting.  If successful, returns [server_ip, ports_dict], where
         server_ip: Self explanitory, the IP address of the server on the local network
         ports_dict: a dictionary containing relevant port numbers
@@ -52,25 +260,34 @@ def discover_server() -> tuple[str, dict[str, int]]:
     s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     s.settimeout(2.0)
 
-    s.sendto(b'RXS_DISCOVERY_REQ', ('<broadcast>', discovery_socket_port))
-    try:
-        resp_bytes, addr = s.recvfrom(1*KB)
-        resp = resp_bytes.decode()
-        discovered_server_ip = addr[0]
+    resp = ''
+    discovered_server_ip = ''
+    targets = []
+    if target_ip:
+        targets.append((target_ip, discovery_socket_port))
+    targets.append(('<broadcast>', discovery_socket_port))
 
-    except socket.timeout:
-        print('Socket timed out')
+    for _ in range(discovery_attempts):
+        for target in targets:
+            s.sendto(b'RXS_DISCOVERY_REQ', target)
+            try:
+                resp_bytes, addr = s.recvfrom(discovery_response_max_bytes)
+                resp = resp_bytes.decode()
+                discovered_server_ip = addr[0]
+                break
+            except socket.timeout:
+                continue
+        if resp:
+            break
+    if not resp:
+        print('Socket timed out during server discovery')
         return None
 
-    resp_parts = resp.splitlines()
-    if len(resp_parts) == 2:
-        respcode, ports_part = resp_parts
-    elif len(resp_parts) > 2:
-        print(f'Too many lines in discovery response from server. Server returned:\n{resp}')
-        return None
-    else: #resp_parts < 2
+    resp_parts = [line.strip() for line in resp.splitlines() if line.strip()]
+    if len(resp_parts) < 2:
         print(f'Too few lines in discovery response from server.  Server returned:\n{resp}')
         return None
+    respcode, ports_part = resp_parts[0], resp_parts[1]
 
     if respcode.strip() != 'RXS_SERVER_HERE':
         print(f'ERROR: Did not receive valid server discovery response code: RXS_SERVER_HERE\nInstead, receieved: {respcode.strip()}')
@@ -79,21 +296,50 @@ def discover_server() -> tuple[str, dict[str, int]]:
         print(f'ERROR: Did not receive valid port list from server in discovery response.  Receieved: {ports_part}')
         return None
     
-    ports_dict_str = ports_part.split('|')[-1]
-    ports_dict = {}
+    ports_dict_str = ports_part.split('|', 1)[-1]
+    response_obj: dict[str, str | int] = {}
 
     for entry in ports_dict_str.split(','):
-        key, val = entry.split(':')
-        port = int(val.strip())
-        ports_dict[key] = port
-    
-    return discovered_server_ip, ports_dict
+        if ':' not in entry:
+            print(f'Invalid discovery ports entry: {entry}')
+            return None
+        key, val = entry.split(':', 1)
+        response_obj[key.strip()] = int(val.strip())
+
+    extra_lines = resp_parts[2:]
+    allowed_keys = {'certificate', 'secret_key', 'pairing_expires_unix'}
+    for line in extra_lines:
+        if ':' not in line:
+            print(f'Invalid discovery line format: {line}')
+            return None
+        key, val = line.split(':', 1)
+        key = key.strip()
+        if key not in allowed_keys:
+            print(f'Unknown discovery key: {key}')
+            return None
+        response_obj[key] = val.strip()
+
+    if require_pairing:
+        required_pairing_keys = {'certificate', 'secret_key', 'pairing_expires_unix'}
+        if not required_pairing_keys.issubset(set(response_obj.keys())):
+            print('Discovery response did not include pairing credentials. Pairing may be disabled or expired.')
+            return None
+        try:
+            pairing_exp = int(str(response_obj['pairing_expires_unix']))
+        except ValueError:
+            print('Invalid pairing_expires_unix value from discovery response')
+            return None
+        now = int(time.time())
+        if pairing_exp < now - allowed_timestamp_skew_s:
+            print('Received expired pairing window in discovery response')
+            return None
+
+    return discovered_server_ip, response_obj
 
 
 def start_build_job(server_addr:tuple[str, int], git_diff_path:str, changed_binary_paths:list[str]=[], args:list[str]=[]) -> str:
-    ip, port = server_addr
     app_name = get_appname()
-    url = f'http://{ip}:{port}/start-build-job/{app_name}'
+    url = _build_server_url(server_addr, f'/start-build-job/{app_name}')
     filename = git_diff_path.split('/')[-1]
 
     files = {'gitdiff': (filename, open(git_diff_path, 'rb'), 'text/plain', {'Expires': 0})}
@@ -106,28 +352,30 @@ def start_build_job(server_addr:tuple[str, int], git_diff_path:str, changed_bina
         files[f'binaryfile{i}'] = (path, open(path, 'rb'), mimetype, {'Expires': 0})
     print(f'Starting build job by making POST request to {url} sending a diff file located at {git_diff_path}\n')
     args_data = [('xcodebuild_args', xcodebuild_arg) for xcodebuild_arg in args]
-    resp = requests.post(url, data=args_data, files=files)
+    resp = _secure_request('POST', url, data=args_data, files=files, timeout=300)
     return resp
 
 def check_build_job(server_addr:tuple[str, int], job_id:str, offset:int=0) -> Response:
-    ip, port = server_addr
-    url = f'http://{ip}:{port}/checkprogress/{job_id}/{offset}'
-    resp = requests.get(url)
+    url = _build_server_url(server_addr, f'/checkprogress/{job_id}/{offset}')
+    resp = _secure_request('GET', url)
     return resp
 
 def wait_for_build_completion(server_addr:tuple[str, int], job_id:str, server_socket_port:int, offset=0) -> str:
-    ip, port = server_addr
+    ip, _ = server_addr
     chunk_size = 4096
     full_text = ''
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.connect((ip, server_socket_port))
-        while True:
-            new_bytes = s.recv(chunk_size)
-            if not new_bytes:
-                break
-            new_text = new_bytes.decode('utf-8', errors='replace')
-            print(new_text, end='')
-            full_text += new_text
+    tls_ctx = _make_client_tls_context()
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as raw_socket:
+        raw_socket.connect((ip, server_socket_port))
+        with tls_ctx.wrap_socket(raw_socket, server_hostname=ip) as s:
+            _send_socket_auth(s, channel='build_log', session_id=str(job_id))
+            while True:
+                new_bytes = s.recv(chunk_size)
+                if not new_bytes:
+                    break
+                new_text = new_bytes.decode('utf-8', errors='replace')
+                print(new_text, end='')
+                full_text += new_text
 
     return full_text
 
@@ -259,16 +507,16 @@ def _send_file_over_socket(
 
 
 def receive_files_from_server(server_addr: tuple[str, int], paths: list[str] | str, chunk_size: int = 64 * KB) -> bool:
-    ip, port = server_addr
+    ip, _ = server_addr
     app_name = get_appname()
     if isinstance(paths, str):
         paths = [paths]
     rel_paths = [unix_path(path) for path in paths]
     transfer_id = str(uuid4())
-    init_url = f'http://{ip}:{port}/sendfilesfromserver/init/{app_name}'
+    init_url = _build_server_url(server_addr, f'/sendfilesfromserver/init/{app_name}')
     init_payload = {'transfer_id': transfer_id, 'paths': rel_paths, 'chunk_size': chunk_size}
     try:
-        init_resp = requests.post(init_url, json=init_payload)
+        init_resp = _secure_request('POST', init_url, json_data=init_payload, timeout=120)
         init_resp.raise_for_status()
     except requests.RequestException as e:
         print(f'Failed to initialize server->client transfer: {e}')
@@ -288,116 +536,119 @@ def receive_files_from_server(server_addr: tuple[str, int], paths: list[str] | s
     received_verified: set[str] = set()
     current_file = None
     sock_port = int(init_obj['file_socket_port'])
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.connect((ip, sock_port))
-        s.settimeout(60)
-        try:
-            while True:
-                header, payload = _recv_frame(s)
-                msg_type = header.get('type', '')
-                incoming_transfer_id = header.get('transfer_id', '')
-                if incoming_transfer_id != transfer_id:
-                    _send_frame(s, {'type': 'ERROR', 'ok': False, 'error': 'transfer_id mismatch'})
-                    return False
+    tls_ctx = _make_client_tls_context()
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as raw_socket:
+        raw_socket.connect((ip, sock_port))
+        with tls_ctx.wrap_socket(raw_socket, server_hostname=ip) as s:
+            s.settimeout(60)
+            _send_socket_auth(s, channel='file_download', session_id=transfer_id)
+            try:
+                while True:
+                    header, payload = _recv_frame(s)
+                    msg_type = header.get('type', '')
+                    incoming_transfer_id = header.get('transfer_id', '')
+                    if incoming_transfer_id != transfer_id:
+                        _send_frame(s, {'type': 'ERROR', 'ok': False, 'error': 'transfer_id mismatch'})
+                        return False
 
-                if msg_type == 'FILE_START':
-                    rel_path = header.get('rel_path', '')
-                    if rel_path not in expected_map:
-                        _send_frame(s, {'type': 'ACK_FILE_START', 'ok': False, 'rel_path': rel_path})
-                        continue
-                    try:
-                        destination_path = _get_safe_local_project_path(rel_path, project_root)
-                    except ValueError as e:
-                        print(f'Invalid destination path for {rel_path}: {e}')
-                        _send_frame(s, {'type': 'ACK_FILE_START', 'ok': False, 'rel_path': rel_path})
-                        continue
+                    if msg_type == 'FILE_START':
+                        rel_path = header.get('rel_path', '')
+                        if rel_path not in expected_map:
+                            _send_frame(s, {'type': 'ACK_FILE_START', 'ok': False, 'rel_path': rel_path})
+                            continue
+                        try:
+                            destination_path = _get_safe_local_project_path(rel_path, project_root)
+                        except ValueError as e:
+                            print(f'Invalid destination path for {rel_path}: {e}')
+                            _send_frame(s, {'type': 'ACK_FILE_START', 'ok': False, 'rel_path': rel_path})
+                            continue
 
-                    parent = os.path.dirname(destination_path)
-                    if parent and not os.path.exists(parent):
-                        os.makedirs(parent, exist_ok=True)
-                    temp_path = destination_path + '.part'
-                    if os.path.exists(temp_path):
-                        os.remove(temp_path)
-                    current_file = {
-                        'rel_path': rel_path,
-                        'destination_path': destination_path,
-                        'temp_path': temp_path,
-                        'expected_size': int(expected_map[rel_path]['size']),
-                        'expected_sha256': expected_map[rel_path]['sha256'],
-                        'bytes_received': 0,
-                        'hash': hashlib.sha256(),
-                        'handle': open(temp_path, 'wb'),
-                    }
-                    _send_frame(s, {'type': 'ACK_FILE_START', 'ok': True, 'rel_path': rel_path})
+                        parent = os.path.dirname(destination_path)
+                        if parent and not os.path.exists(parent):
+                            os.makedirs(parent, exist_ok=True)
+                        temp_path = destination_path + '.part'
+                        if os.path.exists(temp_path):
+                            os.remove(temp_path)
+                        current_file = {
+                            'rel_path': rel_path,
+                            'destination_path': destination_path,
+                            'temp_path': temp_path,
+                            'expected_size': int(expected_map[rel_path]['size']),
+                            'expected_sha256': expected_map[rel_path]['sha256'],
+                            'bytes_received': 0,
+                            'hash': hashlib.sha256(),
+                            'handle': open(temp_path, 'wb'),
+                        }
+                        _send_frame(s, {'type': 'ACK_FILE_START', 'ok': True, 'rel_path': rel_path})
 
-                elif msg_type == 'FILE_CHUNK':
-                    if not current_file:
-                        continue
-                    current_file['handle'].write(payload)
-                    current_file['hash'].update(payload)
-                    current_file['bytes_received'] += len(payload)
+                    elif msg_type == 'FILE_CHUNK':
+                        if not current_file:
+                            continue
+                        current_file['handle'].write(payload)
+                        current_file['hash'].update(payload)
+                        current_file['bytes_received'] += len(payload)
 
-                elif msg_type == 'FILE_END':
-                    rel_path = header.get('rel_path', '')
-                    if not current_file or rel_path != current_file['rel_path']:
-                        _send_frame(s, {'type': 'FILE_RESULT', 'ok': False, 'rel_path': rel_path})
-                        continue
-                    current_file['handle'].close()
-                    actual_size = current_file['bytes_received']
-                    actual_sha256 = current_file['hash'].hexdigest()
-                    verified = (
-                        actual_size == current_file['expected_size']
-                        and actual_sha256 == current_file['expected_sha256']
-                    )
-                    if verified:
-                        os.replace(current_file['temp_path'], current_file['destination_path'])
-                        received_verified.add(rel_path)
+                    elif msg_type == 'FILE_END':
+                        rel_path = header.get('rel_path', '')
+                        if not current_file or rel_path != current_file['rel_path']:
+                            _send_frame(s, {'type': 'FILE_RESULT', 'ok': False, 'rel_path': rel_path})
+                            continue
+                        current_file['handle'].close()
+                        actual_size = current_file['bytes_received']
+                        actual_sha256 = current_file['hash'].hexdigest()
+                        verified = (
+                            actual_size == current_file['expected_size']
+                            and actual_sha256 == current_file['expected_sha256']
+                        )
+                        if verified:
+                            os.replace(current_file['temp_path'], current_file['destination_path'])
+                            received_verified.add(rel_path)
+                        else:
+                            if os.path.exists(current_file['temp_path']):
+                                os.remove(current_file['temp_path'])
+                        _send_frame(s, {'type': 'FILE_RESULT', 'ok': verified, 'rel_path': rel_path})
+                        current_file = None
+
+                    elif msg_type == 'TRANSFER_END':
+                        missing_paths = sorted(expected_paths - received_verified)
+                        ok = len(missing_paths) == 0
+                        _send_frame(
+                            s,
+                            {
+                                'type': 'TRANSFER_RECEIVED',
+                                'ok': ok,
+                                'transfer_id': transfer_id,
+                                'missing': missing_paths,
+                            },
+                        )
+                        break
                     else:
-                        if os.path.exists(current_file['temp_path']):
-                            os.remove(current_file['temp_path'])
-                    _send_frame(s, {'type': 'FILE_RESULT', 'ok': verified, 'rel_path': rel_path})
-                    current_file = None
-
-                elif msg_type == 'TRANSFER_END':
-                    missing_paths = sorted(expected_paths - received_verified)
-                    ok = len(missing_paths) == 0
-                    _send_frame(
-                        s,
-                        {
-                            'type': 'TRANSFER_RECEIVED',
-                            'ok': ok,
-                            'transfer_id': transfer_id,
-                            'missing': missing_paths,
-                        },
-                    )
-                    break
+                        print(f'Unknown frame type from server: {msg_type}')
+                        return False
+            except TimeoutError as e:
+                active_rel_path = current_file.get('rel_path', '') if isinstance(current_file, dict) else ''
+                if active_rel_path:
+                    print(f'Timed out receiving server file transfer while handling {active_rel_path}: {e}')
                 else:
-                    print(f'Unknown frame type from server: {msg_type}')
-                    return False
-        except TimeoutError as e:
-            active_rel_path = current_file.get('rel_path', '') if isinstance(current_file, dict) else ''
-            if active_rel_path:
-                print(f'Timed out receiving server file transfer while handling {active_rel_path}: {e}')
-            else:
-                print(f'Timed out receiving server file transfer: {e}')
-            return False
-        except (ConnectionError, ValueError, json.JSONDecodeError) as e:
-            print(f'Protocol/connection error while receiving files from server: {e}')
-            return False
-        finally:
-            handle = None
-            temp_path = ''
-            if isinstance(current_file, dict):
-                handle = current_file.get('handle', None)
-                temp_path = current_file.get('temp_path', '')
-            if handle is not None and hasattr(handle, 'closed') and not handle.closed:
-                handle.close()
-            if temp_path and os.path.exists(temp_path):
-                os.remove(temp_path)
+                    print(f'Timed out receiving server file transfer: {e}')
+                return False
+            except (ConnectionError, ValueError, json.JSONDecodeError) as e:
+                print(f'Protocol/connection error while receiving files from server: {e}')
+                return False
+            finally:
+                handle = None
+                temp_path = ''
+                if isinstance(current_file, dict):
+                    handle = current_file.get('handle', None)
+                    temp_path = current_file.get('temp_path', '')
+                if handle is not None and hasattr(handle, 'closed') and not handle.closed:
+                    handle.close()
+                if temp_path and os.path.exists(temp_path):
+                    os.remove(temp_path)
 
-    complete_url = f'http://{ip}:{port}/sendfilesfromserver/complete/{app_name}'
+    complete_url = _build_server_url(server_addr, f'/sendfilesfromserver/complete/{app_name}')
     try:
-        complete_resp = requests.post(complete_url, json={'transfer_id': transfer_id})
+        complete_resp = _secure_request('POST', complete_url, json_data={'transfer_id': transfer_id})
         complete_resp.raise_for_status()
     except requests.RequestException as e:
         print(f'Failed to complete server->client transfer: {e}')
@@ -410,7 +661,6 @@ def receive_files_from_server(server_addr: tuple[str, int], paths: list[str] | s
 
 
 def send_files(server_addr:tuple[str, int], paths:list[str]|str, filesize_threshold:int=20*MB, total_threshold=50*MB) -> bool:
-    ip, port = server_addr
     app_name = get_appname()
     if isinstance(paths, str):
         paths = [paths]
@@ -425,7 +675,7 @@ def send_files(server_addr:tuple[str, int], paths:list[str]|str, filesize_thresh
 
     file_sizes = [entry['size'] for entry in file_entries]
     if all(size < filesize_threshold for size in file_sizes) and (sum(file_sizes) < total_threshold):
-        url = f'http://{ip}:{port}/sendfileshttp/{app_name}'
+        url = _build_server_url(server_addr, f'/sendfileshttp/{app_name}')
         files = {}
         handles = []
         try:
@@ -444,7 +694,7 @@ def send_files(server_addr:tuple[str, int], paths:list[str]|str, filesize_thresh
                 handles.append(handle)
                 files[f'file{i}'] = (rel_path, handle, mimetype, {'Expires': 0})
 
-            resp = requests.post(url, files=files)
+            resp = _secure_request('POST', url, files=files, timeout=300)
         finally:
             for handle in handles:
                 handle.close()
@@ -457,7 +707,7 @@ def send_files(server_addr:tuple[str, int], paths:list[str]|str, filesize_thresh
         return True
 
     transfer_id = str(uuid4())
-    url = f'http://{ip}:{port}/sendfilessocket/init/{app_name}'
+    url = _build_server_url(server_addr, f'/sendfilessocket/init/{app_name}')
     init_payload = {
         'transfer_id': transfer_id,
         'chunk_size': 64 * KB,
@@ -470,7 +720,7 @@ def send_files(server_addr:tuple[str, int], paths:list[str]|str, filesize_thresh
     last_err = None
     for _ in range(3):
         try:
-            init_resp = requests.post(url, json=init_payload)
+            init_resp = _secure_request('POST', url, json_data=init_payload, timeout=120)
             init_resp.raise_for_status()
             break
         except requests.RequestException as e:
@@ -484,30 +734,34 @@ def send_files(server_addr:tuple[str, int], paths:list[str]|str, filesize_thresh
         return False
 
     sock_port = int(init_obj['file_socket_port'])
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.connect((ip, sock_port))
-        s.settimeout(60)
-        for entry in file_entries:
-            sent_successfully = _send_file_over_socket(
-                s=s,
-                abs_path=entry['abs_path'],
-                rel_path=entry['rel_path'],
-                expected_size=entry['size'],
-                expected_sha256=entry['sha256'],
-                transfer_id=transfer_id,
-                chunk_size=init_payload['chunk_size'],
-            )
-            if not sent_successfully:
-                print(f"Failed to send file over socket: {entry['rel_path']}")
+    ip, _ = server_addr
+    tls_ctx = _make_client_tls_context()
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as raw_socket:
+        raw_socket.connect((ip, sock_port))
+        with tls_ctx.wrap_socket(raw_socket, server_hostname=ip) as s:
+            s.settimeout(60)
+            _send_socket_auth(s, channel='file_upload', session_id=transfer_id)
+            for entry in file_entries:
+                sent_successfully = _send_file_over_socket(
+                    s=s,
+                    abs_path=entry['abs_path'],
+                    rel_path=entry['rel_path'],
+                    expected_size=entry['size'],
+                    expected_sha256=entry['sha256'],
+                    transfer_id=transfer_id,
+                    chunk_size=init_payload['chunk_size'],
+                )
+                if not sent_successfully:
+                    print(f"Failed to send file over socket: {entry['rel_path']}")
+                    return False
+            _send_frame(s, {'type': 'TRANSFER_END', 'transfer_id': transfer_id})
+            transfer_ack, _ = _recv_frame(s)
+            if transfer_ack.get('type') != 'TRANSFER_RECEIVED' or not transfer_ack.get('ok', False):
+                print(f'Server did not accept transfer end: {transfer_ack}')
                 return False
-        _send_frame(s, {'type': 'TRANSFER_END', 'transfer_id': transfer_id})
-        transfer_ack, _ = _recv_frame(s)
-        if transfer_ack.get('type') != 'TRANSFER_RECEIVED' or not transfer_ack.get('ok', False):
-            print(f'Server did not accept transfer end: {transfer_ack}')
-            return False
 
-    complete_url = f'http://{ip}:{port}/sendfilessocket/complete/{app_name}'
-    complete_resp = requests.post(complete_url, json={'transfer_id': transfer_id})
+    complete_url = _build_server_url(server_addr, f'/sendfilessocket/complete/{app_name}')
+    complete_resp = _secure_request('POST', complete_url, json_data={'transfer_id': transfer_id})
     complete_resp.raise_for_status()
     complete_obj = complete_resp.json()
     if not complete_obj.get('ok', False):
@@ -518,15 +772,14 @@ def send_files(server_addr:tuple[str, int], paths:list[str]|str, filesize_thresh
 
 
 def apply_patch_server(server_addr:tuple[str, int], patch_path:str=None) -> Response:
-    ip, port = server_addr
     app_name = get_appname()
     if not patch_path:
-        patch_path = os.path.join(get_runtime_dir_path, 'gitdiff.diff')
+        patch_path = os.path.join(get_runtime_dir_path(), 'gitdiff.diff')
     if not os.path.exists(patch_path):
         patch_path, _ = prepare_text_changes()
         git_diff_filepath
-    url = f'http://{ip}:{port}/apply-patch-server/{app_name}'
-    resp:Response = requests.get(url, params={'patch_path': patch_path})
+    url = _build_server_url(server_addr, f'/apply-patch-server/{app_name}')
+    resp:Response = _secure_request('GET', url, params={'patch_path': patch_path})
     return resp
     
 
@@ -547,12 +800,11 @@ def send_current_changes(server_addr:tuple[str, int]) -> bool:
     return True
 
 def retrieve_current_text_changes(server_addr:tuple[str, int], save_as_filename='gitdiff.diff') -> bool:
-    ip, port = server_addr
     app_name = get_appname()
-    url = f'http://{ip}:{port}/retrieve_text_changes/{app_name}'
+    url = _build_server_url(server_addr, f'/retrieve_text_changes/{app_name}')
     ran_successfully = True
     try:
-        diff_resp:Response = requests.get(url, stream=True)
+        diff_resp:Response = _secure_request('GET', url, stream=True, timeout=120)
         diff_resp.raise_for_status()
     except requests.RequestException as e:
         print(f'Failed to retrieve text changes: {e}')
@@ -575,11 +827,10 @@ def retrieve_current_changes(server_addr:tuple[str, int], exclude_binary_changes
     retrieved_text_changes = retrieve_current_text_changes(server_addr, save_as_filename)
     if not exclude_binary_changes:
         project_root = get_project_root_path()
-        ip, port = server_addr
         app_name = get_appname()
-        url = f'http://{ip}:{port}/retrieve_changed_binary_paths/{app_name}'
+        url = _build_server_url(server_addr, f'/retrieve_changed_binary_paths/{app_name}')
         try:
-            binary_paths_resp:Response = requests.get(url)
+            binary_paths_resp:Response = _secure_request('GET', url)
             binary_paths_resp.raise_for_status()
         except requests.RequestException as e:
             print(f'Failed to retrieve binary path list: {e}')
@@ -636,13 +887,12 @@ def get_local_git_state() -> dict:
 
 
 def get_server_git_state(server_addr:tuple[str, int], app_name:str='') -> dict|None:
-    ip, port = server_addr
     if not app_name:
         app_name = get_appname()
 
-    url = f'http://{ip}:{port}/git_state/{app_name}'
+    url = _build_server_url(server_addr, f'/git_state/{app_name}')
     try:
-        resp:Response = requests.get(url)
+        resp:Response = _secure_request('GET', url)
         resp.raise_for_status()
     except requests.RequestException as e:
         print(f'Failed to retrieve server git state: {e}')
@@ -658,16 +908,15 @@ def get_server_git_state(server_addr:tuple[str, int], app_name:str='') -> dict|N
 
 
 def _post_server_git_action(server_addr:tuple[str, int], action:str, args:dict|None=None, app_name:str='') -> dict|None:
-    ip, port = server_addr
     if not app_name:
         app_name = get_appname()
     if args is None:
         args = {}
 
-    url = f'http://{ip}:{port}/git_action/{app_name}'
+    url = _build_server_url(server_addr, f'/git_action/{app_name}')
     payload = {'action': action, 'args': args}
     try:
-        resp:Response = requests.post(url, json=payload)
+        resp:Response = _secure_request('POST', url, json_data=payload)
         resp.raise_for_status()
     except requests.RequestException as e:
         print(f'Failed to run server git action {action}: {e}')
@@ -1234,11 +1483,10 @@ def reconcile_git_state(server_addr:tuple[str, int], app_name:str='') -> dict:
 
 
 def retrieve_diff_for_files(server_addr:tuple[str, int], paths:list[str]) -> str:
-    ip, port = server_addr
     app_name:str = get_appname()
-    url = f'http://{ip}:{port}/retrieve_diff_for_files/{app_name}'
+    url = _build_server_url(server_addr, f'/retrieve_diff_for_files/{app_name}')
     try:
-        resp:Response = requests.post(url, json={'filepaths': paths})
+        resp:Response = _secure_request('POST', url, json_data={'filepaths': paths}, timeout=120)
         resp.raise_for_status()
     except requests.RequestException as e:
         print(f'Failed to retrieve diff for specified files: {','.join(paths)[1:]}')
@@ -1273,7 +1521,6 @@ def retrieve_diff_for_files(server_addr:tuple[str, int], paths:list[str]) -> str
 
 
 def sync_changes_with_server(server_addr:tuple[str, int], sync_branches=False, scope='repo') -> bool:
-    ip, port = server_addr
     app_name = get_appname()
 
     ########################### Reconcile actual git state (commit/branch) between client and server ###########################
@@ -1288,12 +1535,12 @@ def sync_changes_with_server(server_addr:tuple[str, int], sync_branches=False, s
     ############################################################################################################################  
 
     ################################################# Sync uncommitted changes #################################################
-    url = f'http://{ip}:{port}/retrieve_changed_file_paths/{app_name}/{scope}'
+    url = _build_server_url(server_addr, f'/retrieve_changed_file_paths/{app_name}/{scope}')
     changed_fpaths_client = get_changed_file_paths(scope)
     changed_plainpaths_client, changed_binarypaths_client = split_paths_by_text_or_binary(changed_fpaths_client)
 
     try:
-        resp = requests.get(url, stream=True)
+        resp = _secure_request('GET', url, stream=True, timeout=120)
         resp.raise_for_status()
     except requests.RequestException as e:
         print(f'Failed to retrieve changed file path lst: {e}')
@@ -1414,21 +1661,33 @@ if __name__ == '__main__':
     #End of all first-run initialization
 
 
-    #Try to find saved server info (ip and various ports) in serverinfo.txt
+    # Try to find saved server info (ip and various ports) in serverinfo.txt.
     serverinfo_path = os.path.join(runtime_dir, 'serverinfo.txt')
+    serverinfo_dict = {}
     if os.path.exists(serverinfo_path):
-        with open(serverinfo_path, 'r') as f:
+        with open(serverinfo_path, 'r', encoding='utf-8') as f:
             serverinfo_dict = json.load(f)
-            
     else:
-        server_ip, serverinfo_dict = discover_server()
-        if not 'server_ip' in serverinfo_dict.keys():
-            serverinfo_dict['server_ip'] = server_ip
+        serverinfo_dict = {}
 
-        with open(serverinfo_path, 'w') as f:
-            json.dump(serverinfo_dict, f)
+    # If connection metadata is missing, do a non-pairing discovery pass to bootstrap IP/ports.
+    required_conn_keys = ['server_ip', 'server_port', 'server_socket_port', 'file_socket_port']
+    missing_conn = [key for key in required_conn_keys if key not in serverinfo_dict]
+    if missing_conn:
+        discovery_result = discover_server(require_pairing=False, target_ip=str(serverinfo_dict.get('server_ip', '')).strip() or None)
+        if discovery_result is None:
+            raise RuntimeError('Unable to discover server connection metadata over UDP.')
+        server_ip_discovered, discovered_info = discovery_result
+        serverinfo_dict['server_ip'] = server_ip_discovered
+        serverinfo_dict['server_port'] = int(discovered_info['server_port'])
+        serverinfo_dict['server_socket_port'] = int(discovered_info['server_socket_port'])
+        serverinfo_dict['file_socket_port'] = int(discovered_info['file_socket_port'])
 
-    required_keys = ['server_ip', 'server_port', 'server_socket_port', 'file_socket_port']
+    # Ensure we have paired cert + shared secret; this requires active pairing window when missing.
+    serverinfo_dict = _ensure_pairing_material(serverinfo_path, runtime_dir, existing_info=serverinfo_dict)
+    _initialize_security_context(runtime_dir, serverinfo_dict)
+
+    required_keys = required_conn_keys
     missing_keys = [key for key in required_keys if key not in serverinfo_dict]
     if missing_keys:
         raise KeyError(f'serverinfo.txt is missing required keys: {missing_keys}')
