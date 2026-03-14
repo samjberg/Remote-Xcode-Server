@@ -1,6 +1,7 @@
-import os, subprocess, socket, json, struct, hashlib, time
+import os, subprocess, socket, json, struct, hashlib, time, re, datetime, secrets, ssl, hmac
 from flask import Flask, request, send_file, send_from_directory, jsonify, Request, Response
 from threading import Thread, Lock
+from functools import wraps
 from werkzeug.utils import secure_filename
 from mcp_utils import *
 # from requests import Request
@@ -9,23 +10,11 @@ server_port = 8751
 server_socket_port = 50271
 discovery_socket_port = 9346
 file_socket_port = 47283
+pairing_duration_s = 60
+allowed_timestamp_skew_s = 120
+nonce_ttl_s = 300
 
-def get_server_port() -> int:
-    return server_port
-
-def start_discovery_listener():
-    #use SOCK_DGRAM for UDP instead of TCP
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind(('0.0.0.0', discovery_socket_port))
-    while True:
-        msg_bytes, addr = s.recvfrom(1*KB)
-        if msg_bytes.startswith(b'RXS_DISCOVERY_REQ'):
-            resp_str = f'RXS_SERVER_HERE\nports|server_port:{server_port},server_socket_port:{server_socket_port},file_socket_port:{file_socket_port}'
-            s.sendto(resp_str.encode(errors='replace'), addr)
-
-
-
-#establish several filesystem level global variables
+# establish several filesystem level global variables
 cwd = unix_path(os.getcwd())
 project_name = get_project_name()
 server_dir_name = get_runtime_dir_name()
@@ -33,7 +22,247 @@ server_dir_path = os.path.join(cwd, server_dir_name)
 project_info_filename = 'projectinfo.txt'
 project_info_filepath = os.path.join(server_dir_path, project_info_filename)
 
-#set up sockets for streaming xcode commands (server) and sending/receiving files (filesocket)
+PAIRING_EXPIRY_UNIX = 0
+PAIRING_LOCK = Lock()
+NONCE_CACHE: dict[str, int] = {}
+NONCE_LOCK = Lock()
+SERVER_TLS_CONTEXT: ssl.SSLContext | None = None
+
+
+def get_server_port() -> int:
+    return server_port
+
+
+def _secrets_base_dir() -> str:
+    return os.path.join(get_runtime_dir_path(cwd), '.secrets')
+
+
+def get_tls_paths() -> tuple[str, str]:
+    tls_dir = os.path.join(_secrets_base_dir(), 'tls')
+    return os.path.join(tls_dir, 'cert.pem'), os.path.join(tls_dir, 'key.pem')
+
+
+def _get_hmac_secret_path() -> str:
+    auth_dir = os.path.join(_secrets_base_dir(), 'auth')
+    return os.path.join(auth_dir, 'hmac_secret.txt')
+
+
+def _generate_secret_key_hmac() -> str:
+    return secrets.token_urlsafe(48)
+
+
+def _generate_secret_pair(path: str | None = None) -> tuple[str, str]:
+    if not path:
+        path = get_runtime_dir_path()
+    print('Generating self-signed certificates for HTTPS...')
+    proc = subprocess.run(
+        [
+            'openssl',
+            'req',
+            '-x509',
+            '-newkey',
+            'rsa:4096',
+            '-keyout',
+            'key.pem',
+            '-out',
+            'cert.pem',
+            '-sha256',
+            '-days',
+            '365',
+            '-nodes',
+            '-subj',
+            '/CN=localhost',
+        ],
+        cwd=path,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if proc.returncode != 0:
+        err_text = proc.stderr.decode(errors='replace') if proc.stderr else 'unknown error'
+        raise RuntimeError(f'Failed to generate TLS keypair with openssl: {err_text}')
+    return os.path.join(path, 'cert.pem'), os.path.join(path, 'key.pem')
+
+
+def get_hmac_secret() -> str:
+    secret_path = _get_hmac_secret_path()
+    with open(secret_path, 'r', encoding='utf-8') as f:
+        return f.read().strip()
+
+
+def bootstrap_security_state() -> None:
+    cert_path, key_path = get_tls_paths()
+    secret_path = _get_hmac_secret_path()
+    os.makedirs(os.path.dirname(cert_path), exist_ok=True)
+    os.makedirs(os.path.dirname(secret_path), exist_ok=True)
+
+    if not (os.path.exists(cert_path) and os.path.exists(key_path)):
+        generated_cert, generated_key = _generate_secret_pair(os.path.dirname(cert_path))
+        if generated_cert != cert_path:
+            os.replace(generated_cert, cert_path)
+        if generated_key != key_path:
+            os.replace(generated_key, key_path)
+
+    if not os.path.exists(secret_path):
+        with open(secret_path, 'w', encoding='utf-8') as f:
+            f.write(_generate_secret_key_hmac())
+
+    global SERVER_TLS_CONTEXT
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
+    SERVER_TLS_CONTEXT = ctx
+
+
+def pairing_window_state() -> tuple[bool, int]:
+    now = int(time.time())
+    with PAIRING_LOCK:
+        is_enabled = now < PAIRING_EXPIRY_UNIX
+        expires_at = PAIRING_EXPIRY_UNIX
+    return is_enabled, expires_at
+
+
+def enable_pairing_window(duration_s: int = pairing_duration_s) -> int:
+    expires_at = int(time.time()) + int(duration_s)
+    global PAIRING_EXPIRY_UNIX
+    with PAIRING_LOCK:
+        PAIRING_EXPIRY_UNIX = expires_at
+    return expires_at
+
+
+def get_certificate() -> str:
+    cert_path, _ = get_tls_paths()
+    with open(cert_path, 'r', encoding='utf-8') as f:
+        return f.read().strip()
+
+
+def _request_target(path: str, query: str) -> str:
+    if not query:
+        return path
+    return f'{path}?{query}'
+
+
+def _body_sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _signature_payload(method: str, target: str, timestamp: str, nonce: str, body_sha256: str) -> str:
+    return '\n'.join([method.upper(), target, timestamp, nonce, body_sha256])
+
+
+def _prune_nonce_cache(now_unix: int) -> None:
+    stale = []
+    for nonce, seen_at in NONCE_CACHE.items():
+        if now_unix - seen_at > nonce_ttl_s:
+            stale.append(nonce)
+    for nonce in stale:
+        NONCE_CACHE.pop(nonce, None)
+
+
+def _verify_hmac_request(req: Request) -> tuple[bool, int, str]:
+    timestamp = req.headers.get('X-RXS-Timestamp', '').strip()
+    signature = req.headers.get('X-RXS-Signature', '').strip()
+    nonce = req.headers.get('X-RXS-Nonce', '').strip()
+    if not timestamp or not signature or not nonce:
+        return False, 401, 'missing_auth_headers'
+    try:
+        ts = int(timestamp)
+    except ValueError:
+        return False, 401, 'invalid_timestamp'
+    now = int(time.time())
+    if abs(now - ts) > allowed_timestamp_skew_s:
+        return False, 401, 'timestamp_out_of_window'
+
+    with NONCE_LOCK:
+        _prune_nonce_cache(now)
+        if nonce in NONCE_CACHE:
+            return False, 403, 'replayed_nonce'
+        NONCE_CACHE[nonce] = now
+
+    body_bytes = req.get_data(cache=True) or b''
+    target = _request_target(req.path, req.query_string.decode('utf-8', errors='replace'))
+    payload = _signature_payload(req.method, target, timestamp, nonce, _body_sha256(body_bytes))
+    expected = hmac.new(get_hmac_secret().encode('utf-8'), payload.encode('utf-8'), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        return False, 403, 'invalid_signature'
+    return True, 200, 'ok'
+
+
+def require_auth(fn):
+    @wraps(fn)
+    def inner(*args, **kwargs):
+        ok, status_code, error = _verify_hmac_request(request)
+        if not ok:
+            return jsonify({'ok': False, 'error': error}), status_code
+        return fn(*args, **kwargs)
+
+    return inner
+
+
+def _build_socket_auth_payload(channel: str, session_id: str, timestamp: str, nonce: str) -> str:
+    return '\n'.join([channel, session_id, timestamp, nonce])
+
+
+def _verify_socket_handshake(conn: socket.socket, expected_channel: str, expected_session_id: str) -> None:
+    header, _ = _recv_frame(conn)
+    if header.get('type') != 'AUTH':
+        raise PermissionError('missing auth handshake')
+    channel = str(header.get('channel', ''))
+    session_id = str(header.get('session_id', ''))
+    timestamp = str(header.get('timestamp', ''))
+    nonce = str(header.get('nonce', ''))
+    signature = str(header.get('signature', ''))
+    if channel != expected_channel or session_id != expected_session_id:
+        raise PermissionError('invalid auth handshake target')
+    try:
+        ts = int(timestamp)
+    except ValueError as e:
+        raise PermissionError('invalid auth handshake timestamp') from e
+    now = int(time.time())
+    if abs(now - ts) > allowed_timestamp_skew_s:
+        raise PermissionError('stale auth handshake timestamp')
+
+    with NONCE_LOCK:
+        _prune_nonce_cache(now)
+        if nonce in NONCE_CACHE:
+            raise PermissionError('replayed auth handshake nonce')
+        NONCE_CACHE[nonce] = now
+
+    payload = _build_socket_auth_payload(channel, session_id, timestamp, nonce)
+    expected = hmac.new(get_hmac_secret().encode('utf-8'), payload.encode('utf-8'), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        raise PermissionError('invalid auth handshake signature')
+    _send_frame(conn, {'type': 'AUTH_ACK', 'ok': True})
+
+
+def _wrap_server_tls_socket(conn: socket.socket) -> ssl.SSLSocket:
+    if SERVER_TLS_CONTEXT is None:
+        raise RuntimeError('Server TLS context is not initialized')
+    return SERVER_TLS_CONTEXT.wrap_socket(conn, server_side=True)
+
+
+def start_discovery_listener():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(('0.0.0.0', discovery_socket_port))
+    while True:
+        msg_bytes, addr = s.recvfrom(1 * KB)
+        if not msg_bytes.startswith(b'RXS_DISCOVERY_REQ'):
+            continue
+        response_lines = [
+            'RXS_SERVER_HERE',
+            f'ports|server_port:{server_port},server_socket_port:{server_socket_port},file_socket_port:{file_socket_port}',
+        ]
+        pairing_enabled, expires_at = pairing_window_state()
+        if pairing_enabled:
+            cert_one_line = get_certificate().replace('\n', '<nl>')
+            response_lines.append(f'certificate:{cert_one_line}')
+            response_lines.append(f'secret_key:{get_hmac_secret()}')
+            response_lines.append(f'pairing_expires_unix:{expires_at}')
+        s.sendto('\n'.join(response_lines).encode('utf-8', errors='replace'), addr)
+
+
+bootstrap_security_state()
+
+# set up sockets for streaming xcode commands (server) and sending/receiving files (filesocket)
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server.bind(('0.0.0.0', server_socket_port))
 server.listen(1)
@@ -41,7 +270,7 @@ filesocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 filesocket.bind(('0.0.0.0', file_socket_port))
 filesocket.listen(1)
 
-#launch thread that reports back to client on server discovery broadcast requests
+# launch thread that reports back to client on server discovery broadcast requests
 discovery_thread = Thread(target=start_discovery_listener, args=[], daemon=True)
 discovery_thread.start()
 
@@ -76,6 +305,15 @@ OUTBOUND_TRANSFER_SESSIONS: dict[str, dict] = {}
 SESSION_LOCK = Lock()
 SESSION_TTL_SECONDS = 30 * 60
 
+
+@app.before_request
+def _global_auth_gate():
+    if request.path in ['/', '/enable_pairing']:
+        return None
+    ok, status_code, error = _verify_hmac_request(request)
+    if not ok:
+        return jsonify({'ok': False, 'error': error}), status_code
+    return None
 
 
 
@@ -216,8 +454,10 @@ def _handle_file_transfer_session(transfer_id: str) -> None:
     conn = None
     try:
         _update_session(transfer_id, status='awaiting_socket')
-        conn, _ = filesocket.accept()
+        raw_conn, _ = filesocket.accept()
+        conn = _wrap_server_tls_socket(raw_conn)
         conn.settimeout(60)
+        _verify_socket_handshake(conn, expected_channel='file_upload', expected_session_id=transfer_id)
         _update_session(transfer_id, status='receiving')
 
         while True:
@@ -357,8 +597,10 @@ def send_files_from_server(transfer_id: str) -> None:
             session['status'] = 'awaiting_socket'
             session['last_updated'] = time.time()
 
-        conn, _ = filesocket.accept()
+        raw_conn, _ = filesocket.accept()
+        conn = _wrap_server_tls_socket(raw_conn)
         conn.settimeout(60)
+        _verify_socket_handshake(conn, expected_channel='file_download', expected_session_id=transfer_id)
         with SESSION_LOCK:
             session = OUTBOUND_TRANSFER_SESSIONS.get(transfer_id)
             if not session:
@@ -435,32 +677,124 @@ def send_files_from_server(transfer_id: str) -> None:
         if conn:
             conn.close()
 
+_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/].+")
+def _looks_like_path_arg(value: str):
+    if not value:
+        return False
+    s = value.strip()
+    if not s:
+        return False
+    return (
+        s.startswith(('/', './', '../', '~', '~/'))
+        or '\\' in s
+        or _DRIVE_PATH_RE.match(s) is not None
+    )
+
+def _get_invalid_xcodebuild_args(args:list[str]) -> list[str]:
+    '''Returns a list of invalid arguments'''
+    project_root = get_project_root_path()
+    path_bearing_flags = ['-project', '-workspace', '-xcconfig', '-sdk', '-derivedDataPath', '-resultBundlePath', '-resultStreamPath',
+                          '-archivePath', '-exportPath', '-exportOptionsPlist', '-localizationPath', '-xctestrun', '-testProductsPath',
+                          '-clonedSourcePackagesDirPath', '-packageCachePath', '-authenticationKeyPath', '-framework', '-library', '-headers', '-output']
+    
+    flags:list[tuple[int, str]] = []
+    invalid_args:list[str] = []
+    #establish flags and their indices within args
+    for i, arg in enumerate(args):
+        if len(arg) > 0:
+            if arg[0] == '-':
+                flags.append((i, arg))
+    
+    #we need indices so that we can check the "next argument" in the case of "-flag arg" syntax, since arg is the "next argument" in that situation
+    for i, arg in flags:
+        #handle "-flag=value" syntax
+        if '=' in arg:
+            arg_parts = arg.split('=', 1)
+            if len(arg_parts) != 2:
+                invalid_args.append(arg)
+            else:
+                flag_name, path = arg_parts
+                if flag_name in path_bearing_flags:
+                    #handle special -sdk case, since its value can be either a path or not a path, so it needs special handling
+                    if flag_name == '-sdk':
+                        if _looks_like_path_arg(path) and not is_subdir(path, project_root):
+                            invalid_args.append(arg)
+                    #handle regular case where flag_name is not -sdk
+                    elif not is_subdir(path, project_root):
+                        invalid_args.append(arg)
+        #handle the "-flag value" syntax
+        else:
+            flag_name = arg
+            if i+1 < len(args):
+                path = args[i+1]
+                if flag_name in path_bearing_flags:
+                    if flag_name == '-sdk':
+                        if _looks_like_path_arg(path) and not is_subdir(path, project_root):
+                            invalid_args.append(arg)
+                    elif not is_subdir(path, project_root):
+                        invalid_args.append(arg)
+            else:
+                #since this is specifically the "-flag value" syntax, not having a next arg means that the flag has no value.  However
+                #there are some flags that ARE just a flag with no additional value, so this does not inherently prove the flag is invalid
+                #but it's likely enough that I felt like I should create this else statement and leave this comment here at least
+                pass
+
+    return invalid_args
 
 
-def run_xcodebuild(job_id):
-    conn, addr = server.accept()
-    print(f'Received connection from {addr}')
+def run_xcodebuild(job_id, xcodebuild_args):
+    conn = None
+    proc = None
+    log_write = None
     try:
+        raw_conn, addr = server.accept()
+        conn = _wrap_server_tls_socket(raw_conn)
+        print(f'Received connection from {addr}')
+        _verify_socket_handshake(conn, expected_channel='build_log', expected_session_id=str(job_id))
         job = JOBS[job_id]
-        job['status'] = 'running'
-        xcodebuild_command: str = f"xcodebuild -scheme \"{project_name}\" -destination 'generic/platform=iOS Simulator' build"
-        proc = subprocess.Popen(xcodebuild_command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0, shell=True)
-        chunk_size = 4096
         log_write = job['file']
+        invalid_args = _get_invalid_xcodebuild_args(xcodebuild_args)
+        if invalid_args:
+            msg = f'Error (invalid args): '
+            for arg in invalid_args[:-1]:
+                msg += f'"{arg}", '
+            msg += invalid_args[-1]
+            job['status'] = 'error'
+            job['error'] = msg
+            conn.sendall(msg.encode())
+            return
+
+        job['status'] = 'running'
+        xcodebuild_command: list[str] = ['xcodebuild', *xcodebuild_args]
+        proc = subprocess.Popen(xcodebuild_command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0, shell=False)
+        chunk_size = 4096
         while True:
             chunk = proc.stdout.read(chunk_size)
             if not chunk:
                 break
-            log_write.write(chunk.decode())
+            log_write.write(chunk.decode(errors='replace'))
             conn.sendall(chunk)
 
-        log_write.close()
-        proc.wait()
-        conn.close()
-
+        return_code = proc.wait()
+        if return_code == 0:
+            job['status'] = 'done'
+        else:
+            job['status'] = 'error'
+            job['error'] = f'xcodebuild exited with return code {return_code}'
     except Exception as e:
         JOBS[job_id]['status'] = 'error'
         JOBS[job_id]['error'] = str(e)
+    finally:
+        if log_write and not log_write.closed:
+            log_write.close()
+        if conn:
+            conn.close()
+        
+
+@app.route('/enable_pairing')
+def enable_pairing():
+    expires_at = enable_pairing_window(pairing_duration_s)
+    return jsonify({'ok': True, 'pairing_enabled': True, 'expires_at_unix': expires_at})
 
 
 
@@ -865,9 +1199,10 @@ def receive_files_socket_legacy(appname:str):
     ), 410
 
 
-@app.route('/start-build-job/<appname>', methods=['GET', 'POST'])
+@app.route('/start-build-job/<appname>', methods=['POST'])
 def start_build_job(appname):
     print(f'appname: {appname}')
+    xcodebuild_args = request.form.getlist('xcodebuild_args')
 
     if request.method == 'POST' or request.method == 'GET':
         if 'gitdiff' not in request.files:
@@ -937,7 +1272,7 @@ def start_build_job(appname):
             build_log_file = open(build_log_path, 'w')
             JOBS[job_id] = {"status": "pending", "result": '', "error": None, "file": build_log_file}
 
-            t = Thread(target=run_xcodebuild, args=([job_id]), daemon=True)
+            t = Thread(target=run_xcodebuild, args=([job_id, xcodebuild_args]), daemon=True)
             t.start()
             return jsonify({"job_id": job_id}), 202
         else:
@@ -961,6 +1296,8 @@ def check_progress(job_id:str, offset:int) -> Response:
     job = JOBS[job_id]
     if job['status'] == 'done':
         return 'Build already Complete'
+    elif job['status'] == 'error':
+        return f'Job status returned error.  Error message: {job['error']}'
 
     build_log_path = get_build_log_path(job_id)
     if not os.path.exists(build_log_path):
@@ -1003,7 +1340,8 @@ def hello_world():
 
 if __name__ == '__main__':
     ip, port = '0.0.0.0', get_server_port()
-    app.run(ip, port)
+    cert_path, key_path = get_tls_paths()
+    app.run(ip, port, ssl_context=(cert_path, key_path))
 
 
 

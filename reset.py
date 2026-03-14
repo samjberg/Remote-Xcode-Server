@@ -31,3 +31,4 @@ if os.path.exists(gitignore_path):
         f.writelines(lines_to_write)
 
 
+#added a comment to a random file
