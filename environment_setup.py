@@ -65,27 +65,22 @@ def update_posix_path(new_path_directory):
     #inject the env_script into the most common profiles, .bashrc and .zshrc
     bashrc_path = os.path.join(user_home_path, '.bashrc')
     zshrc_path = os.path.join(user_home_path, '.zshrc')
+    profile_path = os.path.join(user_home_path, '.profile')
     path_injection_str = f'[[ -f ~/{env_script_name} ]] && source ~/{env_script_name}'
 
+    profile_candidates = [bashrc_path, zshrc_path, profile_path]
 
-    if os.path.exists(bashrc_path):
-        with open(bashrc_path, 'r') as f:
-            bashrc_lines = [line.strip() for line in f.readlines()]
-    else:
-        bashrc_lines = []
-    if path_injection_str not in bashrc_lines:
-        with open(bashrc_path, 'a') as f:
-            f.write(path_injection_str + '\n')
+    for path in profile_candidates:
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                lines = [line.strip() for line in f.readlines()]
+        else:
+            lines = []
+        if path_injection_str not in lines:
+            with open(path, 'a') as f:
+                f.write(path_injection_str + '\n')
 
-    if os.path.exists(zshrc_path):
-        with open(zshrc_path, 'r') as f:
-            zshrc_lines = [line.strip() for line in f.readlines()]
-    else:
-        zshrc_lines = []
-    if path_injection_str not in zshrc_lines:
-        with open(zshrc_path, 'a') as f:
-            f.write(path_injection_str + '\n')
-
+        
 
 
 def ensure_environment_setup():
