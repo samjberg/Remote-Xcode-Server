@@ -1,7 +1,11 @@
 import os, sys, pathlib, socket, subprocess, shlex, datetime, shutil
-from typing import Callable, BinaryIO, ParamSpec, TypeVar
+from typing import Callable, TypeVar
 from mimetypes import guess_type
 from uuid import uuid4
+try:
+    from typing import ParamSpec
+except ImportError:
+    from typing_extensions import ParamSpec
 
 #who even knows what these two lines are.  But they are necessary to enable typehinting for functions (i.e. run_process)
 #that use the decorator @handle_process_errors
@@ -174,10 +178,6 @@ def is_subdir(path, directory):
 
 #this insane P and R stuff with ParamSpec and TypeVar is just the insanity that is necessary to make typehints show up for functions
 #that use this decorator (i.e. run_process) for some insane reason.
-
-from typing import Callable, ParamSpec, TypeVar
-P = ParamSpec("P")
-R = TypeVar("R", bound=subprocess.CompletedProcess)
 import subprocess
 def handle_process_errors(f: Callable[P, R]) -> Callable[P, R]:
     '''Decorator which takes in a function that runs and returns the result of subprocess.run, and handles error handling for it'''
