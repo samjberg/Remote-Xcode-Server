@@ -220,7 +220,7 @@ def get_commit_date(branch:str) -> datetime.datetime|None:
             date_part_str = line.split()
             break
     if not date_part_str:
-        print(f'Date line not found in output from {' '.join(proc.args)}')
+        print(f"Date line not found in output from {' '.join(proc.args)}")
         return None
     date_part_str = date_part_str[1:]
     months = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
@@ -252,7 +252,7 @@ def git_create_update_bundle(start_ref:str, end_ref:str='HEAD', save_path='updat
     try:
         res = proc.stdout.decode(errors='replace')
     except UnicodeDecodeError as err:
-        print(f'Error decoding output from command: {' '.join(cmd)}\nError Message: {err}')
+        print(f"Error decoding output from command: {' '.join(cmd)}\nError Message: {err}")
     return save_path
 
 def git_verify_bundle(bundle_path:str) -> tuple[bool, list[str]]:
@@ -268,7 +268,7 @@ def git_verify_bundle(bundle_path:str) -> tuple[bool, list[str]]:
     try:
         res:str = proc.stdout.decode(errors='replace')
     except UnicodeDecodeError as err:
-        print(f'Error decoding output from command {' '.split(verify_bundle_command)}\nError Message: {err}')
+        print(f"Error decoding output from command {' '.split(verify_bundle_command)}\nError Message: {err}")
     
     lines = res.splitlines()
     for line in lines:
@@ -300,7 +300,7 @@ def get_git_branches(app_name:str='', return_current_branch=False, sort_order='c
     git_command = f'git branch --sort={sort_order}'.split(' ')
     proc = run_process(git_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if not proc.stdout:
-        print(f'No output from {' '.join(git_command)}')
+        print(f"No output from {' '.join(git_command)}")
     
     text: str = proc.stdout.decode()
     lines = text.splitlines()
@@ -323,7 +323,7 @@ def get_merge_base(commit_hash1:str, commit_hash2:str) -> str:
     project_root = get_project_root_path()
     proc = run_process(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=project_root)
     if not proc.stdout:
-        print(f'No output from {' '.join(proc.args)}')
+        print(f"No output from {' '.join(proc.args)}")
         return None
     merge_base = proc.stdout.decode(errors='replace').strip()
     return merge_base
@@ -336,7 +336,7 @@ def compare_ahead_behind(commit1:str, commit2:str) -> tuple[int, int]:
     project_root = get_project_root_path()
     proc = run_process(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=project_root)
     if not proc.stdout:
-        print(f'No output from {' '.join(proc.args)}')
+        print(f"No output from {' '.join(proc.args)}")
         return None
     text = proc.stdout.decode(errors='replace').strip()
     ahead, behind = [int(x) for x in text.split()]
@@ -544,7 +544,7 @@ def execute_git_action(action:str, args:dict|None=None, cwd:str|None=None) -> di
     elif action == 'ahead_behind':
         command = ['git', 'rev-list', '--left-right', '--count', f"{args['left']}...{args['right']}"]
     elif action == 'create_update_bundle':
-        command = ['git', 'bundle', 'create', args['path'], f'{args['start_ref']}..{args['end_ref']}', '--all']
+        command = ['git', 'bundle', 'create', args['path'], f"{args['start_ref']}..{args['end_ref']}", '--all']
     elif action == 'apply_update_bundle':
         if is_subdir(args['path'], get_project_root_path()):
             command = ['git', 'fetch', args['path'], '+refs/heads/*:refs/heads/*', '+refs/tags/*:refs/tags/*']
@@ -594,12 +594,12 @@ def get_current_commit_hash(app_name:str='') -> str:
     proc = subprocess.run(git_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if proc.returncode != 0:
         err_text = proc.stderr.decode(errors='replace') if proc.stderr else ''
-        print(f'Getting current git hash failed with command: {' '.join(git_command)}')
+        print(f"Getting current git hash failed with command: {' '.join(git_command)}")
         if err_text:
             print(f'Error message: {err_text}')
 
     if not proc.stdout:
-        print(f'No output from {' '.join(git_command)}')
+        print(f"No output from {' '.join(git_command)}")
         raise ValueError(err_text)
 
     text:str = proc.stdout.decode(errors='replace')
@@ -637,7 +637,7 @@ def get_changed_file_paths(scope='repo') -> list[str]:
             print(f'Error message: {err_text}')
 
     if not proc.stdout:
-        print(f'No output from {' '.join(diff_command)} in proc.stdout')
+        print(f"No output from {' '.join(diff_command)} in proc.stdout")
 
     #split "lines" (file paths) on null byte
     lines_bytes = [b for b in proc.stdout.split(b'\x00') if b] 
@@ -654,7 +654,7 @@ def get_changed_file_paths(scope='repo') -> list[str]:
             print(f'Error message: {err_text}')
 
     if not untracked_proc.stdout:
-        print(f'No output from {' '.join(untracked_diff_command)} in proc.stdout')
+        print(f"No output from {' '.join(untracked_diff_command)} in proc.stdout")
 
     untracked_lines_bytes = [b for b in untracked_proc.stdout.split(b'\x00') if b]
     untracked_file_paths = [b.decode(errors='replace') for b in untracked_lines_bytes]

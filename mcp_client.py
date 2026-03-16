@@ -1606,7 +1606,7 @@ def retrieve_diff_for_files(server_addr:tuple[str, int], paths:list[str]) -> str
         resp:Response = _secure_request('POST', url, json_data={'filepaths': paths}, timeout=120)
         resp.raise_for_status()
     except requests.RequestException as e:
-        print(f'Failed to retrieve diff for specified files: {','.join(paths)[1:]}')
+        print(f"Failed to retrieve diff for specified files: {','.join(paths)[1:]}")
         return []
 
     runtime_dir_path = get_runtime_dir_path()
