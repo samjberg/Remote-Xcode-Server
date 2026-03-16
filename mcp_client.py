@@ -1,4 +1,5 @@
 import sys, os, socket, requests, json, urllib, hashlib, struct, ssl, hmac, secrets, base64, time, subprocess, re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Union
 from requests import Response
 from requests.adapters import HTTPAdapter
@@ -11,6 +12,9 @@ allowed_timestamp_skew_s = 120
 SECURITY_SCHEMA_VERSION = 2
 discovery_response_max_bytes = 64 * KB
 discovery_attempts = 3
+DEFAULT_SERVER_PORT = 8751
+DEFAULT_SERVER_SOCKET_PORT = 50271
+DEFAULT_FILE_SOCKET_PORT = 47283
 
 SERVER_INFO: dict = {}
 SERVER_CERT_PATH = ''
@@ -116,12 +120,45 @@ def _build_server_url(server_addr: tuple[str, int], path: str) -> str:
     return f'https://{ip}:{port}{path}'
 
 
-def _fetch_pairing_bundle_https(server_ip: str, server_port: int = 8751) -> Optional[tuple[str, dict]]:
+def _env_int(name: str, default: int) -> int:
+    raw = str(os.environ.get(name, '')).strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = str(os.environ.get(name, '')).strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _default_connection_metadata(server_port: Optional[int] = None) -> dict:
+    resolved_server_port = int(server_port) if server_port is not None else _env_int('RXS_SERVER_PORT', DEFAULT_SERVER_PORT)
+    return {
+        'server_port': resolved_server_port,
+        'server_socket_port': _env_int('RXS_SERVER_SOCKET_PORT', DEFAULT_SERVER_SOCKET_PORT),
+        'file_socket_port': _env_int('RXS_FILE_SOCKET_PORT', DEFAULT_FILE_SOCKET_PORT),
+    }
+
+
+def _fetch_pairing_bundle_https(
+    server_ip: str,
+    server_port: int = DEFAULT_SERVER_PORT,
+    timeout_s: float = 5.0,
+) -> Optional[tuple[str, dict]]:
     if not server_ip:
         return None
     url = f'https://{server_ip}:{int(server_port)}/pairing-bootstrap'
     try:
-        resp = requests.get(url, verify=False, timeout=5)
+        resp = requests.get(url, verify=False, timeout=timeout_s)
         resp.raise_for_status()
     except requests.RequestException:
         return None
@@ -170,6 +207,142 @@ def _candidate_ips_from_arp(max_candidates: int = 64) -> list[str]:
         if len(ips) >= max_candidates:
             break
     return ips
+
+
+def _candidate_ips_from_local_subnet(max_candidates: int = 128) -> list[str]:
+    local_ip = get_ip()
+    parts = local_ip.split('.')
+    if len(parts) != 4:
+        return []
+    try:
+        octets = [int(x) for x in parts]
+    except ValueError:
+        return []
+    if any(x < 0 or x > 255 for x in octets):
+        return []
+    # Ignore loopback and non-private ranges for local scan.
+    if octets[0] == 127:
+        return []
+    is_private = (
+        octets[0] == 10
+        or (octets[0] == 192 and octets[1] == 168)
+        or (octets[0] == 172 and 16 <= octets[1] <= 31)
+    )
+    if not is_private:
+        return []
+
+    prefix = f'{octets[0]}.{octets[1]}.{octets[2]}'
+    local_host = octets[3]
+    hosts: list[int] = []
+    seen: set[int] = set()
+
+    def _add_host(host_octet: int) -> None:
+        if host_octet <= 0 or host_octet >= 255:
+            return
+        if host_octet == local_host or host_octet in seen:
+            return
+        seen.add(host_octet)
+        hosts.append(host_octet)
+
+    # Prioritize common gateway and nearby hosts first, then fill in remaining range.
+    _add_host(1)
+    for delta in range(1, 255):
+        _add_host(local_host - delta)
+        _add_host(local_host + delta)
+        if len(hosts) >= max_candidates:
+            break
+    if len(hosts) < max_candidates:
+        for host in range(2, 255):
+            _add_host(host)
+            if len(hosts) >= max_candidates:
+                break
+    return [f'{prefix}.{host}' for host in hosts]
+
+
+def _probe_discovery_status_https(server_ip: str, server_port: int, timeout_s: float) -> Optional[dict]:
+    url = f'https://{server_ip}:{int(server_port)}/discovery-status'
+    try:
+        resp = requests.get(url, verify=False, timeout=timeout_s)
+        resp.raise_for_status()
+        obj = resp.json()
+    except (requests.RequestException, ValueError):
+        return None
+    if not isinstance(obj, dict) or not obj.get('ok', False):
+        return None
+    # Avoid false positives if some other service happens to expose /discovery-status.
+    status_keys = {'started_at_unix', 'last_request_at_unix', 'last_response_at_unix'}
+    if not status_keys.issubset(set(obj.keys())):
+        return None
+
+    defaults = _default_connection_metadata(server_port=server_port)
+    out = {}
+    for key, fallback in defaults.items():
+        try:
+            out[key] = int(obj.get(key, fallback))
+        except (TypeError, ValueError):
+            out[key] = fallback
+    return out
+
+
+def _discover_server_via_https_probe(require_pairing: bool = False, target_ip: Optional[str] = None) -> Optional[tuple[str, dict]]:
+    server_port = _env_int('RXS_SERVER_PORT', DEFAULT_SERVER_PORT)
+    probe_timeout_s = _env_float('RXS_DISCOVERY_PROBE_TIMEOUT_S', 0.6)
+    max_candidates = _env_int('RXS_DISCOVERY_MAX_PROBES', 128)
+    if max_candidates < 1:
+        max_candidates = 1
+    if max_candidates > 512:
+        max_candidates = 512
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _add(ip: str) -> None:
+        ip = str(ip).strip()
+        if not ip or ip in seen:
+            return
+        seen.add(ip)
+        candidates.append(ip)
+
+    if target_ip:
+        _add(target_ip)
+    env_ip = str(os.environ.get('RXS_SERVER_IP', '')).strip()
+    if env_ip:
+        _add(env_ip)
+    for ip in _candidate_ips_from_arp(max_candidates=max_candidates):
+        _add(ip)
+        if len(candidates) >= max_candidates:
+            break
+    if len(candidates) < max_candidates:
+        for ip in _candidate_ips_from_local_subnet(max_candidates=max_candidates):
+            _add(ip)
+            if len(candidates) >= max_candidates:
+                break
+    if not candidates:
+        return None
+
+    def _probe(ip: str) -> Optional[tuple[str, dict]]:
+        if require_pairing:
+            return _fetch_pairing_bundle_https(ip, server_port=server_port, timeout_s=probe_timeout_s)
+        metadata = _probe_discovery_status_https(ip, server_port=server_port, timeout_s=probe_timeout_s)
+        if metadata is None:
+            return None
+        return ip, metadata
+
+    max_workers = _env_int('RXS_DISCOVERY_PROBE_WORKERS', 24)
+    if max_workers < 1:
+        max_workers = 1
+    max_workers = min(max_workers, len(candidates))
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(_probe, ip) for ip in candidates]
+        for fut in as_completed(futures):
+            try:
+                result = fut.result()
+            except Exception:
+                continue
+            if result is not None:
+                return result
+    return None
 
 
 def _load_global_serverinfo_cache() -> dict:
@@ -230,7 +403,7 @@ def _ensure_pairing_material(serverinfo_path: str, runtime_dir: str, existing_in
     if discovery_result is None:
         env_ip = os.environ.get('RXS_SERVER_IP', '').strip()
         fallback_ip = discovery_hint_ip or env_ip
-        fallback_port = int(info.get('server_port', 8751)) if info.get('server_port') else 8751
+        fallback_port = int(info.get('server_port', _env_int('RXS_SERVER_PORT', DEFAULT_SERVER_PORT))) if info.get('server_port') else _env_int('RXS_SERVER_PORT', DEFAULT_SERVER_PORT)
         discovery_result = _fetch_pairing_bundle_https(fallback_ip, fallback_port)
     if discovery_result is None:
         raise RuntimeError(
@@ -402,22 +575,28 @@ def discover_server(require_pairing: bool = False, target_ip: Optional[str] = No
                 continue
         if resp:
             break
+    def _https_fallback() -> Optional[tuple[str, dict]]:
+        result = _discover_server_via_https_probe(require_pairing=require_pairing, target_ip=target_ip)
+        if result is not None:
+            print('UDP discovery unavailable; resolved server via HTTPS probe fallback.')
+        return result
+
     if not resp:
         print('Socket timed out during server discovery')
-        return None
+        return _https_fallback()
 
     resp_parts = [line.strip() for line in resp.splitlines() if line.strip()]
     if len(resp_parts) < 2:
         print(f'Too few lines in discovery response from server.  Server returned:\n{resp}')
-        return None
+        return _https_fallback()
     respcode, ports_part = resp_parts[0], resp_parts[1]
 
     if respcode.strip() != 'RXS_SERVER_HERE':
         print(f'ERROR: Did not receive valid server discovery response code: RXS_SERVER_HERE\nInstead, receieved: {respcode.strip()}')
-        return None
+        return _https_fallback()
     elif not ports_part.startswith('ports|'):
         print(f'ERROR: Did not receive valid port list from server in discovery response.  Receieved: {ports_part}')
-        return None
+        return _https_fallback()
     
     ports_dict_str = ports_part.split('|', 1)[-1]
     response_obj: dict[str, Union[str, int]] = {}
@@ -425,7 +604,7 @@ def discover_server(require_pairing: bool = False, target_ip: Optional[str] = No
     for entry in ports_dict_str.split(','):
         if ':' not in entry:
             print(f'Invalid discovery ports entry: {entry}')
-            return None
+            return _https_fallback()
         key, val = entry.split(':', 1)
         response_obj[key.strip()] = int(val.strip())
 
@@ -434,28 +613,28 @@ def discover_server(require_pairing: bool = False, target_ip: Optional[str] = No
     for line in extra_lines:
         if ':' not in line:
             print(f'Invalid discovery line format: {line}')
-            return None
+            return _https_fallback()
         key, val = line.split(':', 1)
         key = key.strip()
         if key not in allowed_keys:
             print(f'Unknown discovery key: {key}')
-            return None
+            return _https_fallback()
         response_obj[key] = val.strip()
 
     if require_pairing:
         required_pairing_keys = {'certificate', 'secret_key', 'pairing_expires_unix'}
         if not required_pairing_keys.issubset(set(response_obj.keys())):
             print('Discovery response did not include pairing credentials. Pairing may be disabled or expired.')
-            return None
+            return _https_fallback()
         try:
             pairing_exp = int(str(response_obj['pairing_expires_unix']))
         except ValueError:
             print('Invalid pairing_expires_unix value from discovery response')
-            return None
+            return _https_fallback()
         now = int(time.time())
         if pairing_exp < now - allowed_timestamp_skew_s:
             print('Received expired pairing window in discovery response')
-            return None
+            return _https_fallback()
 
     return discovered_server_ip, response_obj
 
@@ -1802,24 +1981,33 @@ if __name__ == '__main__':
         hint_ip = str(serverinfo_dict.get('server_ip', '')).strip() or os.environ.get('RXS_SERVER_IP', '').strip() or None
         discovery_result = discover_server(require_pairing=False, target_ip=hint_ip)
         if discovery_result is None and hint_ip:
-            discovery_result = _fetch_pairing_bundle_https(hint_ip, int(serverinfo_dict.get('server_port', 8751)))
+            discovery_result = _fetch_pairing_bundle_https(
+                hint_ip,
+                int(serverinfo_dict.get('server_port', _env_int('RXS_SERVER_PORT', DEFAULT_SERVER_PORT))),
+            )
         if discovery_result is None:
             raise RuntimeError(
                 'Unable to discover server connection metadata. '
-                'Set RXS_SERVER_IP to the server LAN IP (PowerShell: $env:RXS_SERVER_IP="<ip>") and retry.'
+                'Set RXS_SERVER_IP to the server LAN IP and retry '
+                '(bash/zsh: export RXS_SERVER_IP="<ip>"; PowerShell: $env:RXS_SERVER_IP="<ip>").'
             )
         server_ip_discovered, discovered_info = discovery_result
         serverinfo_dict['server_ip'] = server_ip_discovered
         serverinfo_dict['server_port'] = int(discovered_info['server_port'])
         serverinfo_dict['server_socket_port'] = int(discovered_info['server_socket_port'])
         serverinfo_dict['file_socket_port'] = int(discovered_info['file_socket_port'])
+        # Persist connection metadata immediately so pair-only flows still cache resolved address/ports.
+        with open(serverinfo_path, 'w', encoding='utf-8') as f:
+            json.dump(serverinfo_dict, f)
+        _save_global_serverinfo_cache(serverinfo_dict)
 
     #Early arg gate checking for pair or enable-pairing (they are command synonyms for this program), since pairing needs to happen
     #before _ensure_pairing_material runs (we cannot require pairing material to pair, that would be a catch-22)
     if len(sys.argv) > 1:
         if sys.argv[1] in ['pair', 'enable-pairing']:
-            if serverinfo_dict['server_ip'] and serverinfo_dict['server_port']:
-                server_ip, server_port = serverinfo_dict['server_ip'], serverinfo_dict['server_port']
+            server_ip = str(serverinfo_dict.get('server_ip', '')).strip()
+            server_port = int(serverinfo_dict.get('server_port', _env_int('RXS_SERVER_PORT', DEFAULT_SERVER_PORT)))
+            if server_ip:
                 pairing_enabled = enable_pairing((server_ip, server_port))
                 if pairing_enabled:
                     #success message is printed in enable_pairing itself, we just need to exit
@@ -1828,7 +2016,11 @@ if __name__ == '__main__':
                     print(f"Failed to enable pairing.  Server ip and port are known: {server_ip}:{server_port}, but enable_pairing returned False")
                     exit()
             else:
-                print(f'Pairing failed, server address not known')
+                print(
+                    'Pairing failed because server address is unknown. '
+                    'Set RXS_SERVER_IP to the server LAN IP and retry '
+                    '(bash/zsh: export RXS_SERVER_IP="<ip>"; PowerShell: $env:RXS_SERVER_IP="<ip>").'
+                )
                 exit()
 
             
