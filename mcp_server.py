@@ -1359,7 +1359,7 @@ def check_progress(job_id:str, offset:int) -> Response:
     if job['status'] == 'done':
         return 'Build already Complete'
     elif job['status'] == 'error':
-        return f'Job status returned error.  Error message: {job['error']}'
+        return f"Job status returned error.  Error message: {job['error']}"
 
     build_log_path = get_build_log_path(job_id)
     if not os.path.exists(build_log_path):

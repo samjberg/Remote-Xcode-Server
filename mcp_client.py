@@ -1494,7 +1494,7 @@ def reconcile_git_state(server_addr:tuple[str, int], app_name:str='') -> dict:
     elif not local_has_server_head and not server_has_local_head:
         message = 'both_sides_missing_commits_after_fetch; bundle_fallback_skipped'
         if fetch_failures:
-            message = f'{message}; {' | '.join(fetch_failures)}'
+            message = f"{message}; {' | '.join(fetch_failures)}"
         return _reconcile_result(
             RECONCILE_STATUS_BLOCKED_MISSING_COMMIT_OBJECT,
             actions_applied=actions_applied,

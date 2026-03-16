@@ -210,7 +210,7 @@ def get_commit_date(branch:str) -> datetime.datetime|None:
     command = f'git show {branch}'.split(' ')
     proc = run_process(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if not proc.stdout:
-        print(f'No output from command: {' '.join(proc.args)}')
+        print(f"No output from command: {' '.join(proc.args)}")
         return None
     text:str = proc.stdout.decode(errors='replace')
     lines = text.splitlines()
