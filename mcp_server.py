@@ -2,6 +2,7 @@ import os, subprocess, socket, json, struct, hashlib, time, re, datetime, secret
 from flask import Flask, request, send_file, send_from_directory, jsonify, Request, Response
 from threading import Thread, Lock
 from functools import wraps
+from typing import Optional
 from werkzeug.utils import secure_filename
 from mcp_utils import *
 # from requests import Request
@@ -26,7 +27,7 @@ PAIRING_EXPIRY_UNIX = 0
 PAIRING_LOCK = Lock()
 NONCE_CACHE: dict[str, int] = {}
 NONCE_LOCK = Lock()
-SERVER_TLS_CONTEXT: ssl.SSLContext | None = None
+SERVER_TLS_CONTEXT: Optional[ssl.SSLContext] = None
 DISCOVERY_STATUS = {
     'started_at_unix': 0,
     'last_request_at_unix': 0,
@@ -58,7 +59,7 @@ def _generate_secret_key_hmac() -> str:
     return secrets.token_urlsafe(48)
 
 
-def _generate_secret_pair(path: str | None = None) -> tuple[str, str]:
+def _generate_secret_pair(path: Optional[str] = None) -> tuple[str, str]:
     if not path:
         path = get_runtime_dir_path()
     print('Generating self-signed certificates for HTTPS...')

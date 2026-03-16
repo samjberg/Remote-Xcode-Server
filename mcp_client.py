@@ -1,4 +1,5 @@
 import sys, os, socket, requests, json, urllib, hashlib, struct, ssl, hmac, secrets, base64, time, subprocess, re
+from typing import Optional, Union
 from requests import Response
 from requests.adapters import HTTPAdapter
 from urllib3.poolmanager import PoolManager
@@ -14,7 +15,7 @@ discovery_attempts = 3
 SERVER_INFO: dict = {}
 SERVER_CERT_PATH = ''
 SERVER_SECRET_PATH = ''
-SERVER_REQUEST_SESSION: requests.Session | None = None
+SERVER_REQUEST_SESSION: Optional[requests.Session] = None
 GLOBAL_SERVERINFO_CACHE_PATH = os.path.join(os.path.expanduser('~'), '.remote_xcode_server_serverinfo.json')
 
 def configure_stdio():
@@ -88,7 +89,7 @@ def _secure_request(
     files=None,
     stream: bool = False,
     timeout: int = 60,
-    headers: dict | None = None,
+    headers: Optional[dict] = None,
 ) -> Response:
     session = _get_request_session()
     req_headers = {} if headers is None else dict(headers)
@@ -115,7 +116,7 @@ def _build_server_url(server_addr: tuple[str, int], path: str) -> str:
     return f'https://{ip}:{port}{path}'
 
 
-def _fetch_pairing_bundle_https(server_ip: str, server_port: int = 8751) -> tuple[str, dict] | None:
+def _fetch_pairing_bundle_https(server_ip: str, server_port: int = 8751) -> Optional[tuple[str, dict]]:
     if not server_ip:
         return None
     url = f'https://{server_ip}:{int(server_port)}/pairing-bootstrap'
@@ -211,7 +212,7 @@ def _cert_fingerprint(cert_text: str) -> str:
     return _bytes_to_sha256_hex(cert_text.encode('utf-8'))
 
 
-def _ensure_pairing_material(serverinfo_path: str, runtime_dir: str, existing_info: dict | None = None) -> dict:
+def _ensure_pairing_material(serverinfo_path: str, runtime_dir: str, existing_info: Optional[dict] = None) -> dict:
     info = {} if not isinstance(existing_info, dict) else dict(existing_info)
     cert_path, secret_path = _get_client_security_paths(runtime_dir)
     security = info.get('security', {}) if isinstance(info.get('security', {}), dict) else {}
@@ -357,7 +358,7 @@ def enable_pairing(server_addr:tuple[str, int]) -> bool:
         return False
     return True
 
-def discover_server(require_pairing: bool = False, target_ip: str | None = None) -> tuple[str, dict] | None:
+def discover_server(require_pairing: bool = False, target_ip: Optional[str] = None) -> Optional[tuple[str, dict]]:
     '''Attempts to discover the server on the local network using UDP broadcasting.  If successful, returns [server_ip, ports_dict], where
         server_ip: Self explanitory, the IP address of the server on the local network
         ports_dict: a dictionary containing relevant port numbers
@@ -414,7 +415,7 @@ def discover_server(require_pairing: bool = False, target_ip: str | None = None)
         return None
     
     ports_dict_str = ports_part.split('|', 1)[-1]
-    response_obj: dict[str, str | int] = {}
+    response_obj: dict[str, Union[str, int]] = {}
 
     for entry in ports_dict_str.split(','):
         if ':' not in entry:
@@ -623,11 +624,9 @@ def _send_file_over_socket(
     return True
 
 
-def receive_files_from_server(server_addr: tuple[str, int], paths: list[str] | str, chunk_size: int = 64 * KB) -> bool:
+def receive_files_from_server(server_addr: tuple[str, int], paths: list[str], chunk_size: int = 64 * KB) -> bool:
     ip, _ = server_addr
     app_name = get_appname()
-    if isinstance(paths, str):
-        paths = [paths]
     rel_paths = [unix_path(path) for path in paths]
     transfer_id = str(uuid4())
     init_url = _build_server_url(server_addr, f'/sendfilesfromserver/init/{app_name}')
@@ -777,10 +776,8 @@ def receive_files_from_server(server_addr: tuple[str, int], paths: list[str] | s
     return True
 
 
-def send_files(server_addr:tuple[str, int], paths:list[str]|str, filesize_threshold:int=20*MB, total_threshold=50*MB) -> bool:
+def send_files(server_addr:tuple[str, int], paths:list[str], filesize_threshold:int=20*MB, total_threshold=50*MB) -> bool:
     app_name = get_appname()
-    if isinstance(paths, str):
-        paths = [paths]
     project_root = get_project_root_path(os.getcwd())
     file_entries = []
     for path in paths:
@@ -982,7 +979,7 @@ def _reconcile_result(
     authority_side:str='none',
     target_branch:str='',
     target_commit:str='',
-    actions_applied:list[str]|None=None,
+    actions_applied:Optional[list[str]]=None,
     message:str='',
 ) -> dict:
     '''A helper function that returns the arguments passed in as a dict, sanitizing [actions_applied] to [] if it is None'''
@@ -1003,7 +1000,7 @@ def get_local_git_state() -> dict:
     return get_git_state(project_root)
 
 
-def get_server_git_state(server_addr:tuple[str, int], app_name:str='') -> dict|None:
+def get_server_git_state(server_addr:tuple[str, int], app_name:str='') -> Optional[dict]:
     if not app_name:
         app_name = get_appname()
 
@@ -1024,7 +1021,7 @@ def get_server_git_state(server_addr:tuple[str, int], app_name:str='') -> dict|N
     return obj
 
 
-def _post_server_git_action(server_addr:tuple[str, int], action:str, args:dict|None=None, app_name:str='') -> dict|None:
+def _post_server_git_action(server_addr:tuple[str, int], action:str, args:Optional[dict]=None, app_name:str='') -> Optional[dict]:
     if not app_name:
         app_name = get_appname()
     if args is None:
@@ -1046,7 +1043,7 @@ def _post_server_git_action(server_addr:tuple[str, int], action:str, args:dict|N
         return None
 
 
-def _run_local_git_action(action:str, args:dict|None=None) -> dict:
+def _run_local_git_action(action:str, args:Optional[dict]=None) -> dict:
     return execute_git_action(action, args=args, cwd=get_project_root_path())
 
 
@@ -1058,7 +1055,7 @@ def _get_reconcile_bundle_paths(filename:str='update.bundle') -> tuple[str, str]
     return bundle_abs_path, bundle_rel_path
 
 
-def _format_action_failure(action_label:str, result:dict|None) -> str:
+def _format_action_failure(action_label:str, result:Optional[dict]) -> str:
     if result is None:
         return f'Failed action {action_label}: no response returned.'
 
@@ -1078,7 +1075,7 @@ def _format_action_failure(action_label:str, result:dict|None) -> str:
     return f'Failed action {action_label}.'
 
 
-def _is_gitignore_overwrite_conflict(result:dict|None) -> bool:
+def _is_gitignore_overwrite_conflict(result:Optional[dict]) -> bool:
     if result is None:
         return False
     stderr_text = str(result.get('stderr', '')).lower()
@@ -1210,7 +1207,7 @@ def apply_reconcile_actions(server_addr:tuple[str, int], decision:dict) -> dict:
 
     non_authoritative_side = 'server' if authority_side == 'client' else 'client'
 
-    def read_side_state(side:str) -> dict|None:
+    def read_side_state(side:str) -> Optional[dict]:
         if side == 'client':
             try:
                 return get_local_git_state()
@@ -1219,7 +1216,7 @@ def apply_reconcile_actions(server_addr:tuple[str, int], decision:dict) -> dict:
                 return None
         return get_server_git_state(server_addr, app_name)
 
-    def run_side_action(side:str, action:str, args:dict) -> dict|None:
+    def run_side_action(side:str, action:str, args:dict) -> Optional[dict]:
         if side == 'client':
             result = _run_local_git_action(action, args)
         else:
@@ -1367,7 +1364,7 @@ def reconcile_git_state(server_addr:tuple[str, int], app_name:str='') -> dict:
             message='Tracked uncommitted changes detected; reconcile requires a clean tracked worktree on both sides. No fetch or bundle transfer was attempted.',
         )
 
-    def recheck_commit_visibility() -> tuple[bool, bool] | None:
+    def recheck_commit_visibility() -> Optional[tuple[bool, bool]]:
         local_visibility = git_has_commit(server_head, cwd=get_project_root_path())
         server_has_local_result_inner = _post_server_git_action(
             server_addr,

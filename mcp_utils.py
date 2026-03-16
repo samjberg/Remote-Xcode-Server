@@ -1,5 +1,5 @@
 import os, sys, pathlib, socket, subprocess, shlex, datetime, shutil
-from typing import Callable, TypeVar
+from typing import Callable, Optional, TypeVar, Union
 from mimetypes import guess_type
 from uuid import uuid4
 try:
@@ -18,7 +18,7 @@ runtime_dir_name = '.remote-xcode-server'
 def get_runtime_dir_name() -> str:
     return runtime_dir_name
 
-def get_runtime_dir_path(cwd:str|None=None) -> str:
+def get_runtime_dir_path(cwd:Optional[str]=None) -> str:
     """Returns the directory Remote-Xcode-Server uses to save files on both client and server"""
     if cwd is None:
         cwd = os.getcwd()
@@ -199,14 +199,14 @@ def handle_process_errors(f: Callable[P, R]) -> Callable[P, R]:
 
 
 @handle_process_errors
-def run_process(command:str|list[str], stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd:str=None) -> subprocess.CompletedProcess:
+def run_process(command:Union[str, list[str]], stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd:str=None) -> subprocess.CompletedProcess:
     if cwd is None:
         cwd = get_project_root_path()
     command_arg = command if type(command) == list else shlex.split(command)
     proc = subprocess.run(command_arg, stdout=stdout, stderr=stderr, cwd=cwd)
     return proc
 
-def get_commit_date(branch:str) -> datetime.datetime|None:
+def get_commit_date(branch:str) -> Optional[datetime.datetime]:
     command = f'git show {branch}'.split(' ')
     proc = run_process(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if not proc.stdout:
@@ -294,7 +294,7 @@ def git_apply_update_bundle(bundle_path:str) -> bool:
 
 
 
-def get_git_branches(app_name:str='', return_current_branch=False, sort_order='creatordate') -> list[str] | tuple[list[str], str]:
+def get_git_branches(app_name:str='', return_current_branch=False, sort_order='creatordate') -> Union[list[str], tuple[list[str], str]]:
     if not app_name:
         app_name = get_appname()
     git_command = f'git branch --sort={sort_order}'.split(' ')
@@ -343,7 +343,7 @@ def compare_ahead_behind(commit1:str, commit2:str) -> tuple[int, int]:
     return ahead, behind
 
 
-def _run_git_capture(command:list[str], cwd:str|None=None) -> subprocess.CompletedProcess:
+def _run_git_capture(command:list[str], cwd:Optional[str]=None) -> subprocess.CompletedProcess:
     """Run git command and capture stdout/stderr without raising."""
     if cwd is None:
         cwd = get_project_root_path()
@@ -356,7 +356,7 @@ def _decode_stdout_stderr(proc:subprocess.CompletedProcess) -> tuple[str, str]:
     return stdout_text, stderr_text
 
 
-def git_has_origin(cwd:str|None=None) -> bool:
+def git_has_origin(cwd:Optional[str]=None) -> bool:
     proc = _run_git_capture(['git', 'remote'], cwd=cwd)
     if proc.returncode != 0:
         return False
@@ -365,13 +365,13 @@ def git_has_origin(cwd:str|None=None) -> bool:
     return 'origin' in remotes
 
 
-def git_has_commit(commit_hash:str, cwd:str|None=None) -> bool:
+def git_has_commit(commit_hash:str, cwd:Optional[str]=None) -> bool:
     # git cat-file returns non-zero when object is missing.
     proc = _run_git_capture(['git', 'cat-file', '-e', f'{commit_hash}^{{commit}}'], cwd=cwd)
     return proc.returncode == 0
 
 
-def git_ahead_behind(left_commit:str, right_commit:str, cwd:str|None=None) -> tuple[int, int]|None:
+def git_ahead_behind(left_commit:str, right_commit:str, cwd:Optional[str]=None) -> Optional[tuple[int, int]]:
     proc = _run_git_capture(
         ['git', 'rev-list', '--left-right', '--count', f'{left_commit}...{right_commit}'],
         cwd=cwd,
@@ -391,7 +391,7 @@ def git_ahead_behind(left_commit:str, right_commit:str, cwd:str|None=None) -> tu
     return left_ahead, right_ahead
 
 
-def git_dirty_tracked(cwd:str|None=None) -> bool:
+def git_dirty_tracked(cwd:Optional[str]=None) -> bool:
     if cwd is None:
         cwd = get_project_root_path()
 
@@ -400,7 +400,7 @@ def git_dirty_tracked(cwd:str|None=None) -> bool:
     return unstaged.returncode != 0 or staged.returncode != 0
 
 
-def git_dirty_untracked_count(cwd:str|None=None) -> int:
+def git_dirty_untracked_count(cwd:Optional[str]=None) -> int:
     proc = _run_git_capture(['git', 'ls-files', '--others', '--exclude-standard'], cwd=cwd)
     if proc.returncode != 0:
         return 0
@@ -410,7 +410,7 @@ def git_dirty_untracked_count(cwd:str|None=None) -> int:
     return len([line for line in text.splitlines() if line.strip()])
 
 
-def get_git_state(cwd:str|None=None) -> dict:
+def get_git_state(cwd:Optional[str]=None) -> dict:
     """
     Returns a dict with the following entries (using format 'name: type'))
         head: str
@@ -457,7 +457,7 @@ def get_git_state(cwd:str|None=None) -> dict:
     }
 
 
-def execute_git_action(action:str, args:dict|None=None, cwd:str|None=None) -> dict:
+def execute_git_action(action:str, args:Optional[dict]=None, cwd:Optional[str]=None) -> dict:
     if args is None:
         args = {}
     if cwd is None:
