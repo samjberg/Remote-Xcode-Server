@@ -351,8 +351,10 @@ def retrieve_file(server_addr:tuple[str, int], path) -> bool:
     return ran_successfully
 
 def enable_pairing(server_addr:tuple[str, int]) -> bool:
-    url = _build_server_url(server_addr, '/enable_pairing')
-    resp:Response = requests.get(url)
+    ip, port = server_addr
+    url = f'https://{ip}:{port}/enable_pairing'
+    #verify=False ONLY for this one request.  All subsequent requests are secured
+    resp:Response = requests.get(url, verify=False)
     if not resp.ok:
         print('Error enabling pairing')
         return False
@@ -387,7 +389,10 @@ def discover_server(require_pairing: bool = False, target_ip: Optional[str] = No
 
     for _ in range(discovery_attempts):
         for target in targets:
-            s.sendto(b'RXS_DISCOVERY_REQ', target)
+            try:
+                s.sendto(b'RXS_DISCOVERY_REQ', target)
+            except OSError:
+                continue
             try:
                 resp_bytes, addr = s.recvfrom(discovery_response_max_bytes)
                 resp = resp_bytes.decode()
@@ -1809,6 +1814,25 @@ if __name__ == '__main__':
         serverinfo_dict['server_socket_port'] = int(discovered_info['server_socket_port'])
         serverinfo_dict['file_socket_port'] = int(discovered_info['file_socket_port'])
 
+    #Early arg gate checking for pair or enable-pairing (they are command synonyms for this program), since pairing needs to happen
+    #before _ensure_pairing_material runs (we cannot require pairing material to pair, that would be a catch-22)
+    if len(sys.argv) > 1:
+        if sys.argv[1] in ['pair', 'enable-pairing']:
+            if serverinfo_dict['server_ip'] and serverinfo_dict['server_port']:
+                server_ip, server_port = serverinfo_dict['server_ip'], serverinfo_dict['server_port']
+                pairing_enabled = enable_pairing((server_ip, server_port))
+                if pairing_enabled:
+                    #success message is printed in enable_pairing itself, we just need to exit
+                    exit()
+                else:
+                    print(f"Failed to enable pairing.  Server ip and port are known: {server_ip}:{server_port}, but enable_pairing returned False")
+                    exit()
+            else:
+                print(f'Pairing failed, server address not known')
+                exit()
+
+            
+
     # Ensure we have paired cert + shared secret; this requires active pairing window when missing.
     serverinfo_dict = _ensure_pairing_material(serverinfo_path, runtime_dir, existing_info=serverinfo_dict)
     _initialize_security_context(runtime_dir, serverinfo_dict)
@@ -1860,10 +1884,6 @@ if __name__ == '__main__':
             print('Successfully retrieved changes from the server')
         else:
             print('Failed to retrieve changes from the server')
-    elif 'pair' in arg:
-        pairing_enabled = enable_pairing(server_addr)
-        if pairing_enabled:
-            print('Pairing enabled.  Please run any command in the next 60 seconds to complete pairing process')
     elif 'sync' in arg:
         sync_changes_with_server(server_addr)
     elif 'sendfiles' in arg:
