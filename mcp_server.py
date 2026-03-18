@@ -857,7 +857,15 @@ def pairing_bootstrap():
 @app.route('/discovery-status')
 def discovery_status():
     with DISCOVERY_LOCK:
-        return jsonify({'ok': True, **DISCOVERY_STATUS})
+        return jsonify(
+            {
+                'ok': True,
+                'server_port': server_port,
+                'server_socket_port': server_socket_port,
+                'file_socket_port': file_socket_port,
+                **DISCOVERY_STATUS,
+            }
+        )
 
 
 
