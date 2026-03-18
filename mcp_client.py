@@ -1,4 +1,6 @@
-import sys, os, socket, requests, json, urllib, hashlib, struct, ssl, hmac, secrets, base64, time
+import sys, os, socket, requests, json, urllib, hashlib, struct, ssl, hmac, secrets, base64, time, subprocess, re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional, Union
 from requests import Response
 from requests.adapters import HTTPAdapter
 from urllib3.poolmanager import PoolManager
@@ -10,11 +12,15 @@ allowed_timestamp_skew_s = 120
 SECURITY_SCHEMA_VERSION = 2
 discovery_response_max_bytes = 64 * KB
 discovery_attempts = 3
+DEFAULT_SERVER_PORT = 8751
+DEFAULT_SERVER_SOCKET_PORT = 50271
+DEFAULT_FILE_SOCKET_PORT = 47283
 
 SERVER_INFO: dict = {}
 SERVER_CERT_PATH = ''
 SERVER_SECRET_PATH = ''
-SERVER_REQUEST_SESSION: requests.Session | None = None
+SERVER_REQUEST_SESSION: Optional[requests.Session] = None
+GLOBAL_SERVERINFO_CACHE_PATH = os.path.join(os.path.expanduser('~'), '.remote_xcode_server_serverinfo.json')
 
 def configure_stdio():
     """Ensure redirected output can represent UTF-8 build logs on Windows."""
@@ -49,10 +55,14 @@ def _load_hmac_secret() -> str:
 
 
 def _sign_http_request(method: str, path_url: str, timestamp: str, nonce: str, body_bytes: bytes) -> str:
+    # Match Flask request canonicalization: decoded path + raw encoded query string.
+    split = urllib.parse.urlsplit(path_url)
+    canonical_path = urllib.parse.unquote(split.path)
+    canonical_target = canonical_path if not split.query else f'{canonical_path}?{split.query}'
     payload = '\n'.join(
         [
             method.upper(),
-            path_url,
+            canonical_target,
             timestamp,
             nonce,
             _bytes_to_sha256_hex(body_bytes),
@@ -83,7 +93,7 @@ def _secure_request(
     files=None,
     stream: bool = False,
     timeout: int = 60,
-    headers: dict | None = None,
+    headers: Optional[dict] = None,
 ) -> Response:
     session = _get_request_session()
     req_headers = {} if headers is None else dict(headers)
@@ -110,6 +120,261 @@ def _build_server_url(server_addr: tuple[str, int], path: str) -> str:
     return f'https://{ip}:{port}{path}'
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = str(os.environ.get(name, '')).strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = str(os.environ.get(name, '')).strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _default_connection_metadata(server_port: Optional[int] = None) -> dict:
+    resolved_server_port = int(server_port) if server_port is not None else _env_int('RXS_SERVER_PORT', DEFAULT_SERVER_PORT)
+    return {
+        'server_port': resolved_server_port,
+        'server_socket_port': _env_int('RXS_SERVER_SOCKET_PORT', DEFAULT_SERVER_SOCKET_PORT),
+        'file_socket_port': _env_int('RXS_FILE_SOCKET_PORT', DEFAULT_FILE_SOCKET_PORT),
+    }
+
+
+def _fetch_pairing_bundle_https(
+    server_ip: str,
+    server_port: int = DEFAULT_SERVER_PORT,
+    timeout_s: float = 5.0,
+) -> Optional[tuple[str, dict]]:
+    if not server_ip:
+        return None
+    url = f'https://{server_ip}:{int(server_port)}/pairing-bootstrap'
+    try:
+        resp = requests.get(url, verify=False, timeout=timeout_s)
+        resp.raise_for_status()
+    except requests.RequestException:
+        return None
+    try:
+        obj = resp.json()
+    except ValueError:
+        return None
+    required = {'server_port', 'server_socket_port', 'file_socket_port', 'certificate', 'secret_key', 'expires_at_unix'}
+    if not obj.get('ok', False) or not required.issubset(set(obj.keys())):
+        return None
+    return server_ip, obj
+
+
+def _candidate_ips_from_arp(max_candidates: int = 64) -> list[str]:
+    try:
+        proc = subprocess.run(['arp', '-a'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3)
+    except Exception:
+        return []
+    if proc.returncode != 0 or not proc.stdout:
+        return []
+    text = proc.stdout.decode(errors='replace')
+    ips = []
+    seen = set()
+    for match in re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', text):
+        ip = match.strip()
+        if ip in seen:
+            continue
+        parts = ip.split('.')
+        if len(parts) != 4:
+            continue
+        try:
+            octets = [int(x) for x in parts]
+        except ValueError:
+            continue
+        if any(x < 0 or x > 255 for x in octets):
+            continue
+        is_private = (
+            octets[0] == 10
+            or (octets[0] == 192 and octets[1] == 168)
+            or (octets[0] == 172 and 16 <= octets[1] <= 31)
+        )
+        if not is_private:
+            continue
+        seen.add(ip)
+        ips.append(ip)
+        if len(ips) >= max_candidates:
+            break
+    return ips
+
+
+def _candidate_ips_from_local_subnet(max_candidates: int = 128) -> list[str]:
+    local_ip = get_ip()
+    parts = local_ip.split('.')
+    if len(parts) != 4:
+        return []
+    try:
+        octets = [int(x) for x in parts]
+    except ValueError:
+        return []
+    if any(x < 0 or x > 255 for x in octets):
+        return []
+    # Ignore loopback and non-private ranges for local scan.
+    if octets[0] == 127:
+        return []
+    is_private = (
+        octets[0] == 10
+        or (octets[0] == 192 and octets[1] == 168)
+        or (octets[0] == 172 and 16 <= octets[1] <= 31)
+    )
+    if not is_private:
+        return []
+
+    prefix = f'{octets[0]}.{octets[1]}.{octets[2]}'
+    local_host = octets[3]
+    hosts: list[int] = []
+    seen: set[int] = set()
+
+    def _add_host(host_octet: int) -> None:
+        if host_octet <= 0 or host_octet >= 255:
+            return
+        if host_octet == local_host or host_octet in seen:
+            return
+        seen.add(host_octet)
+        hosts.append(host_octet)
+
+    # Prioritize common gateway and nearby hosts first, then fill in remaining range.
+    _add_host(1)
+    for delta in range(1, 255):
+        _add_host(local_host - delta)
+        _add_host(local_host + delta)
+        if len(hosts) >= max_candidates:
+            break
+    if len(hosts) < max_candidates:
+        for host in range(2, 255):
+            _add_host(host)
+            if len(hosts) >= max_candidates:
+                break
+    return [f'{prefix}.{host}' for host in hosts]
+
+
+def _probe_discovery_status_https(server_ip: str, server_port: int, timeout_s: float) -> Optional[dict]:
+    url = f'https://{server_ip}:{int(server_port)}/discovery-status'
+    try:
+        resp = requests.get(url, verify=False, timeout=timeout_s)
+        resp.raise_for_status()
+        obj = resp.json()
+    except (requests.RequestException, ValueError):
+        return None
+    if not isinstance(obj, dict) or not obj.get('ok', False):
+        return None
+    # Avoid false positives if some other service happens to expose /discovery-status.
+    status_keys = {'started_at_unix', 'last_request_at_unix', 'last_response_at_unix'}
+    if not status_keys.issubset(set(obj.keys())):
+        return None
+
+    defaults = _default_connection_metadata(server_port=server_port)
+    out = {}
+    for key, fallback in defaults.items():
+        try:
+            out[key] = int(obj.get(key, fallback))
+        except (TypeError, ValueError):
+            out[key] = fallback
+    return out
+
+
+def _discover_server_via_https_probe(require_pairing: bool = False, target_ip: Optional[str] = None) -> Optional[tuple[str, dict]]:
+    server_port = _env_int('RXS_SERVER_PORT', DEFAULT_SERVER_PORT)
+    probe_timeout_s = _env_float('RXS_DISCOVERY_PROBE_TIMEOUT_S', 0.6)
+    max_candidates = _env_int('RXS_DISCOVERY_MAX_PROBES', 128)
+    if max_candidates < 1:
+        max_candidates = 1
+    if max_candidates > 512:
+        max_candidates = 512
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _add(ip: str) -> None:
+        ip = str(ip).strip()
+        if not ip or ip in seen:
+            return
+        seen.add(ip)
+        candidates.append(ip)
+
+    if target_ip:
+        _add(target_ip)
+    env_ip = str(os.environ.get('RXS_SERVER_IP', '')).strip()
+    if env_ip:
+        _add(env_ip)
+    for ip in _candidate_ips_from_arp(max_candidates=max_candidates):
+        _add(ip)
+        if len(candidates) >= max_candidates:
+            break
+    if len(candidates) < max_candidates:
+        for ip in _candidate_ips_from_local_subnet(max_candidates=max_candidates):
+            _add(ip)
+            if len(candidates) >= max_candidates:
+                break
+    if not candidates:
+        return None
+
+    def _probe(ip: str) -> Optional[tuple[str, dict]]:
+        if require_pairing:
+            return _fetch_pairing_bundle_https(ip, server_port=server_port, timeout_s=probe_timeout_s)
+        metadata = _probe_discovery_status_https(ip, server_port=server_port, timeout_s=probe_timeout_s)
+        if metadata is None:
+            return None
+        return ip, metadata
+
+    max_workers = _env_int('RXS_DISCOVERY_PROBE_WORKERS', 24)
+    if max_workers < 1:
+        max_workers = 1
+    max_workers = min(max_workers, len(candidates))
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(_probe, ip) for ip in candidates]
+        for fut in as_completed(futures):
+            try:
+                result = fut.result()
+            except Exception:
+                continue
+            if result is not None:
+                return result
+    return None
+
+
+def _load_global_serverinfo_cache() -> dict:
+    if not os.path.exists(GLOBAL_SERVERINFO_CACHE_PATH):
+        return {}
+    try:
+        with open(GLOBAL_SERVERINFO_CACHE_PATH, 'r', encoding='utf-8') as f:
+            obj = json.load(f)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_global_serverinfo_cache(serverinfo: dict) -> None:
+    if not isinstance(serverinfo, dict):
+        return
+    keys = ['server_ip', 'server_port', 'server_socket_port', 'file_socket_port']
+    if any(key not in serverinfo for key in keys):
+        return
+    obj = {
+        'server_ip': str(serverinfo['server_ip']),
+        'server_port': int(serverinfo['server_port']),
+        'server_socket_port': int(serverinfo['server_socket_port']),
+        'file_socket_port': int(serverinfo['file_socket_port']),
+    }
+    try:
+        with open(GLOBAL_SERVERINFO_CACHE_PATH, 'w', encoding='utf-8') as f:
+            json.dump(obj, f)
+    except Exception:
+        pass
+
+
 def _get_client_security_paths(runtime_dir: str) -> tuple[str, str]:
     cert_dir = os.path.join(runtime_dir, 'certs')
     cred_dir = os.path.join(runtime_dir, 'credentials')
@@ -120,7 +385,7 @@ def _cert_fingerprint(cert_text: str) -> str:
     return _bytes_to_sha256_hex(cert_text.encode('utf-8'))
 
 
-def _ensure_pairing_material(serverinfo_path: str, runtime_dir: str, existing_info: dict | None = None) -> dict:
+def _ensure_pairing_material(serverinfo_path: str, runtime_dir: str, existing_info: Optional[dict] = None) -> dict:
     info = {} if not isinstance(existing_info, dict) else dict(existing_info)
     cert_path, secret_path = _get_client_security_paths(runtime_dir)
     security = info.get('security', {}) if isinstance(info.get('security', {}), dict) else {}
@@ -136,7 +401,15 @@ def _ensure_pairing_material(serverinfo_path: str, runtime_dir: str, existing_in
     discovery_hint_ip = str(info.get('server_ip', '')).strip() if info.get('server_ip') else None
     discovery_result = discover_server(require_pairing=True, target_ip=discovery_hint_ip)
     if discovery_result is None:
-        raise RuntimeError('Pairing required. Enable pairing on server and retry within 60 seconds.')
+        env_ip = os.environ.get('RXS_SERVER_IP', '').strip()
+        fallback_ip = discovery_hint_ip or env_ip
+        fallback_port = int(info.get('server_port', _env_int('RXS_SERVER_PORT', DEFAULT_SERVER_PORT))) if info.get('server_port') else _env_int('RXS_SERVER_PORT', DEFAULT_SERVER_PORT)
+        discovery_result = _fetch_pairing_bundle_https(fallback_ip, fallback_port)
+    if discovery_result is None:
+        raise RuntimeError(
+            'Pairing required. Enable pairing and retry within 60 seconds. '
+            'If UDP discovery is blocked, set RXS_SERVER_IP to the server LAN IP and retry.'
+        )
     server_ip, discovery_info = discovery_result
     cert_payload = discovery_info.get('certificate', '')
     secret = discovery_info.get('secret_key', '')
@@ -250,26 +523,49 @@ def retrieve_file(server_addr:tuple[str, int], path) -> bool:
     ran_successfully = ran_successfully and (under_write_count <= 1)
     return ran_successfully
 
+def enable_pairing(server_addr:tuple[str, int]) -> bool:
+    ip, port = server_addr
+    url = f'https://{ip}:{port}/enable_pairing'
+    #verify=False ONLY for this one request.  All subsequent requests are secured
+    resp:Response = requests.get(url, verify=False)
+    if not resp.ok:
+        print('Error enabling pairing')
+        return False
+    return True
 
-def discover_server(require_pairing: bool = False, target_ip: str | None = None) -> tuple[str, dict] | None:
+def discover_server(require_pairing: bool = False, target_ip: Optional[str] = None) -> Optional[tuple[str, dict]]:
     '''Attempts to discover the server on the local network using UDP broadcasting.  If successful, returns [server_ip, ports_dict], where
         server_ip: Self explanitory, the IP address of the server on the local network
         ports_dict: a dictionary containing relevant port numbers
     '''
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    s.settimeout(2.0)
+    s.settimeout(3.0)
 
     resp = ''
     discovered_server_ip = ''
     targets = []
+    seen_targets = set()
+    def _add_target(ip: str):
+        key = (ip, discovery_socket_port)
+        if key in seen_targets:
+            return
+        seen_targets.add(key)
+        targets.append(key)
+
     if target_ip:
-        targets.append((target_ip, discovery_socket_port))
-    targets.append(('<broadcast>', discovery_socket_port))
+        _add_target(target_ip)
+    _add_target('<broadcast>')
+    _add_target('255.255.255.255')
+    for ip in _candidate_ips_from_arp():
+        _add_target(ip)
 
     for _ in range(discovery_attempts):
         for target in targets:
-            s.sendto(b'RXS_DISCOVERY_REQ', target)
+            try:
+                s.sendto(b'RXS_DISCOVERY_REQ', target)
+            except OSError:
+                continue
             try:
                 resp_bytes, addr = s.recvfrom(discovery_response_max_bytes)
                 resp = resp_bytes.decode()
@@ -279,30 +575,36 @@ def discover_server(require_pairing: bool = False, target_ip: str | None = None)
                 continue
         if resp:
             break
+    def _https_fallback() -> Optional[tuple[str, dict]]:
+        result = _discover_server_via_https_probe(require_pairing=require_pairing, target_ip=target_ip)
+        if result is not None:
+            print('UDP discovery unavailable; resolved server via HTTPS probe fallback.')
+        return result
+
     if not resp:
         print('Socket timed out during server discovery')
-        return None
+        return _https_fallback()
 
     resp_parts = [line.strip() for line in resp.splitlines() if line.strip()]
     if len(resp_parts) < 2:
         print(f'Too few lines in discovery response from server.  Server returned:\n{resp}')
-        return None
+        return _https_fallback()
     respcode, ports_part = resp_parts[0], resp_parts[1]
 
     if respcode.strip() != 'RXS_SERVER_HERE':
         print(f'ERROR: Did not receive valid server discovery response code: RXS_SERVER_HERE\nInstead, receieved: {respcode.strip()}')
-        return None
+        return _https_fallback()
     elif not ports_part.startswith('ports|'):
         print(f'ERROR: Did not receive valid port list from server in discovery response.  Receieved: {ports_part}')
-        return None
+        return _https_fallback()
     
     ports_dict_str = ports_part.split('|', 1)[-1]
-    response_obj: dict[str, str | int] = {}
+    response_obj: dict[str, Union[str, int]] = {}
 
     for entry in ports_dict_str.split(','):
         if ':' not in entry:
             print(f'Invalid discovery ports entry: {entry}')
-            return None
+            return _https_fallback()
         key, val = entry.split(':', 1)
         response_obj[key.strip()] = int(val.strip())
 
@@ -311,28 +613,28 @@ def discover_server(require_pairing: bool = False, target_ip: str | None = None)
     for line in extra_lines:
         if ':' not in line:
             print(f'Invalid discovery line format: {line}')
-            return None
+            return _https_fallback()
         key, val = line.split(':', 1)
         key = key.strip()
         if key not in allowed_keys:
             print(f'Unknown discovery key: {key}')
-            return None
+            return _https_fallback()
         response_obj[key] = val.strip()
 
     if require_pairing:
         required_pairing_keys = {'certificate', 'secret_key', 'pairing_expires_unix'}
         if not required_pairing_keys.issubset(set(response_obj.keys())):
             print('Discovery response did not include pairing credentials. Pairing may be disabled or expired.')
-            return None
+            return _https_fallback()
         try:
             pairing_exp = int(str(response_obj['pairing_expires_unix']))
         except ValueError:
             print('Invalid pairing_expires_unix value from discovery response')
-            return None
+            return _https_fallback()
         now = int(time.time())
         if pairing_exp < now - allowed_timestamp_skew_s:
             print('Received expired pairing window in discovery response')
-            return None
+            return _https_fallback()
 
     return discovered_server_ip, response_obj
 
@@ -506,11 +808,9 @@ def _send_file_over_socket(
     return True
 
 
-def receive_files_from_server(server_addr: tuple[str, int], paths: list[str] | str, chunk_size: int = 64 * KB) -> bool:
+def receive_files_from_server(server_addr: tuple[str, int], paths: list[str], chunk_size: int = 64 * KB) -> bool:
     ip, _ = server_addr
     app_name = get_appname()
-    if isinstance(paths, str):
-        paths = [paths]
     rel_paths = [unix_path(path) for path in paths]
     transfer_id = str(uuid4())
     init_url = _build_server_url(server_addr, f'/sendfilesfromserver/init/{app_name}')
@@ -660,10 +960,8 @@ def receive_files_from_server(server_addr: tuple[str, int], paths: list[str] | s
     return True
 
 
-def send_files(server_addr:tuple[str, int], paths:list[str]|str, filesize_threshold:int=20*MB, total_threshold=50*MB) -> bool:
+def send_files(server_addr:tuple[str, int], paths:list[str], filesize_threshold:int=20*MB, total_threshold=50*MB) -> bool:
     app_name = get_appname()
-    if isinstance(paths, str):
-        paths = [paths]
     project_root = get_project_root_path(os.getcwd())
     file_entries = []
     for path in paths:
@@ -865,7 +1163,7 @@ def _reconcile_result(
     authority_side:str='none',
     target_branch:str='',
     target_commit:str='',
-    actions_applied:list[str]|None=None,
+    actions_applied:Optional[list[str]]=None,
     message:str='',
 ) -> dict:
     '''A helper function that returns the arguments passed in as a dict, sanitizing [actions_applied] to [] if it is None'''
@@ -886,7 +1184,7 @@ def get_local_git_state() -> dict:
     return get_git_state(project_root)
 
 
-def get_server_git_state(server_addr:tuple[str, int], app_name:str='') -> dict|None:
+def get_server_git_state(server_addr:tuple[str, int], app_name:str='') -> Optional[dict]:
     if not app_name:
         app_name = get_appname()
 
@@ -907,7 +1205,7 @@ def get_server_git_state(server_addr:tuple[str, int], app_name:str='') -> dict|N
     return obj
 
 
-def _post_server_git_action(server_addr:tuple[str, int], action:str, args:dict|None=None, app_name:str='') -> dict|None:
+def _post_server_git_action(server_addr:tuple[str, int], action:str, args:Optional[dict]=None, app_name:str='') -> Optional[dict]:
     if not app_name:
         app_name = get_appname()
     if args is None:
@@ -929,7 +1227,7 @@ def _post_server_git_action(server_addr:tuple[str, int], action:str, args:dict|N
         return None
 
 
-def _run_local_git_action(action:str, args:dict|None=None) -> dict:
+def _run_local_git_action(action:str, args:Optional[dict]=None) -> dict:
     return execute_git_action(action, args=args, cwd=get_project_root_path())
 
 
@@ -941,7 +1239,7 @@ def _get_reconcile_bundle_paths(filename:str='update.bundle') -> tuple[str, str]
     return bundle_abs_path, bundle_rel_path
 
 
-def _format_action_failure(action_label:str, result:dict|None) -> str:
+def _format_action_failure(action_label:str, result:Optional[dict]) -> str:
     if result is None:
         return f'Failed action {action_label}: no response returned.'
 
@@ -961,7 +1259,7 @@ def _format_action_failure(action_label:str, result:dict|None) -> str:
     return f'Failed action {action_label}.'
 
 
-def _is_gitignore_overwrite_conflict(result:dict|None) -> bool:
+def _is_gitignore_overwrite_conflict(result:Optional[dict]) -> bool:
     if result is None:
         return False
     stderr_text = str(result.get('stderr', '')).lower()
@@ -1093,7 +1391,7 @@ def apply_reconcile_actions(server_addr:tuple[str, int], decision:dict) -> dict:
 
     non_authoritative_side = 'server' if authority_side == 'client' else 'client'
 
-    def read_side_state(side:str) -> dict|None:
+    def read_side_state(side:str) -> Optional[dict]:
         if side == 'client':
             try:
                 return get_local_git_state()
@@ -1102,7 +1400,7 @@ def apply_reconcile_actions(server_addr:tuple[str, int], decision:dict) -> dict:
                 return None
         return get_server_git_state(server_addr, app_name)
 
-    def run_side_action(side:str, action:str, args:dict) -> dict|None:
+    def run_side_action(side:str, action:str, args:dict) -> Optional[dict]:
         if side == 'client':
             result = _run_local_git_action(action, args)
         else:
@@ -1250,7 +1548,7 @@ def reconcile_git_state(server_addr:tuple[str, int], app_name:str='') -> dict:
             message='Tracked uncommitted changes detected; reconcile requires a clean tracked worktree on both sides. No fetch or bundle transfer was attempted.',
         )
 
-    def recheck_commit_visibility() -> tuple[bool, bool] | None:
+    def recheck_commit_visibility() -> Optional[tuple[bool, bool]]:
         local_visibility = git_has_commit(server_head, cwd=get_project_root_path())
         server_has_local_result_inner = _post_server_git_action(
             server_addr,
@@ -1377,7 +1675,7 @@ def reconcile_git_state(server_addr:tuple[str, int], app_name:str='') -> dict:
     elif not local_has_server_head and not server_has_local_head:
         message = 'both_sides_missing_commits_after_fetch; bundle_fallback_skipped'
         if fetch_failures:
-            message = f'{message}; {' | '.join(fetch_failures)}'
+            message = f"{message}; {' | '.join(fetch_failures)}"
         return _reconcile_result(
             RECONCILE_STATUS_BLOCKED_MISSING_COMMIT_OBJECT,
             actions_applied=actions_applied,
@@ -1489,7 +1787,7 @@ def retrieve_diff_for_files(server_addr:tuple[str, int], paths:list[str]) -> str
         resp:Response = _secure_request('POST', url, json_data={'filepaths': paths}, timeout=120)
         resp.raise_for_status()
     except requests.RequestException as e:
-        print(f'Failed to retrieve diff for specified files: {','.join(paths)[1:]}')
+        print(f"Failed to retrieve diff for specified files: {','.join(paths)[1:]}")
         return []
 
     runtime_dir_path = get_runtime_dir_path()
@@ -1670,22 +1968,67 @@ if __name__ == '__main__':
     else:
         serverinfo_dict = {}
 
+    # Merge in cross-project cached metadata (helps when project-local runtime dirs were deleted).
+    cached_serverinfo = _load_global_serverinfo_cache()
+    for key in ['server_ip', 'server_port', 'server_socket_port', 'file_socket_port']:
+        if key not in serverinfo_dict and key in cached_serverinfo:
+            serverinfo_dict[key] = cached_serverinfo[key]
+
     # If connection metadata is missing, do a non-pairing discovery pass to bootstrap IP/ports.
     required_conn_keys = ['server_ip', 'server_port', 'server_socket_port', 'file_socket_port']
     missing_conn = [key for key in required_conn_keys if key not in serverinfo_dict]
     if missing_conn:
-        discovery_result = discover_server(require_pairing=False, target_ip=str(serverinfo_dict.get('server_ip', '')).strip() or None)
+        hint_ip = str(serverinfo_dict.get('server_ip', '')).strip() or os.environ.get('RXS_SERVER_IP', '').strip() or None
+        discovery_result = discover_server(require_pairing=False, target_ip=hint_ip)
+        if discovery_result is None and hint_ip:
+            discovery_result = _fetch_pairing_bundle_https(
+                hint_ip,
+                int(serverinfo_dict.get('server_port', _env_int('RXS_SERVER_PORT', DEFAULT_SERVER_PORT))),
+            )
         if discovery_result is None:
-            raise RuntimeError('Unable to discover server connection metadata over UDP.')
+            raise RuntimeError(
+                'Unable to discover server connection metadata. '
+                'Set RXS_SERVER_IP to the server LAN IP and retry '
+                '(bash/zsh: export RXS_SERVER_IP="<ip>"; PowerShell: $env:RXS_SERVER_IP="<ip>").'
+            )
         server_ip_discovered, discovered_info = discovery_result
         serverinfo_dict['server_ip'] = server_ip_discovered
         serverinfo_dict['server_port'] = int(discovered_info['server_port'])
         serverinfo_dict['server_socket_port'] = int(discovered_info['server_socket_port'])
         serverinfo_dict['file_socket_port'] = int(discovered_info['file_socket_port'])
+        # Persist connection metadata immediately so pair-only flows still cache resolved address/ports.
+        with open(serverinfo_path, 'w', encoding='utf-8') as f:
+            json.dump(serverinfo_dict, f)
+        _save_global_serverinfo_cache(serverinfo_dict)
+
+    #Early arg gate checking for pair or enable-pairing (they are command synonyms for this program), since pairing needs to happen
+    #before _ensure_pairing_material runs (we cannot require pairing material to pair, that would be a catch-22)
+    if len(sys.argv) > 1:
+        if sys.argv[1] in ['pair', 'enable-pairing']:
+            server_ip = str(serverinfo_dict.get('server_ip', '')).strip()
+            server_port = int(serverinfo_dict.get('server_port', _env_int('RXS_SERVER_PORT', DEFAULT_SERVER_PORT)))
+            if server_ip:
+                pairing_enabled = enable_pairing((server_ip, server_port))
+                if pairing_enabled:
+                    #success message is printed in enable_pairing itself, we just need to exit
+                    exit()
+                else:
+                    print(f"Failed to enable pairing.  Server ip and port are known: {server_ip}:{server_port}, but enable_pairing returned False")
+                    exit()
+            else:
+                print(
+                    'Pairing failed because server address is unknown. '
+                    'Set RXS_SERVER_IP to the server LAN IP and retry '
+                    '(bash/zsh: export RXS_SERVER_IP="<ip>"; PowerShell: $env:RXS_SERVER_IP="<ip>").'
+                )
+                exit()
+
+            
 
     # Ensure we have paired cert + shared secret; this requires active pairing window when missing.
     serverinfo_dict = _ensure_pairing_material(serverinfo_path, runtime_dir, existing_info=serverinfo_dict)
     _initialize_security_context(runtime_dir, serverinfo_dict)
+    _save_global_serverinfo_cache(serverinfo_dict)
 
     required_keys = required_conn_keys
     missing_keys = [key for key in required_keys if key not in serverinfo_dict]
@@ -1719,6 +2062,7 @@ if __name__ == '__main__':
         git_diff_filepath, changed_binary_paths = prepare_text_changes()
         resp:Response = start_build_job(server_addr, git_diff_filepath, changed_binary_paths, xcodebuild_args)
         json_obj = json.loads(resp.text)
+        print(json_obj)
         job_id = json_obj['job_id']
         build_log_str = wait_for_build_completion(server_addr, job_id, server_socket_port)
         # print('final build log')
