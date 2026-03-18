@@ -2,6 +2,7 @@ import os, subprocess, socket, json, struct, hashlib, time, re, datetime, secret
 from flask import Flask, request, send_file, send_from_directory, jsonify, Request, Response
 from threading import Thread, Lock
 from functools import wraps
+from typing import Optional
 from werkzeug.utils import secure_filename
 from mcp_utils import *
 # from requests import Request
@@ -26,7 +27,14 @@ PAIRING_EXPIRY_UNIX = 0
 PAIRING_LOCK = Lock()
 NONCE_CACHE: dict[str, int] = {}
 NONCE_LOCK = Lock()
-SERVER_TLS_CONTEXT: ssl.SSLContext | None = None
+SERVER_TLS_CONTEXT: Optional[ssl.SSLContext] = None
+DISCOVERY_STATUS = {
+    'started_at_unix': 0,
+    'last_request_at_unix': 0,
+    'last_response_at_unix': 0,
+    'last_error': '',
+}
+DISCOVERY_LOCK = Lock()
 
 
 def get_server_port() -> int:
@@ -51,7 +59,7 @@ def _generate_secret_key_hmac() -> str:
     return secrets.token_urlsafe(48)
 
 
-def _generate_secret_pair(path: str | None = None) -> tuple[str, str]:
+def _generate_secret_pair(path: Optional[str] = None) -> tuple[str, str]:
     if not path:
         path = get_runtime_dir_path()
     print('Generating self-signed certificates for HTTPS...')
@@ -242,22 +250,51 @@ def _wrap_server_tls_socket(conn: socket.socket) -> ssl.SSLSocket:
 
 def start_discovery_listener():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.settimeout(2.0)
     s.bind(('0.0.0.0', discovery_socket_port))
+    with DISCOVERY_LOCK:
+        DISCOVERY_STATUS['started_at_unix'] = int(time.time())
+        DISCOVERY_STATUS['last_error'] = ''
+
     while True:
-        msg_bytes, addr = s.recvfrom(1 * KB)
+        try:
+            msg_bytes, addr = s.recvfrom(64 * KB)
+        except socket.timeout:
+            continue
+        except Exception as e:
+            with DISCOVERY_LOCK:
+                DISCOVERY_STATUS['last_error'] = f'recv_error:{e}'
+            continue
+
+        with DISCOVERY_LOCK:
+            DISCOVERY_STATUS['last_request_at_unix'] = int(time.time())
+
         if not msg_bytes.startswith(b'RXS_DISCOVERY_REQ'):
             continue
+
         response_lines = [
             'RXS_SERVER_HERE',
             f'ports|server_port:{server_port},server_socket_port:{server_socket_port},file_socket_port:{file_socket_port}',
         ]
-        pairing_enabled, expires_at = pairing_window_state()
-        if pairing_enabled:
-            cert_one_line = get_certificate().replace('\n', '<nl>')
-            response_lines.append(f'certificate:{cert_one_line}')
-            response_lines.append(f'secret_key:{get_hmac_secret()}')
-            response_lines.append(f'pairing_expires_unix:{expires_at}')
-        s.sendto('\n'.join(response_lines).encode('utf-8', errors='replace'), addr)
+        try:
+            pairing_enabled, expires_at = pairing_window_state()
+            if pairing_enabled:
+                cert_one_line = get_certificate().replace('\n', '<nl>')
+                response_lines.append(f'certificate:{cert_one_line}')
+                response_lines.append(f'secret_key:{get_hmac_secret()}')
+                response_lines.append(f'pairing_expires_unix:{expires_at}')
+        except Exception as e:
+            with DISCOVERY_LOCK:
+                DISCOVERY_STATUS['last_error'] = f'build_response_error:{e}'
+
+        try:
+            s.sendto('\n'.join(response_lines).encode('utf-8', errors='replace'), addr)
+            with DISCOVERY_LOCK:
+                DISCOVERY_STATUS['last_response_at_unix'] = int(time.time())
+        except Exception as e:
+            with DISCOVERY_LOCK:
+                DISCOVERY_STATUS['last_error'] = f'send_error:{e}'
 
 
 bootstrap_security_state()
@@ -308,7 +345,7 @@ SESSION_TTL_SECONDS = 30 * 60
 
 @app.before_request
 def _global_auth_gate():
-    if request.path in ['/', '/enable_pairing']:
+    if request.path in ['/', '/enable_pairing', '/pairing-bootstrap', '/discovery-status']:
         return None
     ok, status_code, error = _verify_hmac_request(request)
     if not ok:
@@ -795,6 +832,40 @@ def run_xcodebuild(job_id, xcodebuild_args):
 def enable_pairing():
     expires_at = enable_pairing_window(pairing_duration_s)
     return jsonify({'ok': True, 'pairing_enabled': True, 'expires_at_unix': expires_at})
+
+
+@app.route('/pairing-bootstrap')
+def pairing_bootstrap():
+    pairing_enabled, expires_at = pairing_window_state()
+    if not pairing_enabled:
+        return jsonify({'ok': False, 'error': 'pairing_disabled_or_expired'}), 403
+    cert_one_line = get_certificate().replace('\n', '<nl>')
+    return jsonify(
+        {
+            'ok': True,
+            'pairing_enabled': True,
+            'expires_at_unix': expires_at,
+            'server_port': server_port,
+            'server_socket_port': server_socket_port,
+            'file_socket_port': file_socket_port,
+            'certificate': cert_one_line,
+            'secret_key': get_hmac_secret(),
+        }
+    )
+
+
+@app.route('/discovery-status')
+def discovery_status():
+    with DISCOVERY_LOCK:
+        return jsonify(
+            {
+                'ok': True,
+                'server_port': server_port,
+                'server_socket_port': server_socket_port,
+                'file_socket_port': file_socket_port,
+                **DISCOVERY_STATUS,
+            }
+        )
 
 
 
@@ -1297,7 +1368,7 @@ def check_progress(job_id:str, offset:int) -> Response:
     if job['status'] == 'done':
         return 'Build already Complete'
     elif job['status'] == 'error':
-        return f'Job status returned error.  Error message: {job['error']}'
+        return f"Job status returned error.  Error message: {job['error']}"
 
     build_log_path = get_build_log_path(job_id)
     if not os.path.exists(build_log_path):
