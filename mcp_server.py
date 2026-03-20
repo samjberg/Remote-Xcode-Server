@@ -23,6 +23,10 @@ server_dir_name = get_runtime_dir_name()
 server_dir_path = os.path.join(cwd, server_dir_name)
 project_info_filename = 'projectinfo.txt'
 project_info_filepath = os.path.join(server_dir_path, project_info_filename)
+legacy_allowed_interactive_commands_filename = 'allowed_interactive_commands.txt'
+allowed_interactive_commands_filename = 'allowed-interactive-commands.txt'
+legacy_allowed_interactive_commands_path = os.path.join(server_dir_path, legacy_allowed_interactive_commands_filename)
+allowed_interactive_commands_path = os.path.join(server_dir_path, allowed_interactive_commands_filename)
 
 PAIRING_EXPIRY_UNIX = 0
 PAIRING_LOCK = Lock()
@@ -98,6 +102,115 @@ def get_hmac_secret() -> str:
     with open(secret_path, 'r', encoding='utf-8') as f:
         return f.read().strip()
 
+allowed_interactive_commands: list[str] = []
+executable_command_paths_dict: dict[str, str] = {}
+
+
+def _normalize_allowed_interactive_commands(raw_commands) -> list[str]:
+    if not isinstance(raw_commands, list):
+        return []
+    normalized = []
+    seen = set()
+    for cmd in raw_commands:
+        if not isinstance(cmd, str):
+            continue
+        cleaned = cmd.strip()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        normalized.append(cleaned)
+    return list(sorted(normalized))
+
+
+def _extract_allowed_commands_from_payload(payload: dict) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+    # Support both keys to remain compatible with any existing file contents.
+    raw = payload.get('allowed_interactive_commands', payload.get('allowed-interactive-commands', []))
+    return _normalize_allowed_interactive_commands(raw)
+
+
+def _load_allowed_interactive_commands_file(path: str) -> list[str]:
+    with open(path, 'r', encoding='utf-8') as f:
+        text = f.read().strip()
+    if not text:
+        return []
+    payload = json.loads(text)
+    return _extract_allowed_commands_from_payload(payload)
+
+
+def _ensure_allowed_interactive_commands_file() -> None:
+    os.makedirs(server_dir_path, exist_ok=True)
+    if os.path.exists(allowed_interactive_commands_path):
+        return
+    if os.path.exists(legacy_allowed_interactive_commands_path):
+        commands = _load_allowed_interactive_commands_file(legacy_allowed_interactive_commands_path)
+        save_allowed_interactive_commands(commands)
+        return
+    save_allowed_interactive_commands([])
+
+
+def load_allowed_interactive_commands() -> list[str]:
+    _ensure_allowed_interactive_commands_file()
+    try:
+        return _load_allowed_interactive_commands_file(allowed_interactive_commands_path)
+    except Exception as e:
+        print(f'Error trying to decode JSON in {allowed_interactive_commands_path}: {e}')
+        return []
+
+
+def save_allowed_interactive_commands(allowed_commands: list[str]) -> None:
+    os.makedirs(server_dir_path, exist_ok=True)
+    normalized = _normalize_allowed_interactive_commands(allowed_commands)
+    with open(allowed_interactive_commands_path, 'w', encoding='utf-8') as f:
+        payload = {'allowed_interactive_commands': normalized}
+        f.write(json.dumps(payload))
+
+
+def add_allowed_interactive_command(name: str, save_allowed_commands: bool = True) -> bool:
+    global allowed_interactive_commands
+    global executable_command_paths_dict
+    cleaned = name.strip()
+    if not cleaned:
+        return False
+    if cleaned in allowed_interactive_commands:
+        if cleaned not in executable_command_paths_dict:
+            executable_command_paths_dict.update(_find_executable_paths([cleaned]))
+        return True
+    exe_paths = _find_executable_paths([cleaned])
+    exe_path = exe_paths.get(cleaned, '')
+    if not exe_path:
+        return False
+    allowed_interactive_commands = list(sorted(allowed_interactive_commands + [cleaned]))
+    executable_command_paths_dict[cleaned] = exe_path
+    if save_allowed_commands:
+        save_allowed_interactive_commands(allowed_interactive_commands)
+    return True
+
+
+def remove_allowed_interactive_command(name: str, save_allowed_commands: bool = True) -> bool:
+    global allowed_interactive_commands
+    global executable_command_paths_dict
+    cleaned = name.strip()
+    old_len = len(allowed_interactive_commands)
+    allowed_interactive_commands = [cmd for cmd in allowed_interactive_commands if cmd != cleaned]
+    executable_command_paths_dict.pop(cleaned, None)
+    changed = len(allowed_interactive_commands) != old_len
+    if save_allowed_commands:
+        save_allowed_interactive_commands(allowed_interactive_commands)
+    return changed
+
+
+def _ensure_allowed_interactive_commands() -> None:
+    global allowed_interactive_commands
+    global executable_command_paths_dict
+    allowed_interactive_commands = load_allowed_interactive_commands()
+    executable_command_paths_dict = _find_executable_paths(allowed_interactive_commands)
+    if not allowed_interactive_commands:
+        print('Continuing execution, however allowed_interactive_commands is an empty list. No interactive commands will be allowed')
+
+
+
 
 def bootstrap_security_state() -> None:
     cert_path, key_path = get_tls_paths()
@@ -121,6 +234,7 @@ def bootstrap_security_state() -> None:
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
     SERVER_TLS_CONTEXT = ctx
+    _ensure_allowed_interactive_commands()
 
 
 def pairing_window_state() -> tuple[bool, int]:
@@ -323,7 +437,7 @@ def _locate_which_executable():
 
 
 
-def _find_executable_paths(command_names):
+def _find_executable_paths(command_names) -> dict[str, str]:
     path_dict = {}
     which_executable_path = _locate_which_executable()
     for name in command_names:
@@ -343,8 +457,6 @@ def _find_executable_paths(command_names):
 
 
 bootstrap_security_state()
-allowed_interactive_commands = ['codex']
-executable_command_paths_dict = _find_executable_paths(['codex'])
 
 # set up sockets for streaming xcode commands (server) and sending/receiving files (filesocket)
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1126,6 +1238,48 @@ def discovery_status():
             }
         )
 
+@app.route('/add_allowed_interactive_command/<command>')
+def add_allowed_interactive_command_route(command:str):
+    command = command.strip()
+    if ' ' in command:
+        return jsonify({'ok': False, 'error': f'Invalid command: {command}. Commands cannot contain spaces'}), 400
+    elif _looks_like_path_arg(command):
+        return jsonify({'ok': False, 'error': f'Invalid command: {command}. Commands cannot be paths'}), 400
+    elif command in allowed_interactive_commands:
+        if command not in executable_command_paths_dict:
+            executable_command_paths_dict.update(_find_executable_paths([command]))
+        return jsonify({'ok': True, 'allowed_interactive_commands': allowed_interactive_commands}), 200
+
+    _exe_paths = _find_executable_paths([command])
+    exe_path = _exe_paths.get(command)
+    if exe_path:
+        if not (os.path.exists(exe_path) and os.path.isfile(exe_path) and os.access(exe_path, os.X_OK)):
+            error_msg = f'Error, detected path for command: {command} (somehow) does not exist'
+            print(error_msg)
+            return jsonify({'ok': False, 'error': error_msg}), 500
+    else:
+        error_msg = f'Error, unable to find executable for command: {command}'
+        print(error_msg)
+        return jsonify({'ok': False, 'error': error_msg}), 400
+
+    #actually add the command to list of interactive commands, and save it permanently in a file
+    if not add_allowed_interactive_command(command):
+        return jsonify({'ok': False, 'error': f'Failed to add interactive command: {command}'}), 500
+    return jsonify({'ok': True, 'allowed_interactive_commands': allowed_interactive_commands}), 200
+
+
+@app.route('/remove_allowed_interactive_command/<command>')
+def remove_allowed_interactive_command_route(command:str):
+    command = command.strip()
+    remove_allowed_interactive_command(command)
+    return jsonify({'ok': True, 'allowed_interactive_commands': allowed_interactive_commands}), 200
+
+
+@app.route('/get_allowed_interactive_commands')
+def get_allowed_interactive_commands_route():
+    return jsonify({'ok': True, 'allowed_interactive_commands': allowed_interactive_commands}), 200
+
+    
 
 
 @app.route('/retrieve_text_changes/<appname>')

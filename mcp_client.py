@@ -2005,32 +2005,38 @@ def sync_changes_with_server(server_addr:tuple[str, int], sync_branches=False, s
     if shared_binary_paths:
         print('There are shared binary files with changes.  Please resolve this manually')
 
-
-
-
-
-
-
-
-
-    # print(f'changed_filepaths')
-    # for path in changed_filepaths:
-    #     print(path)
-
-
-
-
-    
-
-
-    
-
-
-
-
-
     return True
     
+
+
+def add_allowed_interactive_command(server_addr:tuple[str, int], command:str):
+    '''Adds [command] to the list of allowed interactive commands.  Returns full list of all allowed interactive commands'''
+    ip, port = server_addr
+    command_arg = urllib.parse.quote(command, safe='')
+    url = f'https://{ip}:{port}/add_allowed_interactive_command/{command_arg}'
+    resp = _secure_request('GET', url)
+    resp.raise_for_status()
+    allowed_interactive_commands = resp.json()
+    return allowed_interactive_commands
+
+def remove_allowed_interactive_command(server_addr:tuple[str, int], command:str):
+    '''Removes [command] from the list of allowed interactive commands.  Returns full list of all allowed interactive commands after removal of [command]'''
+    ip, port = server_addr
+    command_arg = urllib.parse.quote(command, safe='')
+    url = f'https://{ip}:{port}/remove_allowed_interactive_command/{command_arg}'
+    resp = _secure_request('GET', url)
+    resp.raise_for_status()
+    allowed_interactive_commands = resp.json()
+    return allowed_interactive_commands
+    
+def get_allowed_interactive_commands(server_addr:tuple[str, int]):
+    '''Returns full list of allowed interactive commands'''
+    ip, port = server_addr
+    url = f'https://{ip}:{port}/get_allowed_interactive_commands'
+    resp = _secure_request('GET', url)
+    resp.raise_for_status()
+    allowed_interactive_commands = resp.json()
+    return allowed_interactive_commands
 
 
 
@@ -2193,10 +2199,27 @@ if __name__ == '__main__':
         if len(sys.argv) > 2:
             send_files(server_addr, [os.path.join(os.getcwd(), name) for name in sys.argv[2:]])
     elif arg == 'interactive':
-        if len(sys.argv) < 3:
+        if len(sys.argv) != 3:
             print('Usage: interactive <executable_name>')
         else:
             launch_remote_interactive_executable_stream(server_addr, sys.argv[2])
+    elif arg == 'getinteractive':
+        if len(sys.argv) != 2:
+            print("Usage: getinteractive")
+        else:
+            print(get_allowed_interactive_commands(server_addr))
+
+    elif arg == 'addinteractive':
+        if len(sys.argv) != 3:
+            print('Usage: addinteractive <executable_name>')
+        else:
+            print(add_allowed_interactive_command(server_addr, sys.argv[2]))
+    elif arg == 'removeinteractive':
+        if len(sys.argv) != 3:
+            print('Usage: removeinteractive <executable_name>')
+        else:
+            print(remove_allowed_interactive_command(server_addr, sys.argv[2]))
+
     else:
         print(f'Invalid argument: {arg}')
     
