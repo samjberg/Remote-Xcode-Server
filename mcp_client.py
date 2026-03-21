@@ -1,4 +1,4 @@
-import sys, os, socket, requests, json, urllib, hashlib, struct, ssl, hmac, secrets, base64, time, subprocess, re
+import sys, os, socket, requests, json, urllib, hashlib, struct, ssl, hmac, secrets, base64, time, subprocess, re, select
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Union
 from requests import Response
@@ -15,6 +15,7 @@ discovery_attempts = 3
 DEFAULT_SERVER_PORT = 8751
 DEFAULT_SERVER_SOCKET_PORT = 50271
 DEFAULT_FILE_SOCKET_PORT = 47283
+DEFAULT_INTERACTIVE_WRAPPER_PORT = 40887
 
 SERVER_INFO: dict = {}
 SERVER_CERT_PATH = ''
@@ -146,6 +147,7 @@ def _default_connection_metadata(server_port: Optional[int] = None) -> dict:
         'server_port': resolved_server_port,
         'server_socket_port': _env_int('RXS_SERVER_SOCKET_PORT', DEFAULT_SERVER_SOCKET_PORT),
         'file_socket_port': _env_int('RXS_FILE_SOCKET_PORT', DEFAULT_FILE_SOCKET_PORT),
+        'interactive_wrapper_port': _env_int('RXS_INTERACTIVE_WRAPPER_PORT', DEFAULT_INTERACTIVE_WRAPPER_PORT),
     }
 
 
@@ -169,6 +171,8 @@ def _fetch_pairing_bundle_https(
     required = {'server_port', 'server_socket_port', 'file_socket_port', 'certificate', 'secret_key', 'expires_at_unix'}
     if not obj.get('ok', False) or not required.issubset(set(obj.keys())):
         return None
+    if 'interactive_wrapper_port' not in obj:
+        obj['interactive_wrapper_port'] = _env_int('RXS_INTERACTIVE_WRAPPER_PORT', DEFAULT_INTERACTIVE_WRAPPER_PORT)
     return server_ip, obj
 
 
@@ -359,7 +363,7 @@ def _load_global_serverinfo_cache() -> dict:
 def _save_global_serverinfo_cache(serverinfo: dict) -> None:
     if not isinstance(serverinfo, dict):
         return
-    keys = ['server_ip', 'server_port', 'server_socket_port', 'file_socket_port']
+    keys = ['server_ip', 'server_port', 'server_socket_port', 'file_socket_port', 'interactive_wrapper_port']
     if any(key not in serverinfo for key in keys):
         return
     obj = {
@@ -367,6 +371,7 @@ def _save_global_serverinfo_cache(serverinfo: dict) -> None:
         'server_port': int(serverinfo['server_port']),
         'server_socket_port': int(serverinfo['server_socket_port']),
         'file_socket_port': int(serverinfo['file_socket_port']),
+        'interactive_wrapper_port': int(serverinfo['interactive_wrapper_port']),
     }
     try:
         with open(GLOBAL_SERVERINFO_CACHE_PATH, 'w', encoding='utf-8') as f:
@@ -434,6 +439,9 @@ def _ensure_pairing_material(serverinfo_path: str, runtime_dir: str, existing_in
     info['server_port'] = int(discovery_info['server_port'])
     info['server_socket_port'] = int(discovery_info['server_socket_port'])
     info['file_socket_port'] = int(discovery_info['file_socket_port'])
+    info['interactive_wrapper_port'] = int(
+        discovery_info.get('interactive_wrapper_port', _env_int('RXS_INTERACTIVE_WRAPPER_PORT', DEFAULT_INTERACTIVE_WRAPPER_PORT))
+    )
     info['security'] = {
         'cert_relpath': unix_path(os.path.relpath(cert_path, runtime_dir)),
         'secret_relpath': unix_path(os.path.relpath(secret_path, runtime_dir)),
@@ -494,6 +502,103 @@ def _send_socket_auth(conn: socket.socket, channel: str, session_id: str) -> Non
     ack, _ = _recv_frame(conn)
     if ack.get('type') != 'AUTH_ACK' or not ack.get('ok', False):
         raise PermissionError(f'Server rejected socket auth for channel {channel}')
+
+def _require_posix_tty_modules():
+    if os.name != 'posix':
+        raise RuntimeError('Interactive mode is only supported on POSIX clients.')
+    if not sys.stdin.isatty():
+        raise RuntimeError('Interactive mode requires a TTY stdin.')
+    try:
+        import termios
+        import tty
+    except Exception as e:
+        raise RuntimeError(f'Interactive mode terminal setup is unavailable: {e}') from e
+    return termios, tty
+
+
+# this function should be deleted after secure implementation is validated.
+def stream_remote_executable_simple(server_addr: tuple[str, int], command: str) -> None:
+    termios, tty = _require_posix_tty_modules()
+    old_settings = termios.tcgetattr(sys.stdin)
+    tty.setraw(sys.stdin.fileno())
+    interactive_wrapper_port = DEFAULT_INTERACTIVE_WRAPPER_PORT
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.connect((server_addr[0], interactive_wrapper_port))
+        try:
+            while True:
+                r, _, _ = select.select([sys.stdin, sock], [], [])
+                if sys.stdin in r:
+                    raw_user_keystrokes = os.read(sys.stdin.fileno(), 1 * KB)
+                    if not raw_user_keystrokes:
+                        break
+                    sock.sendall(raw_user_keystrokes)
+                if sock in r:
+                    data = sock.recv(4 * KB)
+                    if not data:
+                        break
+                    os.write(sys.stdout.fileno(), data)
+        finally:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+
+
+def stream_remote_executable_from_server(
+    server_addr: tuple[str, int],
+    stream_id: str,
+    interactive_wrapper_port: Optional[int] = None,
+) -> None:
+    termios, tty = _require_posix_tty_modules()
+    ip = server_addr[0]
+    if interactive_wrapper_port is None:
+        interactive_wrapper_port = int(
+            SERVER_INFO.get('interactive_wrapper_port', _env_int('RXS_INTERACTIVE_WRAPPER_PORT', DEFAULT_INTERACTIVE_WRAPPER_PORT))
+        )
+    old_settings = termios.tcgetattr(sys.stdin)
+    tty.setraw(sys.stdin.fileno())
+
+    tls_ctx = _make_client_tls_context()
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as raw_socket:
+        raw_socket.connect((ip, int(interactive_wrapper_port)))
+        with tls_ctx.wrap_socket(raw_socket, server_hostname=ip) as sock:
+            _send_socket_auth(sock, channel='remote_executable', session_id=stream_id)
+            try:
+                while True:
+                    r, _, _ = select.select([sys.stdin, sock], [], [])
+                    if sys.stdin in r:
+                        raw_user_keystrokes = os.read(sys.stdin.fileno(), 1 * KB)
+                        if not raw_user_keystrokes:
+                            break
+                        sock.sendall(raw_user_keystrokes)
+                    if sock in r:
+                        data = sock.recv(4 * KB)
+                        if not data:
+                            break
+                        os.write(sys.stdout.fileno(), data)
+            finally:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+
+
+def launch_remote_interactive_executable_stream(server_addr: tuple[str, int], command: str):
+    _require_posix_tty_modules()
+    ip, port = server_addr
+    app_name = get_appname()
+    url = _build_server_url(server_addr, f'/interactive/launch/{app_name}/{command}')
+    resp: Response = _secure_request('POST', url, json_data={})
+    resp.raise_for_status()
+    try:
+        obj = resp.json()
+    except ValueError as e:
+        raise RuntimeError(f'Invalid launch response from server: {resp.text}') from e
+    if not obj.get('ok', False):
+        raise RuntimeError(f'Interactive launch failed: {obj.get("error", "unknown_error")}')
+    stream_id = str(obj.get('stream_id', '')).strip()
+    if not stream_id:
+        raise RuntimeError('Interactive launch response missing stream_id')
+    interactive_wrapper_port = int(
+        obj.get('interactive_wrapper_port', _env_int('RXS_INTERACTIVE_WRAPPER_PORT', DEFAULT_INTERACTIVE_WRAPPER_PORT))
+    )
+    stream_remote_executable_from_server(server_addr, stream_id, interactive_wrapper_port)
+
 
 
 def retrieve_file(server_addr:tuple[str, int], path) -> bool:
@@ -1900,32 +2005,38 @@ def sync_changes_with_server(server_addr:tuple[str, int], sync_branches=False, s
     if shared_binary_paths:
         print('There are shared binary files with changes.  Please resolve this manually')
 
-
-
-
-
-
-
-
-
-    # print(f'changed_filepaths')
-    # for path in changed_filepaths:
-    #     print(path)
-
-
-
-
-    
-
-
-    
-
-
-
-
-
     return True
     
+
+
+def add_allowed_interactive_command(server_addr:tuple[str, int], command:str):
+    '''Adds [command] to the list of allowed interactive commands.  Returns full list of all allowed interactive commands'''
+    ip, port = server_addr
+    command_arg = urllib.parse.quote(command, safe='')
+    url = f'https://{ip}:{port}/add_allowed_interactive_command/{command_arg}'
+    resp = _secure_request('GET', url)
+    resp.raise_for_status()
+    allowed_interactive_commands = resp.json()
+    return allowed_interactive_commands
+
+def remove_allowed_interactive_command(server_addr:tuple[str, int], command:str):
+    '''Removes [command] from the list of allowed interactive commands.  Returns full list of all allowed interactive commands after removal of [command]'''
+    ip, port = server_addr
+    command_arg = urllib.parse.quote(command, safe='')
+    url = f'https://{ip}:{port}/remove_allowed_interactive_command/{command_arg}'
+    resp = _secure_request('GET', url)
+    resp.raise_for_status()
+    allowed_interactive_commands = resp.json()
+    return allowed_interactive_commands
+    
+def get_allowed_interactive_commands(server_addr:tuple[str, int]):
+    '''Returns full list of allowed interactive commands'''
+    ip, port = server_addr
+    url = f'https://{ip}:{port}/get_allowed_interactive_commands'
+    resp = _secure_request('GET', url)
+    resp.raise_for_status()
+    allowed_interactive_commands = resp.json()
+    return allowed_interactive_commands
 
 
 
@@ -1970,12 +2081,12 @@ if __name__ == '__main__':
 
     # Merge in cross-project cached metadata (helps when project-local runtime dirs were deleted).
     cached_serverinfo = _load_global_serverinfo_cache()
-    for key in ['server_ip', 'server_port', 'server_socket_port', 'file_socket_port']:
+    for key in ['server_ip', 'server_port', 'server_socket_port', 'file_socket_port', 'interactive_wrapper_port']:
         if key not in serverinfo_dict and key in cached_serverinfo:
             serverinfo_dict[key] = cached_serverinfo[key]
 
     # If connection metadata is missing, do a non-pairing discovery pass to bootstrap IP/ports.
-    required_conn_keys = ['server_ip', 'server_port', 'server_socket_port', 'file_socket_port']
+    required_conn_keys = ['server_ip', 'server_port', 'server_socket_port', 'file_socket_port', 'interactive_wrapper_port']
     missing_conn = [key for key in required_conn_keys if key not in serverinfo_dict]
     if missing_conn:
         hint_ip = str(serverinfo_dict.get('server_ip', '')).strip() or os.environ.get('RXS_SERVER_IP', '').strip() or None
@@ -1996,6 +2107,9 @@ if __name__ == '__main__':
         serverinfo_dict['server_port'] = int(discovered_info['server_port'])
         serverinfo_dict['server_socket_port'] = int(discovered_info['server_socket_port'])
         serverinfo_dict['file_socket_port'] = int(discovered_info['file_socket_port'])
+        serverinfo_dict['interactive_wrapper_port'] = int(
+            discovered_info.get('interactive_wrapper_port', _env_int('RXS_INTERACTIVE_WRAPPER_PORT', DEFAULT_INTERACTIVE_WRAPPER_PORT))
+        )
         # Persist connection metadata immediately so pair-only flows still cache resolved address/ports.
         with open(serverinfo_path, 'w', encoding='utf-8') as f:
             json.dump(serverinfo_dict, f)
@@ -2027,6 +2141,8 @@ if __name__ == '__main__':
 
     # Ensure we have paired cert + shared secret; this requires active pairing window when missing.
     serverinfo_dict = _ensure_pairing_material(serverinfo_path, runtime_dir, existing_info=serverinfo_dict)
+    if 'interactive_wrapper_port' not in serverinfo_dict:
+        serverinfo_dict['interactive_wrapper_port'] = _env_int('RXS_INTERACTIVE_WRAPPER_PORT', DEFAULT_INTERACTIVE_WRAPPER_PORT)
     _initialize_security_context(runtime_dir, serverinfo_dict)
     _save_global_serverinfo_cache(serverinfo_dict)
 
@@ -2039,6 +2155,7 @@ if __name__ == '__main__':
     server_port = int(serverinfo_dict['server_port'])
     server_socket_port = int(serverinfo_dict['server_socket_port'])
     file_socket_port = int(serverinfo_dict['file_socket_port'])
+    interactive_wrapper_port = int(serverinfo_dict['interactive_wrapper_port'])
     server_addr = (server_ip, server_port)
  
 
@@ -2081,6 +2198,28 @@ if __name__ == '__main__':
     elif 'sendfiles' in arg:
         if len(sys.argv) > 2:
             send_files(server_addr, [os.path.join(os.getcwd(), name) for name in sys.argv[2:]])
+    elif arg == 'interactive':
+        if len(sys.argv) != 3:
+            print('Usage: interactive <executable_name>')
+        else:
+            launch_remote_interactive_executable_stream(server_addr, sys.argv[2])
+    elif arg == 'getinteractive':
+        if len(sys.argv) != 2:
+            print("Usage: getinteractive")
+        else:
+            print(get_allowed_interactive_commands(server_addr))
+
+    elif arg == 'addinteractive':
+        if len(sys.argv) != 3:
+            print('Usage: addinteractive <executable_name>')
+        else:
+            print(add_allowed_interactive_command(server_addr, sys.argv[2]))
+    elif arg == 'removeinteractive':
+        if len(sys.argv) != 3:
+            print('Usage: removeinteractive <executable_name>')
+        else:
+            print(remove_allowed_interactive_command(server_addr, sys.argv[2]))
+
     else:
         print(f'Invalid argument: {arg}')
     

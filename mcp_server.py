@@ -1,4 +1,4 @@
-import os, subprocess, socket, json, struct, hashlib, time, re, datetime, secrets, ssl, hmac
+import os, subprocess, socket, json, struct, hashlib, time, re, secrets, ssl, hmac, pty, select
 from flask import Flask, request, send_file, send_from_directory, jsonify, Request, Response
 from threading import Thread, Lock
 from functools import wraps
@@ -11,6 +11,7 @@ server_port = 8751
 server_socket_port = 50271
 discovery_socket_port = 9346
 file_socket_port = 47283
+interactive_wrapper_port = 40887
 pairing_duration_s = 60
 allowed_timestamp_skew_s = 120
 nonce_ttl_s = 300
@@ -22,6 +23,10 @@ server_dir_name = get_runtime_dir_name()
 server_dir_path = os.path.join(cwd, server_dir_name)
 project_info_filename = 'projectinfo.txt'
 project_info_filepath = os.path.join(server_dir_path, project_info_filename)
+legacy_allowed_interactive_commands_filename = 'allowed_interactive_commands.txt'
+allowed_interactive_commands_filename = 'allowed-interactive-commands.txt'
+legacy_allowed_interactive_commands_path = os.path.join(server_dir_path, legacy_allowed_interactive_commands_filename)
+allowed_interactive_commands_path = os.path.join(server_dir_path, allowed_interactive_commands_filename)
 
 PAIRING_EXPIRY_UNIX = 0
 PAIRING_LOCK = Lock()
@@ -35,6 +40,7 @@ DISCOVERY_STATUS = {
     'last_error': '',
 }
 DISCOVERY_LOCK = Lock()
+INTERACTIVE_SESSION_TTL_SECONDS = 120
 
 
 def get_server_port() -> int:
@@ -96,6 +102,115 @@ def get_hmac_secret() -> str:
     with open(secret_path, 'r', encoding='utf-8') as f:
         return f.read().strip()
 
+allowed_interactive_commands: list[str] = []
+executable_command_paths_dict: dict[str, str] = {}
+
+
+def _normalize_allowed_interactive_commands(raw_commands) -> list[str]:
+    if not isinstance(raw_commands, list):
+        return []
+    normalized = []
+    seen = set()
+    for cmd in raw_commands:
+        if not isinstance(cmd, str):
+            continue
+        cleaned = cmd.strip()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        normalized.append(cleaned)
+    return list(sorted(normalized))
+
+
+def _extract_allowed_commands_from_payload(payload: dict) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+    # Support both keys to remain compatible with any existing file contents.
+    raw = payload.get('allowed_interactive_commands', payload.get('allowed-interactive-commands', []))
+    return _normalize_allowed_interactive_commands(raw)
+
+
+def _load_allowed_interactive_commands_file(path: str) -> list[str]:
+    with open(path, 'r', encoding='utf-8') as f:
+        text = f.read().strip()
+    if not text:
+        return []
+    payload = json.loads(text)
+    return _extract_allowed_commands_from_payload(payload)
+
+
+def _ensure_allowed_interactive_commands_file() -> None:
+    os.makedirs(server_dir_path, exist_ok=True)
+    if os.path.exists(allowed_interactive_commands_path):
+        return
+    if os.path.exists(legacy_allowed_interactive_commands_path):
+        commands = _load_allowed_interactive_commands_file(legacy_allowed_interactive_commands_path)
+        save_allowed_interactive_commands(commands)
+        return
+    save_allowed_interactive_commands([])
+
+
+def load_allowed_interactive_commands() -> list[str]:
+    _ensure_allowed_interactive_commands_file()
+    try:
+        return _load_allowed_interactive_commands_file(allowed_interactive_commands_path)
+    except Exception as e:
+        print(f'Error trying to decode JSON in {allowed_interactive_commands_path}: {e}')
+        return []
+
+
+def save_allowed_interactive_commands(allowed_commands: list[str]) -> None:
+    os.makedirs(server_dir_path, exist_ok=True)
+    normalized = _normalize_allowed_interactive_commands(allowed_commands)
+    with open(allowed_interactive_commands_path, 'w', encoding='utf-8') as f:
+        payload = {'allowed_interactive_commands': normalized}
+        f.write(json.dumps(payload))
+
+
+def add_allowed_interactive_command(name: str, save_allowed_commands: bool = True) -> bool:
+    global allowed_interactive_commands
+    global executable_command_paths_dict
+    cleaned = name.strip()
+    if not cleaned:
+        return False
+    if cleaned in allowed_interactive_commands:
+        if cleaned not in executable_command_paths_dict:
+            executable_command_paths_dict.update(_find_executable_paths([cleaned]))
+        return True
+    exe_paths = _find_executable_paths([cleaned])
+    exe_path = exe_paths.get(cleaned, '')
+    if not exe_path:
+        return False
+    allowed_interactive_commands = list(sorted(allowed_interactive_commands + [cleaned]))
+    executable_command_paths_dict[cleaned] = exe_path
+    if save_allowed_commands:
+        save_allowed_interactive_commands(allowed_interactive_commands)
+    return True
+
+
+def remove_allowed_interactive_command(name: str, save_allowed_commands: bool = True) -> bool:
+    global allowed_interactive_commands
+    global executable_command_paths_dict
+    cleaned = name.strip()
+    old_len = len(allowed_interactive_commands)
+    allowed_interactive_commands = [cmd for cmd in allowed_interactive_commands if cmd != cleaned]
+    executable_command_paths_dict.pop(cleaned, None)
+    changed = len(allowed_interactive_commands) != old_len
+    if save_allowed_commands:
+        save_allowed_interactive_commands(allowed_interactive_commands)
+    return changed
+
+
+def _ensure_allowed_interactive_commands() -> None:
+    global allowed_interactive_commands
+    global executable_command_paths_dict
+    allowed_interactive_commands = load_allowed_interactive_commands()
+    executable_command_paths_dict = _find_executable_paths(allowed_interactive_commands)
+    if not allowed_interactive_commands:
+        print('Continuing execution, however allowed_interactive_commands is an empty list. No interactive commands will be allowed')
+
+
+
 
 def bootstrap_security_state() -> None:
     cert_path, key_path = get_tls_paths()
@@ -119,6 +234,7 @@ def bootstrap_security_state() -> None:
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
     SERVER_TLS_CONTEXT = ctx
+    _ensure_allowed_interactive_commands()
 
 
 def pairing_window_state() -> tuple[bool, int]:
@@ -210,7 +326,11 @@ def _build_socket_auth_payload(channel: str, session_id: str, timestamp: str, no
     return '\n'.join([channel, session_id, timestamp, nonce])
 
 
-def _verify_socket_handshake(conn: socket.socket, expected_channel: str, expected_session_id: str) -> None:
+def _verify_socket_handshake(
+    conn: socket.socket,
+    expected_channel: Optional[str] = None,
+    expected_session_id: Optional[str] = None,
+) -> tuple[str, str]:
     header, _ = _recv_frame(conn)
     if header.get('type') != 'AUTH':
         raise PermissionError('missing auth handshake')
@@ -219,8 +339,10 @@ def _verify_socket_handshake(conn: socket.socket, expected_channel: str, expecte
     timestamp = str(header.get('timestamp', ''))
     nonce = str(header.get('nonce', ''))
     signature = str(header.get('signature', ''))
-    if channel != expected_channel or session_id != expected_session_id:
-        raise PermissionError('invalid auth handshake target')
+    if expected_channel is not None and channel != expected_channel:
+        raise PermissionError('invalid auth handshake channel')
+    if expected_session_id is not None and session_id != expected_session_id:
+        raise PermissionError('invalid auth handshake session id')
     try:
         ts = int(timestamp)
     except ValueError as e:
@@ -240,6 +362,7 @@ def _verify_socket_handshake(conn: socket.socket, expected_channel: str, expecte
     if not hmac.compare_digest(expected, signature):
         raise PermissionError('invalid auth handshake signature')
     _send_frame(conn, {'type': 'AUTH_ACK', 'ok': True})
+    return channel, session_id
 
 
 def _wrap_server_tls_socket(conn: socket.socket) -> ssl.SSLSocket:
@@ -275,7 +398,10 @@ def start_discovery_listener():
 
         response_lines = [
             'RXS_SERVER_HERE',
-            f'ports|server_port:{server_port},server_socket_port:{server_socket_port},file_socket_port:{file_socket_port}',
+            (
+                f'ports|server_port:{server_port},server_socket_port:{server_socket_port},'
+                f'file_socket_port:{file_socket_port},interactive_wrapper_port:{interactive_wrapper_port}'
+            ),
         ]
         try:
             pairing_enabled, expires_at = pairing_window_state()
@@ -296,6 +422,39 @@ def start_discovery_listener():
             with DISCOVERY_LOCK:
                 DISCOVERY_STATUS['last_error'] = f'send_error:{e}'
 
+def _locate_which_executable():
+    primary_candidates = ['/usr/bin', '/bin']
+    for dir_path in primary_candidates:
+        full_path = os.path.join(dir_path, 'which')
+        if os.path.exists(full_path):
+            return full_path
+    PATH_paths = os.environ['PATH'].split(os.pathsep)
+    for dir_path in PATH_paths:
+        full_path = os.path.join(dir_path, 'which')
+        if os.path.exists(full_path):
+            return full_path
+    raise FileNotFoundError('Unable to locate "which" executable in primary_candidates')
+
+
+
+def _find_executable_paths(command_names) -> dict[str, str]:
+    path_dict = {}
+    which_executable_path = _locate_which_executable()
+    for name in command_names:
+        if name not in path_dict:
+            proc = run_process([which_executable_path, name])
+            if proc.returncode != 0:
+                print(f'Error locating executable for command: {name}')
+            if proc.stdout:
+                resolved = proc.stdout.decode(errors='replace').strip().splitlines()
+                if not resolved:
+                    continue
+                executable_path = resolved[0].strip()
+                if executable_path and os.path.isfile(executable_path) and os.access(executable_path, os.X_OK):
+                    path_dict[name] = executable_path
+    return path_dict
+
+
 
 bootstrap_security_state()
 
@@ -306,6 +465,10 @@ server.listen(1)
 filesocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 filesocket.bind(('0.0.0.0', file_socket_port))
 filesocket.listen(1)
+interactive_wrapper_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+interactive_wrapper_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+interactive_wrapper_socket.bind(('0.0.0.0', interactive_wrapper_port))
+interactive_wrapper_socket.listen(16)
 
 # launch thread that reports back to client on server discovery broadcast requests
 discovery_thread = Thread(target=start_discovery_listener, args=[], daemon=True)
@@ -341,6 +504,208 @@ TRANSFER_SESSIONS: dict[str, dict] = {}
 OUTBOUND_TRANSFER_SESSIONS: dict[str, dict] = {}
 SESSION_LOCK = Lock()
 SESSION_TTL_SECONDS = 30 * 60
+INTERACTIVE_SESSIONS: dict[str, dict] = {}
+INTERACTIVE_LOCK = Lock()
+
+
+
+def _close_interactive_session_resources(session: dict) -> None:
+    master_fd = session.get('master_fd')
+    if isinstance(master_fd, int):
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+    proc = session.get('proc')
+    if proc is not None:
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+def _cleanup_expired_interactive_sessions(now: Optional[float] = None) -> None:
+    if now is None:
+        now = time.time()
+    stale_stream_ids: list[str] = []
+    with INTERACTIVE_LOCK:
+        for stream_id, session in INTERACTIVE_SESSIONS.items():
+            if session.get('attached', False):
+                continue
+            created_at = float(session.get('created_at', now))
+            if now - created_at > INTERACTIVE_SESSION_TTL_SECONDS:
+                stale_stream_ids.append(stream_id)
+        stale_sessions = [INTERACTIVE_SESSIONS.pop(stream_id, None) for stream_id in stale_stream_ids]
+    for session in stale_sessions:
+        if session:
+            _close_interactive_session_resources(session)
+
+
+def _stream_interactive_session(conn: socket.socket, session: dict, stream_id: str) -> None:
+    try:
+        master_fd = int(session['master_fd'])
+        proc = session['proc']
+        while True:
+            if proc.poll() is not None:
+                # Process has exited; continue draining PTY output until EOF.
+                pass
+            r, _, _ = select.select([conn, master_fd], [], [], 1.0)
+            if conn in r:
+                user_input = conn.recv(1*KB)
+                if not user_input:
+                    break
+                try:
+                    os.write(master_fd, user_input)
+                except OSError:
+                    break
+            if master_fd in r:
+                try:
+                    process_output = os.read(master_fd, 4*KB)
+                except OSError:
+                    break
+                if not process_output:
+                    break
+                conn.sendall(process_output)
+    except Exception as e:
+        print(f'Error streaming interactive session {stream_id}: {e}')
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        with INTERACTIVE_LOCK:
+            final_session = INTERACTIVE_SESSIONS.pop(stream_id, None)
+        if final_session:
+            _close_interactive_session_resources(final_session)
+    
+
+
+def start_interactive_session_listener():
+    while True:
+        _cleanup_expired_interactive_sessions()
+        try:
+            raw_conn, addr = interactive_wrapper_socket.accept()
+        except Exception as e:
+            print(f'Error accepting interactive wrapper socket: {e}')
+            continue
+
+        remote_ip = addr[0] if addr else ''
+        try:
+            conn = _wrap_server_tls_socket(raw_conn)
+        except Exception as e:
+            print(f'Error establishing TLS for interactive socket: {e}')
+            try:
+                raw_conn.close()
+            except Exception:
+                pass
+            continue
+
+        try:
+            _, stream_id = _verify_socket_handshake(conn, expected_channel='remote_executable')
+        except Exception as e:
+            print(f'Rejected interactive socket handshake: {e}')
+            try:
+                conn.close()
+            except Exception:
+                pass
+            continue
+
+        with INTERACTIVE_LOCK:
+            session = INTERACTIVE_SESSIONS.get(stream_id)
+            if not session:
+                session_ok = False
+                reject_reason = f'unknown stream id {stream_id}'
+            elif session.get('attached', False):
+                session_ok = False
+                reject_reason = f'stream id {stream_id} already attached'
+            elif session.get('client_ip', '') != remote_ip:
+                session_ok = False
+                reject_reason = (
+                    f'IP mismatch for stream id {stream_id}: expected {session.get("client_ip", "")}, got {remote_ip}'
+                )
+            else:
+                session_ok = True
+                session['attached'] = True
+                session['attached_at'] = time.time()
+                reject_reason = ''
+
+        if not session_ok:
+            print(f'Rejected interactive socket connection: {reject_reason}')
+            try:
+                conn.close()
+            except Exception:
+                pass
+            continue
+
+        worker = Thread(target=_stream_interactive_session, args=(conn, session, stream_id), daemon=True)
+        worker.start()
+
+
+def _launch_interactive_wrapper(appname: str, executable_name: str):
+    if _looks_like_path_arg(executable_name):
+        return jsonify({'ok': False, 'error': 'invalid_executable_name'}), 400
+    if executable_name not in allowed_interactive_commands:
+        return jsonify({'ok': False, 'error': 'command_not_allowed'}), 403
+
+    command_path = executable_command_paths_dict.get(executable_name, '')
+    if not command_path:
+        return jsonify({'ok': False, 'error': 'command_not_found'}), 400
+
+    slave_fd = None
+    try:
+        master_fd, slave_fd = pty.openpty()
+        proc = subprocess.Popen(
+            [command_path],
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            close_fds=True,
+            env={**os.environ, 'TERM': 'xterm-256color'},
+        )
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'failed_to_launch:{e}'}), 500
+    finally:
+        if isinstance(slave_fd, int):
+            try:
+                os.close(slave_fd)
+            except Exception:
+                pass
+
+    stream_id = secrets.token_urlsafe(24)
+    with INTERACTIVE_LOCK:
+        INTERACTIVE_SESSIONS[stream_id] = {
+            'stream_id': stream_id,
+            'client_ip': request.remote_addr or '',
+            'executable': executable_name,
+            'master_fd': master_fd,
+            'proc': proc,
+            'created_at': time.time(),
+            'attached': False,
+        }
+
+    return jsonify(
+        {
+            'ok': True,
+            'stream_id': stream_id,
+            'interactive_wrapper_port': interactive_wrapper_port,
+            'executable': executable_name,
+        }
+    )
+
+
+@app.route('/interactive/launch/<appname>/<executable_name>', methods=['POST'])
+def launch_interactive_wrapper_v2(appname: str, executable_name: str):
+    return _launch_interactive_wrapper(appname, executable_name)
+
+
+@app.route('/stream_interactive_wrapper/<appname>/<executable_name>', methods=['GET'])
+def launch_interactive_wrapper_legacy(appname: str, executable_name: str):
+    return _launch_interactive_wrapper(appname, executable_name)
 
 
 @app.before_request
@@ -444,6 +809,10 @@ def _recv_frame(conn: socket.socket) -> tuple[dict, bytes]:
     payload_len = struct.unpack('!I', _recv_exact(conn, 4))[0]
     payload = _recv_exact(conn, payload_len) if payload_len else b''
     return header, payload
+
+
+interactive_session_thread = Thread(target=start_interactive_session_listener, args=[], daemon=True)
+interactive_session_thread.start()
 
 
 def _update_session(transfer_id: str, **updates) -> None:
@@ -848,6 +1217,7 @@ def pairing_bootstrap():
             'server_port': server_port,
             'server_socket_port': server_socket_port,
             'file_socket_port': file_socket_port,
+            'interactive_wrapper_port': interactive_wrapper_port,
             'certificate': cert_one_line,
             'secret_key': get_hmac_secret(),
         }
@@ -863,10 +1233,53 @@ def discovery_status():
                 'server_port': server_port,
                 'server_socket_port': server_socket_port,
                 'file_socket_port': file_socket_port,
+                'interactive_wrapper_port': interactive_wrapper_port,
                 **DISCOVERY_STATUS,
             }
         )
 
+@app.route('/add_allowed_interactive_command/<command>')
+def add_allowed_interactive_command_route(command:str):
+    command = command.strip()
+    if ' ' in command:
+        return jsonify({'ok': False, 'error': f'Invalid command: {command}. Commands cannot contain spaces'}), 400
+    elif _looks_like_path_arg(command):
+        return jsonify({'ok': False, 'error': f'Invalid command: {command}. Commands cannot be paths'}), 400
+    elif command in allowed_interactive_commands:
+        if command not in executable_command_paths_dict:
+            executable_command_paths_dict.update(_find_executable_paths([command]))
+        return jsonify({'ok': True, 'allowed_interactive_commands': allowed_interactive_commands}), 200
+
+    _exe_paths = _find_executable_paths([command])
+    exe_path = _exe_paths.get(command)
+    if exe_path:
+        if not (os.path.exists(exe_path) and os.path.isfile(exe_path) and os.access(exe_path, os.X_OK)):
+            error_msg = f'Error, detected path for command: {command} (somehow) does not exist'
+            print(error_msg)
+            return jsonify({'ok': False, 'error': error_msg}), 500
+    else:
+        error_msg = f'Error, unable to find executable for command: {command}'
+        print(error_msg)
+        return jsonify({'ok': False, 'error': error_msg}), 400
+
+    #actually add the command to list of interactive commands, and save it permanently in a file
+    if not add_allowed_interactive_command(command):
+        return jsonify({'ok': False, 'error': f'Failed to add interactive command: {command}'}), 500
+    return jsonify({'ok': True, 'allowed_interactive_commands': allowed_interactive_commands}), 200
+
+
+@app.route('/remove_allowed_interactive_command/<command>')
+def remove_allowed_interactive_command_route(command:str):
+    command = command.strip()
+    remove_allowed_interactive_command(command)
+    return jsonify({'ok': True, 'allowed_interactive_commands': allowed_interactive_commands}), 200
+
+
+@app.route('/get_allowed_interactive_commands')
+def get_allowed_interactive_commands_route():
+    return jsonify({'ok': True, 'allowed_interactive_commands': allowed_interactive_commands}), 200
+
+    
 
 
 @app.route('/retrieve_text_changes/<appname>')
