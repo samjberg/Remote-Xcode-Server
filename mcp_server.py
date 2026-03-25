@@ -1398,7 +1398,7 @@ def apply_patch_server(appname):
         return 'Error: no patch path received from the client'
     apply_patch(patch_path)
     return 'successfully applied patch'
-    
+
 
 @app.route('/sendchanges/<appname>', methods=['GET'])
 def receive_changes(appname):
@@ -1812,7 +1812,6 @@ def job_status(job_id):
         return jsonify("error", "job not found"), 404
     return jsonify(job)
 
-    
 
 
 

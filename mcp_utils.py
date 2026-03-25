@@ -96,6 +96,13 @@ def get_ip():
     return IP
 
 
+def clear_directory(path) -> None:
+    for item_path in os.listdir(path):
+        os.remove(os.path.join(path, item_path))
+
+def dir_is_empty(path) -> bool:
+    return len(os.listdir(path)) == 0
+
 def update_gitignore():
     start_dir = os.getcwd()
     project_root = get_project_root_path(start_dir)
@@ -174,6 +181,29 @@ def is_subdir(path, directory):
     else:
         return True
 
+def normalize_file_line_endings(path:str, fmt='LF') -> None:
+    #guard against invalid fmt option. This makes it valid to just use if/else instead of if/elif in the for loop
+    if fmt.upper() not in ['LF', 'CRLF']:
+        print(f'Invalid line endings format: {fmt}')
+        return
+
+    #guard against invalid path
+    if not os.path.exists(path):
+        raise FileNotFoundError
+
+    #the newline=None option causes .read() to strip out ALL line endings, both LF and CRLF
+    with open(path, 'r', newline=None) as f:
+        lines = f.readlines()
+
+    newline_str = '\n' if fmt == 'LF' else '\r\n'
+
+
+    with open(path, 'w', newline=newline_str) as f:
+        for line in lines:
+            clean_line = line.rstrip()
+            f.write(clean_line + '\n')
+
+
 
 
 #this insane P and R stuff with ParamSpec and TypeVar is just the insanity that is necessary to make typehints show up for functions
@@ -241,6 +271,7 @@ def get_commits_between(start_ref:str, end_ref:str='HEAD') -> list[str]:
         res_str:str = proc.stdout.decode(errors='replace')
     except UnicodeDecodeError as err:
         print(f'Failed to decode output for command: {cmd}\nError message: {err}')
+        return []
     commits = [line.strip() for line in res_str.splitlines()]
     return commits
 
@@ -255,7 +286,7 @@ def git_create_update_bundle(start_ref:str, end_ref:str='HEAD', save_path='updat
         print(f"Error decoding output from command: {' '.join(cmd)}\nError Message: {err}")
     return save_path
 
-def git_verify_bundle(bundle_path:str) -> tuple[bool, list[str]]:
+def git_verify_bundle(bundle_path:str) -> bool:
     '''Verifies that the git bundle is both a valid bundle in general, and also can be successfully applied to the current repo without errors'''
     project_root = get_project_root_path()
     if not is_subdir(bundle_path, project_root):
@@ -268,7 +299,8 @@ def git_verify_bundle(bundle_path:str) -> tuple[bool, list[str]]:
     try:
         res:str = proc.stdout.decode(errors='replace')
     except UnicodeDecodeError as err:
-        print(f"Error decoding output from command {' '.split(verify_bundle_command)}\nError Message: {err}")
+        print(f"Error decoding output from command {' '.join(verify_bundle_command)}\nError Message: {err}")
+        return False
     
     lines = res.splitlines()
     for line in lines:
@@ -309,6 +341,7 @@ def get_git_branches(app_name:str='', return_current_branch=False, sort_order='c
     if not return_current_branch:
         return return_lines
 
+    current_branch = ''
     for line in lines:
         #current branch line starts with '*'
         if line[0] == '*':
@@ -324,13 +357,13 @@ def get_merge_base(commit_hash1:str, commit_hash2:str) -> str:
     proc = run_process(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=project_root)
     if not proc.stdout:
         print(f"No output from {' '.join(proc.args)}")
-        return None
+        return ''
     merge_base = proc.stdout.decode(errors='replace').strip()
     return merge_base
 
 
 
-def compare_ahead_behind(commit1:str, commit2:str) -> tuple[int, int]:
+def compare_ahead_behind(commit1:str, commit2:str) -> Union[tuple[int, int], None]:
     '''Returns two ints, representing how many commits ahead each commit is compared to the other''' 
     command = shlex.split(f'git rev-list --left-right --count {commit1}...{commit2}')
     project_root = get_project_root_path()
@@ -667,9 +700,9 @@ def get_changed_file_paths(scope='repo') -> list[str]:
     return file_paths
 
 def get_diff_for_files(paths:list[str], diff_filename='specific_files_gitdiff.diff') -> str:
-    cwd = unix_path(os.getcwd())
+    cwd = os.getcwd()
     runtime_dir_path = get_runtime_dir_path(cwd)
-    git_diff_path = os.path.join(runtime_dir_path, diff_filename)
+    git_diff_path = unix_path(os.path.join(runtime_dir_path, diff_filename))
     if os.path.exists(git_diff_path): #my brain would actually explode if this returned true lmao
         os.remove(git_diff_path)
 

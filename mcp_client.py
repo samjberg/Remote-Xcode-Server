@@ -1,4 +1,5 @@
-import sys, os, socket, requests, json, urllib, hashlib, struct, ssl, hmac, secrets, base64, time, subprocess, re, select
+import sys, os, socket, requests, json, hashlib, struct, ssl, hmac, secrets, base64, time, subprocess, re, select
+from urllib import parse as parse_url
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Union
 from requests import Response
@@ -57,8 +58,8 @@ def _load_hmac_secret() -> str:
 
 def _sign_http_request(method: str, path_url: str, timestamp: str, nonce: str, body_bytes: bytes) -> str:
     # Match Flask request canonicalization: decoded path + raw encoded query string.
-    split = urllib.parse.urlsplit(path_url)
-    canonical_path = urllib.parse.unquote(split.path)
+    split = parse_url.urlsplit(path_url)
+    canonical_path = parse_url.unquote(split.path)
     canonical_target = canonical_path if not split.query else f'{canonical_path}?{split.query}'
     payload = '\n'.join(
         [
@@ -602,31 +603,11 @@ def launch_remote_interactive_executable_stream(server_addr: tuple[str, int], co
 
 
 def retrieve_file(server_addr:tuple[str, int], path) -> bool:
-    app_name = get_appname()
-    url = _build_server_url(server_addr, f'/retrieve_files/{app_name}/{path}')
-    dct = {'paths': [path]}
-    ran_successfully = True
-    try:
-        resp:Response = _secure_request('GET', url, params=dct)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        print(f'Failed to retrieve file {path}.  Error message: {e}')
-        return False
-
-    under_write_count = 0
-    
-    if len(resp.content) < 1*MB:
-        chunk_size = 16 * KB
-        with open(path, 'wb') as f:
-            for chunk in resp.iter_content(chunk_size=chunk_size):
-                num_bytes_written = f.write(chunk)
-                if num_bytes_written != chunk_size:
-                    under_write_count += 1
-
-    #a single "under_write" (writing less than chunk_size bytes) is normal, and expected to happen... well actually about 99.994% of the time.  So it's pretty normal
-    #but I use <=1 instead of just <1 because it IS 99.994% of the time, not 100% (the other 0.006% is when it is 0.  Otherwise something ACTUALLY went wrong)
-    ran_successfully = ran_successfully and (under_write_count <= 1)
-    return ran_successfully
+    rel_path = unix_path(path)
+    success = receive_files_from_server(server_addr, [rel_path])
+    if not success:
+        print(f'Failed to retrieve file {rel_path} from server via sendfilesfromserver transfer')
+    return success
 
 def enable_pairing(server_addr:tuple[str, int]) -> bool:
     ip, port = server_addr
@@ -702,7 +683,7 @@ def discover_server(require_pairing: bool = False, target_ip: Optional[str] = No
     elif not ports_part.startswith('ports|'):
         print(f'ERROR: Did not receive valid port list from server in discovery response.  Receieved: {ports_part}')
         return _https_fallback()
-    
+
     ports_dict_str = ports_part.split('|', 1)[-1]
     response_obj: dict[str, Union[str, int]] = {}
 
@@ -744,7 +725,7 @@ def discover_server(require_pairing: bool = False, target_ip: Optional[str] = No
     return discovered_server_ip, response_obj
 
 
-def start_build_job(server_addr:tuple[str, int], git_diff_path:str, changed_binary_paths:list[str]=[], args:list[str]=[]) -> str:
+def start_build_job(server_addr:tuple[str, int], git_diff_path:str, changed_binary_paths:list[str]=[], args:list[str]=[]) -> Response:
     app_name = get_appname()
     url = _build_server_url(server_addr, f'/start-build-job/{app_name}')
     filename = git_diff_path.split('/')[-1]
@@ -1174,21 +1155,22 @@ def send_files(server_addr:tuple[str, int], paths:list[str], filesize_threshold:
 
 
 
-def apply_patch_server(server_addr:tuple[str, int], patch_path:str=None) -> Response:
+def apply_patch_server(server_addr:tuple[str, int], patch_path:str='') -> Response:
     app_name = get_appname()
+    project_root = get_project_root_path()
     if not patch_path:
         patch_path = os.path.join(get_runtime_dir_path(), 'gitdiff.diff')
     if not os.path.exists(patch_path):
         patch_path, _ = prepare_text_changes()
-        git_diff_filepath
+    patch_path = _to_repo_relative_posix(patch_path, project_root)
     url = _build_server_url(server_addr, f'/apply-patch-server/{app_name}')
     resp:Response = _secure_request('GET', url, params={'patch_path': patch_path})
     return resp
-    
+
 
 
 #Sort of like git push, but for uncommited changes and specifically from the server
-def send_current_changes(server_addr:tuple[str, int]) -> bool:
+def send_current_changes(server_addr:tuple[str, int]) -> Response:
     git_diff_path, changed_binary_paths = prepare_text_changes()
     paths = [os.path.join(get_runtime_dir_path(), 'gitdiff.diff'), *changed_binary_paths]
     print('sending paths:')
@@ -1200,7 +1182,7 @@ def send_current_changes(server_addr:tuple[str, int]) -> bool:
     patch_rel_path = _to_repo_relative_posix(git_diff_path, get_project_root_path())
     resp:Response = apply_patch_server(server_addr, patch_rel_path)
     resp.raise_for_status()
-    return True
+    return resp
 
 def retrieve_current_text_changes(server_addr:tuple[str, int], save_as_filename='gitdiff.diff') -> bool:
     app_name = get_appname()
@@ -1248,6 +1230,182 @@ def retrieve_current_changes(server_addr:tuple[str, int], exclude_binary_changes
             retrieved_binary_changes = receive_files_from_server(server_addr, paths)
             return retrieved_text_changes and retrieved_binary_changes
     return retrieved_text_changes
+
+def get_changed_server_files(server_addr:tuple[str, int], app_name:str, scope='repo') -> Union[tuple[list[str], list[str]], bool]:
+    url = _build_server_url(server_addr, f'/retrieve_changed_file_paths/{app_name}/{scope}')
+    try:
+        resp = _secure_request('GET', url, stream=True, timeout=120)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        print(f'Failed to retrieve changed file path lst: {e}')
+        return False
+    if not resp.text:
+        print(f'No changed files returned by server (reason not specified)')
+        return False
+
+    try:
+        resp_json_obj:dict = json.loads(resp.text)
+        changed_plainpaths_server = resp_json_obj['plaintext_file_paths']
+        changed_binarypaths_server = resp_json_obj['binary_file_paths']
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        print(f'Invalid changed file paths payload from server: {e}')
+        return False
+    #respect scope settings in case the default 'repo' argument is not used
+    if scope == 'cwd':
+        cwd = os.getcwd()
+        changed_plainpaths_server = [path for path in changed_plainpaths_server if is_subdir(path, cwd)]
+        changed_binarypaths_server = [path for path in changed_binarypaths_server if is_subdir(path, cwd)]
+
+    return changed_plainpaths_server, changed_binarypaths_server
+
+
+
+def sync_uncommitted_changes(server_addr:tuple[str, int]) -> bool:
+    '''Performs two way sync with server of all UNCOMMITTED changes.'''
+    project_root_path = get_project_root_path()
+    changed_fpaths_client = get_changed_file_paths()
+    changed_plainpaths_client, changed_binarypaths_client = split_paths_by_text_or_binary(changed_fpaths_client)
+    changed_server_result = get_changed_server_files(server_addr, get_appname())
+    if not changed_server_result:
+        print('sync_uncommitted_changes failed at get_changed_server_files')
+        return False
+    changed_plainpaths_server, changed_binarypaths_server = changed_server_result
+
+    client_only_plainpaths = [path for path in changed_plainpaths_client if path not in changed_plainpaths_server]
+    server_only_plainpaths = [path for path in changed_plainpaths_server if path not in changed_plainpaths_client]
+
+    client_only_binarypaths = [path for path in changed_binarypaths_client if path not in changed_binarypaths_server]
+    server_only_binarypaths = [path for path in changed_binarypaths_server if path not in changed_binarypaths_client]
+
+    both_plainpaths = [path for path in changed_plainpaths_client if path in changed_plainpaths_server]
+    both_binarypaths = [path for path in changed_binarypaths_client if path in changed_binarypaths_server]
+
+    #path to newly created diff representing the changes on the client.
+    #It needs to be sent to the server (along with changed binary files being sent directly)
+    diff_to_send_path = get_diff_for_files(client_only_plainpaths, 'client_side_gitdiff.diff')
+    for _ in range(10):
+        print(f'diff_to_send_path: {diff_to_send_path}')
+
+    #send the client-side diff and changed/new binaries on client side to server
+    success = send_files(server_addr, [diff_to_send_path, *client_only_binarypaths])
+    if not success:
+        print('sync_uncommitted_changes failed at send_files (client-only changes)')
+        return False
+
+    #apply the client only text changes to the server
+    try:
+        resp = apply_patch_server(server_addr, diff_to_send_path)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        print(f'sync_uncommitted_changes failed at apply_patch_server (client-only changes): {e}')
+        return False
+
+    #path to newly created diff, which holds the patch for specifically and only the files in server_only_plainpaths
+    #this diff needs to be applied locally, to the client
+    if server_only_plainpaths:
+        diff_to_use_path = retrieve_diff_for_files(server_addr, server_only_plainpaths)
+        if not diff_to_use_path:
+            print('sync_uncommitted_changes failed at retrieve_diff_for_files (server-only changes)')
+            return False
+
+        #apply server only text changes to client
+        apply_patch(diff_to_use_path)
+
+    for binary_path in server_only_binarypaths:
+        success = retrieve_file(server_addr, binary_path)
+        if not success:
+            print(f'Failed to retrieve binary file {binary_path} from the server')
+            return False
+
+
+    #idk, just a random folder name to put all of the versions of the files in
+    work_path = os.path.join(get_runtime_dir_path(), '.working')
+    if not os.path.exists(work_path):
+        os.mkdir(work_path)
+    else:
+        clear_directory(work_path)
+
+
+
+    for path in both_plainpaths:
+        if not dir_is_empty(work_path):
+            clear_directory(work_path)
+
+        filename = os.path.split(path)[1]
+        file_ext = filename.split('.')[-1]
+
+        client_version_path = os.path.join(work_path, f'client.{file_ext}')
+        server_version_path = os.path.join(work_path, f'server.{file_ext}')
+        base_version_path = os.path.join(work_path, f'base.{file_ext}')
+        rel_path = _to_repo_relative_posix(path, project_root_path)
+
+
+
+        #copy the current local (client) version as is to {work_path}/client.{file_ext}
+        shutil.copy2(path, client_version_path)
+        #retrieve the server version into the same repo path temporarily
+        success = retrieve_file(server_addr, path)
+        if not success:
+            print(f'sync_uncommitted_changes failed at retrieve_file (shared plaintext): {path}')
+            return False
+        #copy the server version (the file at {path} is now the server version due to retrieve_file) to {work_path}/server.{file_ext}
+        shutil.copy2(path, server_version_path)
+        #restore the local file so conflicts/failures do not leave the repo clobbered
+        shutil.copy2(client_version_path, path)
+
+        
+
+        #run 'git show HEAD:{rel_path} > {base_version_path}' to save the base version to {base_version_path}
+        with open(base_version_path, 'wb') as base_version_file:
+            show_proc = subprocess.run(
+                ['git', 'show', f'HEAD:{rel_path}'],
+                stdout=base_version_file,
+                stderr=subprocess.PIPE,
+                cwd=project_root_path,
+            )
+        if show_proc.returncode != 0:
+            err = show_proc.stderr.decode(errors='replace') if show_proc.stderr else ''
+            print(f'Error running git show HEAD:{rel_path}. {err}')
+            return False
+
+        #normalize line endings for all 3 file versions in the working directory
+        normalize_file_line_endings(client_version_path)
+        normalize_file_line_endings(server_version_path)
+        normalize_file_line_endings(base_version_path)
+
+
+        merge_proc = subprocess.run(
+            ['git', 'merge-file', client_version_path, base_version_path, server_version_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=project_root_path,
+        )
+
+        if merge_proc.returncode == 0:
+            #git merge-file ran successfully, the updated version is now in client_version_path
+            shutil.copy2(client_version_path, path)
+            success = send_files(server_addr, [path])
+            if not success:
+                print(f'sync_uncommitted_changes failed at send_files (merged plaintext): {path}')
+                return False
+
+        elif merge_proc.returncode == 1:
+            print(f'There is a conflict, the client and server versions of file located at {path} cannot be merged')
+        else:
+            err = merge_proc.stderr.decode(errors='replace') if merge_proc.stderr else ''
+            print(f'git merge-file failed for {path}. {err}')
+            return False
+
+
+        clear_directory(work_path)
+
+    return True
+
+
+
+
+
+
 
 
 
@@ -1885,15 +2043,15 @@ def reconcile_git_state(server_addr:tuple[str, int], app_name:str='') -> dict:
     )
 
 
-def retrieve_diff_for_files(server_addr:tuple[str, int], paths:list[str]) -> str:
+def retrieve_diff_for_files(server_addr:tuple[str, int], paths:list[str]) -> Union[str, bool]:
     app_name:str = get_appname()
     url = _build_server_url(server_addr, f'/retrieve_diff_for_files/{app_name}')
     try:
         resp:Response = _secure_request('POST', url, json_data={'filepaths': paths}, timeout=120)
         resp.raise_for_status()
     except requests.RequestException as e:
-        print(f"Failed to retrieve diff for specified files: {','.join(paths)[1:]}")
-        return []
+        print(f"Failed to retrieve diff for specified files ({len(paths)} paths): {e}")
+        return False
 
     runtime_dir_path = get_runtime_dir_path()
     git_diff_name = 'specific_files_gitdiff.diff'
@@ -1918,7 +2076,7 @@ def retrieve_diff_for_files(server_addr:tuple[str, int], paths:list[str]) -> str
 
 
 
-    
+
 
 
 
@@ -1935,28 +2093,33 @@ def sync_changes_with_server(server_addr:tuple[str, int], sync_branches=False, s
         if reconcile_result.get('actions_applied'):
             print(f"Actions applied before stop: {', '.join(reconcile_result['actions_applied'])}")
         return False
-    ############################################################################################################################  
+    ############################################################################################################################
 
     ################################################# Sync uncommitted changes #################################################
-    url = _build_server_url(server_addr, f'/retrieve_changed_file_paths/{app_name}/{scope}')
+    # url = _build_server_url(server_addr, f'/retrieve_changed_file_paths/{app_name}/{scope}')
     changed_fpaths_client = get_changed_file_paths(scope)
     changed_plainpaths_client, changed_binarypaths_client = split_paths_by_text_or_binary(changed_fpaths_client)
 
-    try:
-        resp = _secure_request('GET', url, stream=True, timeout=120)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        print(f'Failed to retrieve changed file path lst: {e}')
-        return False
-    if not resp.text:
-        print(f'No changed files returned by server (reason not specified)')
-        return False
+    # try:
+    #     resp = _secure_request('GET', url, stream=True, timeout=120)
+    #     resp.raise_for_status()
+    # except requests.RequestException as e:
+    #     print(f'Failed to retrieve changed file path lst: {e}')
+    #     return False
+    # if not resp.text:
+    #     print(f'No changed files returned by server (reason not specified)')
+    #     return False
 
-    resp_json_obj:dict = json.loads(resp.text)
-    changed_plainpaths_server = resp_json_obj['plaintext_file_paths']
-    changed_binarypaths_server = resp_json_obj['binary_file_paths']
+    # resp_json_obj:dict = json.loads(resp.text)
+    changed_server_result = get_changed_server_files(server_addr, app_name, scope)
+    if not changed_server_result:
+        print('sync_changes_with_server failed at get_changed_server_files')
+        return False
+    changed_plainpaths_server, changed_binarypaths_server = changed_server_result
+    # changed_plainpaths_server = resp_json_obj['plaintext_file_paths']
+    # changed_binarypaths_server = resp_json_obj['binary_file_paths']
 
-    print(f'resp_json_obj: {resp_json_obj}')
+    # print(f'resp_json_obj: {resp_json_obj}')
 
     #Lists of paths of files that only have changes on the server
     server_only_plaintext_paths = [path for path in changed_plainpaths_server if path not in changed_plainpaths_client]
@@ -1973,6 +2136,9 @@ def sync_changes_with_server(server_addr:tuple[str, int], sync_branches=False, s
     #if there are any plaintext files only on the server, retrieve the diff for those specific files, and then apply the patch locally on the client
     if server_only_plaintext_paths:
         diff_path = retrieve_diff_for_files(server_addr, server_only_plaintext_paths)
+        if not diff_path:
+            print('sync_changes_with_server failed at retrieve_diff_for_files (server-only plaintext)')
+            return False
         apply_patch(diff_path)
 
     #if there are any binary files only on the server, retrieve each files and save to the same path locally on the client
@@ -1990,9 +2156,13 @@ def sync_changes_with_server(server_addr:tuple[str, int], sync_branches=False, s
         if not success:
             print(f'Failed to send client plaintext files patch to server')
             return False
-        resp = apply_patch_server(server_addr, client_diff_path)
-        resp.raise_for_status()
-        
+        try:
+            resp = apply_patch_server(server_addr, client_diff_path)
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            print(f'sync_changes_with_server failed at apply_patch_server (client-only plaintext): {e}')
+            return False
+
     if client_only_binary_paths:
         success = send_files(server_addr, client_only_binary_paths)
         if not success:
@@ -2006,13 +2176,13 @@ def sync_changes_with_server(server_addr:tuple[str, int], sync_branches=False, s
         print('There are shared binary files with changes.  Please resolve this manually')
 
     return True
-    
+
 
 
 def add_allowed_interactive_command(server_addr:tuple[str, int], command:str):
     '''Adds [command] to the list of allowed interactive commands.  Returns full list of all allowed interactive commands'''
     ip, port = server_addr
-    command_arg = urllib.parse.quote(command, safe='')
+    command_arg = parse_url.quote(command, safe='')
     url = f'https://{ip}:{port}/add_allowed_interactive_command/{command_arg}'
     resp = _secure_request('GET', url)
     resp.raise_for_status()
@@ -2022,13 +2192,13 @@ def add_allowed_interactive_command(server_addr:tuple[str, int], command:str):
 def remove_allowed_interactive_command(server_addr:tuple[str, int], command:str):
     '''Removes [command] from the list of allowed interactive commands.  Returns full list of all allowed interactive commands after removal of [command]'''
     ip, port = server_addr
-    command_arg = urllib.parse.quote(command, safe='')
+    command_arg = parse_url.quote(command, safe='')
     url = f'https://{ip}:{port}/remove_allowed_interactive_command/{command_arg}'
     resp = _secure_request('GET', url)
     resp.raise_for_status()
     allowed_interactive_commands = resp.json()
     return allowed_interactive_commands
-    
+
 def get_allowed_interactive_commands(server_addr:tuple[str, int]):
     '''Returns full list of allowed interactive commands'''
     ip, port = server_addr
@@ -2137,7 +2307,7 @@ if __name__ == '__main__':
                 )
                 exit()
 
-            
+
 
     # Ensure we have paired cert + shared secret; this requires active pairing window when missing.
     serverinfo_dict = _ensure_pairing_material(serverinfo_path, runtime_dir, existing_info=serverinfo_dict)
@@ -2157,12 +2327,12 @@ if __name__ == '__main__':
     file_socket_port = int(serverinfo_dict['file_socket_port'])
     interactive_wrapper_port = int(serverinfo_dict['interactive_wrapper_port'])
     server_addr = (server_ip, server_port)
- 
+
 
     update_gitignore()
 
 
-    
+
 
 
 
@@ -2194,7 +2364,10 @@ if __name__ == '__main__':
         else:
             print('Failed to retrieve changes from the server')
     elif 'sync' in arg:
-        sync_changes_with_server(server_addr)
+        if not (('unchanged' in arg) or ('uncomitted' in arg)):
+            sync_changes_with_server(server_addr)
+        else:
+            sync_uncommitted_changes(server_addr)
     elif 'sendfiles' in arg:
         if len(sys.argv) > 2:
             send_files(server_addr, [os.path.join(os.getcwd(), name) for name in sys.argv[2:]])
@@ -2222,4 +2395,4 @@ if __name__ == '__main__':
 
     else:
         print(f'Invalid argument: {arg}')
-    
+
