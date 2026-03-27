@@ -14,9 +14,13 @@ R = TypeVar("R", bound=subprocess.CompletedProcess)
 KB = 1024
 MB = KB * KB
 runtime_dir_name = '.remote-xcode-server'
+user_runtime_dir_name = '.remote_xcode_server'
 
 def get_runtime_dir_name() -> str:
     return runtime_dir_name
+
+def get_user_runtime_dir_name() -> str:
+    return user_runtime_dir_name
 
 def get_runtime_dir_path(cwd:Optional[str]=None) -> str:
     """Returns the directory Remote-Xcode-Server uses to save files on both client and server"""
@@ -24,6 +28,8 @@ def get_runtime_dir_path(cwd:Optional[str]=None) -> str:
         cwd = os.getcwd()
     return os.path.join(cwd, runtime_dir_name)
 
+def get_user_runtime_dir_path() -> str:
+    return os.path.join(get_user_home_dir(), user_runtime_dir_name)
 
 def unix_path(path:str) -> str:
     """Returns a POSIX compliant version of path"""
@@ -70,6 +76,13 @@ def get_project_root_path(cwd:str='.') -> str:
                 return current_path
         path_parts = path_parts[:-1]
     return cwd
+
+def get_user_home_dir() -> str:
+    home_dir_unsanitized = os.path.expanduser('~')
+    home_dir_path = unix_path(home_dir_unsanitized)
+    return home_dir_path
+
+
 
 def get_appname(cwd:str='') -> str:
     if not cwd:

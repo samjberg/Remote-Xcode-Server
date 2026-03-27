@@ -1,13 +1,14 @@
 import os
 from sys import platform
-from mcp_utils import get_project_root_path, get_runtime_dir_path, unix_path
+from mcp_utils import get_project_root_path, get_runtime_dir_path, get_user_runtime_dir_path, unix_path
 from subprocess import run
 
 cwd = os.getcwd()
 project_root_path = get_project_root_path(cwd)
 rxs_root_path = os.path.dirname(os.path.realpath(__file__)) #the root path where THIS SCRIPT is located.  Needed for locating the client script, which is in the same directory
 runtime_dir_path = get_runtime_dir_path(cwd)
-executables_path = os.path.join(runtime_dir_path, 'executables')
+user_runtime_path = get_user_runtime_dir_path()
+executables_path = os.path.join(user_runtime_path, 'executables')
 client_script_name = 'mcp_client.py'
 client_script_path = os.path.join(rxs_root_path, client_script_name)
 
@@ -85,6 +86,7 @@ def update_posix_path(new_path_directory):
 
 def ensure_environment_setup():
     #Create all necessary directories if they do not exist
+    #first create all necesesary directories (if they do not exist) within project root
     if not os.path.exists(runtime_dir_path):
         os.makedirs(runtime_dir_path)
     else:
@@ -92,6 +94,35 @@ def ensure_environment_setup():
             os.remove(runtime_dir_path)
             os.makedirs(runtime_dir_path)
 
+    
+    #next create all necessary directories in user home path (global info for all projects such as serverinfo)
+    if not os.path.exists(user_runtime_path):
+        os.makedirs(user_runtime_path)
+    else:
+        #case where for some reason user_runtime_path DOES exist, but is a file instead of directory.  Delete it and create it as directory
+        if not os.path.isdir(user_runtime_path):
+            os.remove(user_runtime_path)
+            os.makedirs(user_runtime_path)
+
+    certs_path = os.path.join(user_runtime_path, 'certs')
+    credentials_path = os.path.join(user_runtime_path, 'credentials')
+    #ensure existence of certs directory (~/.remote_xcode_server/certs)
+    if not os.path.exists(certs_path):
+        os.makedirs(certs_path)
+    else:
+        if not os.path.isdir(certs_path):
+            os.remove(certs_path)
+            os.makedirs(certs_path)
+
+    #ensure existence of credentials directory (~/.remote_xcode_server/credentials)
+    if not os.path.exists(credentials_path):
+        os.makedirs(credentials_path)
+    else:
+        if not os.path.isdir(credentials_path):
+            os.remove(credentials_path)
+            os.makedirs(credentials_path)
+
+    #ensure existence of executables directory
     if not os.path.exists(executables_path):
         os.makedirs(executables_path)
     else:

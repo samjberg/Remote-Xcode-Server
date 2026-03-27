@@ -15,6 +15,7 @@ interactive_wrapper_port = 40887
 pairing_duration_s = 60
 allowed_timestamp_skew_s = 120
 nonce_ttl_s = 300
+SECURITY_METADATA_FILENAME = 'security_metadata.json'
 
 # establish several filesystem level global variables
 cwd = unix_path(os.getcwd())
@@ -41,6 +42,7 @@ DISCOVERY_STATUS = {
 }
 DISCOVERY_LOCK = Lock()
 INTERACTIVE_SESSION_TTL_SECONDS = 120
+SERVER_SECURITY_METADATA: dict = {}
 
 
 def get_server_port() -> int:
@@ -48,7 +50,11 @@ def get_server_port() -> int:
 
 
 def _secrets_base_dir() -> str:
-    return os.path.join(get_runtime_dir_path(cwd), '.secrets')
+    return os.path.join(get_user_runtime_dir_path(), '.secrets')
+
+
+def _security_metadata_path() -> str:
+    return os.path.join(_secrets_base_dir(), SECURITY_METADATA_FILENAME)
 
 
 def get_tls_paths() -> tuple[str, str]:
@@ -67,7 +73,7 @@ def _generate_secret_key_hmac() -> str:
 
 def _generate_secret_pair(path: Optional[str] = None) -> tuple[str, str]:
     if not path:
-        path = get_runtime_dir_path()
+        path = get_user_runtime_dir_path()
     print('Generating self-signed certificates for HTTPS...')
     proc = subprocess.run(
         [
@@ -101,6 +107,61 @@ def get_hmac_secret() -> str:
     secret_path = _get_hmac_secret_path()
     with open(secret_path, 'r', encoding='utf-8') as f:
         return f.read().strip()
+
+
+def _sha256_hex(text: str) -> str:
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+def _current_security_fingerprints() -> tuple[str, str]:
+    cert_fingerprint = _sha256_hex(get_certificate())
+    hmac_fingerprint = _sha256_hex(get_hmac_secret())
+    return cert_fingerprint, hmac_fingerprint
+
+
+def _load_security_metadata() -> dict:
+    now = int(time.time())
+    cert_fingerprint, hmac_fingerprint = _current_security_fingerprints()
+    metadata_path = _security_metadata_path()
+    existing = {}
+    if os.path.exists(metadata_path):
+        try:
+            with open(metadata_path, 'r', encoding='utf-8') as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                existing = loaded
+        except Exception:
+            existing = {}
+
+    server_id = str(existing.get('server_id', '')).strip() or str(uuid4())
+    try:
+        security_epoch = int(existing.get('security_epoch', 0))
+    except (TypeError, ValueError):
+        security_epoch = 0
+    if security_epoch < 1:
+        security_epoch = 1
+
+    existing_cert_fp = str(existing.get('cert_fingerprint_sha256', '')).strip()
+    existing_hmac_fp = str(existing.get('hmac_fingerprint_sha256', '')).strip()
+    if existing and (existing_cert_fp != cert_fingerprint or existing_hmac_fp != hmac_fingerprint):
+        security_epoch += 1
+
+    metadata = {
+        'server_id': server_id,
+        'security_epoch': security_epoch,
+        'cert_fingerprint_sha256': cert_fingerprint,
+        'hmac_fingerprint_sha256': hmac_fingerprint,
+        'updated_at_unix': now,
+    }
+    with open(metadata_path, 'w', encoding='utf-8') as f:
+        json.dump(metadata, f)
+    return metadata
+
+
+def get_server_security_metadata() -> dict:
+    if not SERVER_SECURITY_METADATA:
+        raise RuntimeError('Server security metadata not initialized')
+    return dict(SERVER_SECURITY_METADATA)
 
 allowed_interactive_commands: list[str] = []
 executable_command_paths_dict: dict[str, str] = {}
@@ -228,6 +289,9 @@ def bootstrap_security_state() -> None:
     if not os.path.exists(secret_path):
         with open(secret_path, 'w', encoding='utf-8') as f:
             f.write(_generate_secret_key_hmac())
+
+    global SERVER_SECURITY_METADATA
+    SERVER_SECURITY_METADATA = _load_security_metadata()
 
     global SERVER_TLS_CONTEXT
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -407,9 +471,13 @@ def start_discovery_listener():
             pairing_enabled, expires_at = pairing_window_state()
             if pairing_enabled:
                 cert_one_line = get_certificate().replace('\n', '<nl>')
+                security_meta = get_server_security_metadata()
                 response_lines.append(f'certificate:{cert_one_line}')
                 response_lines.append(f'secret_key:{get_hmac_secret()}')
                 response_lines.append(f'pairing_expires_unix:{expires_at}')
+                response_lines.append(f"server_id:{security_meta['server_id']}")
+                response_lines.append(f"security_epoch:{security_meta['security_epoch']}")
+                response_lines.append(f"cert_fingerprint_sha256:{security_meta['cert_fingerprint_sha256']}")
         except Exception as e:
             with DISCOVERY_LOCK:
                 DISCOVERY_STATUS['last_error'] = f'build_response_error:{e}'
@@ -1209,6 +1277,7 @@ def pairing_bootstrap():
     if not pairing_enabled:
         return jsonify({'ok': False, 'error': 'pairing_disabled_or_expired'}), 403
     cert_one_line = get_certificate().replace('\n', '<nl>')
+    security_meta = get_server_security_metadata()
     return jsonify(
         {
             'ok': True,
@@ -1220,12 +1289,16 @@ def pairing_bootstrap():
             'interactive_wrapper_port': interactive_wrapper_port,
             'certificate': cert_one_line,
             'secret_key': get_hmac_secret(),
+            'server_id': security_meta['server_id'],
+            'security_epoch': security_meta['security_epoch'],
+            'cert_fingerprint_sha256': security_meta['cert_fingerprint_sha256'],
         }
     )
 
 
 @app.route('/discovery-status')
 def discovery_status():
+    security_meta = get_server_security_metadata()
     with DISCOVERY_LOCK:
         return jsonify(
             {
@@ -1234,6 +1307,9 @@ def discovery_status():
                 'server_socket_port': server_socket_port,
                 'file_socket_port': file_socket_port,
                 'interactive_wrapper_port': interactive_wrapper_port,
+                'server_id': security_meta['server_id'],
+                'security_epoch': security_meta['security_epoch'],
+                'cert_fingerprint_sha256': security_meta['cert_fingerprint_sha256'],
                 **DISCOVERY_STATUS,
             }
         )

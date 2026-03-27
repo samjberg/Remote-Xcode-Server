@@ -10,7 +10,7 @@ from environment_setup import ensure_environment_setup
 
 discovery_socket_port = 9346
 allowed_timestamp_skew_s = 120
-SECURITY_SCHEMA_VERSION = 2
+SECURITY_SCHEMA_VERSION = 3
 discovery_response_max_bytes = 64 * KB
 discovery_attempts = 3
 DEFAULT_SERVER_PORT = 8751
@@ -22,7 +22,8 @@ SERVER_INFO: dict = {}
 SERVER_CERT_PATH = ''
 SERVER_SECRET_PATH = ''
 SERVER_REQUEST_SESSION: Optional[requests.Session] = None
-GLOBAL_SERVERINFO_CACHE_PATH = os.path.join(os.path.expanduser('~'), '.remote_xcode_server_serverinfo.json')
+user_runtime_dir = get_user_runtime_dir_path()
+GLOBAL_SERVERINFO_CACHE_PATH = os.path.join(user_runtime_dir, '.remote_xcode_server_serverinfo.json')
 
 def configure_stdio():
     """Ensure redirected output can represent UTF-8 build logs on Windows."""
@@ -152,6 +153,10 @@ def _default_connection_metadata(server_port: Optional[int] = None) -> dict:
     }
 
 
+def _ensure_user_runtime_dir_exists() -> None:
+    os.makedirs(user_runtime_dir, exist_ok=True)
+
+
 def _fetch_pairing_bundle_https(
     server_ip: str,
     server_port: int = DEFAULT_SERVER_PORT,
@@ -169,7 +174,17 @@ def _fetch_pairing_bundle_https(
         obj = resp.json()
     except ValueError:
         return None
-    required = {'server_port', 'server_socket_port', 'file_socket_port', 'certificate', 'secret_key', 'expires_at_unix'}
+    required = {
+        'server_port',
+        'server_socket_port',
+        'file_socket_port',
+        'certificate',
+        'secret_key',
+        'expires_at_unix',
+        'server_id',
+        'security_epoch',
+        'cert_fingerprint_sha256',
+    }
     if not obj.get('ok', False) or not required.issubset(set(obj.keys())):
         return None
     if 'interactive_wrapper_port' not in obj:
@@ -286,6 +301,17 @@ def _probe_discovery_status_https(server_ip: str, server_port: int, timeout_s: f
             out[key] = int(obj.get(key, fallback))
         except (TypeError, ValueError):
             out[key] = fallback
+    server_id = str(obj.get('server_id', '')).strip()
+    cert_fp = str(obj.get('cert_fingerprint_sha256', '')).strip()
+    try:
+        security_epoch = int(obj.get('security_epoch'))
+    except (TypeError, ValueError):
+        return None
+    if not server_id or not cert_fp:
+        return None
+    out['server_id'] = server_id
+    out['security_epoch'] = security_epoch
+    out['cert_fingerprint_sha256'] = cert_fp
     return out
 
 
@@ -351,6 +377,7 @@ def _discover_server_via_https_probe(require_pairing: bool = False, target_ip: O
 
 
 def _load_global_serverinfo_cache() -> dict:
+    _ensure_user_runtime_dir_exists()
     if not os.path.exists(GLOBAL_SERVERINFO_CACHE_PATH):
         return {}
     try:
@@ -375,15 +402,16 @@ def _save_global_serverinfo_cache(serverinfo: dict) -> None:
         'interactive_wrapper_port': int(serverinfo['interactive_wrapper_port']),
     }
     try:
+        _ensure_user_runtime_dir_exists()
         with open(GLOBAL_SERVERINFO_CACHE_PATH, 'w', encoding='utf-8') as f:
             json.dump(obj, f)
     except Exception:
         pass
 
 
-def _get_client_security_paths(runtime_dir: str) -> tuple[str, str]:
-    cert_dir = os.path.join(runtime_dir, 'certs')
-    cred_dir = os.path.join(runtime_dir, 'credentials')
+def _get_client_security_paths(user_runtime_dir: str) -> tuple[str, str]:
+    cert_dir = os.path.join(user_runtime_dir, 'certs')
+    cred_dir = os.path.join(user_runtime_dir, 'credentials')
     return os.path.join(cert_dir, 'server_cert.pem'), os.path.join(cred_dir, 'hmac_secret.txt')
 
 
@@ -391,15 +419,19 @@ def _cert_fingerprint(cert_text: str) -> str:
     return _bytes_to_sha256_hex(cert_text.encode('utf-8'))
 
 
-def _ensure_pairing_material(serverinfo_path: str, runtime_dir: str, existing_info: Optional[dict] = None) -> dict:
+def _ensure_pairing_material(serverinfo_path: str, user_runtime_dir: str, existing_info: Optional[dict] = None) -> dict:
     info = {} if not isinstance(existing_info, dict) else dict(existing_info)
-    cert_path, secret_path = _get_client_security_paths(runtime_dir)
+    cert_path, secret_path = _get_client_security_paths(user_runtime_dir)
     security = info.get('security', {}) if isinstance(info.get('security', {}), dict) else {}
     has_security_files = os.path.exists(cert_path) and os.path.exists(secret_path)
     has_security_meta = (
         isinstance(security.get('cert_relpath', ''), str)
         and isinstance(security.get('secret_relpath', ''), str)
         and isinstance(security.get('cert_fingerprint_sha256', ''), str)
+        and isinstance(security.get('server_id', ''), str)
+        and isinstance(security.get('security_epoch', 0), int)
+        and isinstance(security.get('paired_at_unix', 0), int)
+        and isinstance(security.get('last_validated_unix', 0), int)
     )
     if has_security_files and has_security_meta and info.get('schema_version') == SECURITY_SCHEMA_VERSION:
         return info
@@ -444,23 +476,28 @@ def _ensure_pairing_material(serverinfo_path: str, runtime_dir: str, existing_in
         discovery_info.get('interactive_wrapper_port', _env_int('RXS_INTERACTIVE_WRAPPER_PORT', DEFAULT_INTERACTIVE_WRAPPER_PORT))
     )
     info['security'] = {
-        'cert_relpath': unix_path(os.path.relpath(cert_path, runtime_dir)),
-        'secret_relpath': unix_path(os.path.relpath(secret_path, runtime_dir)),
+        'cert_relpath': unix_path(os.path.relpath(cert_path, user_runtime_dir)),
+        'secret_relpath': unix_path(os.path.relpath(secret_path, user_runtime_dir)),
         'cert_fingerprint_sha256': _cert_fingerprint(cert_text),
+        'server_id': str(discovery_info['server_id']).strip(),
+        'security_epoch': int(discovery_info['security_epoch']),
+        'paired_at_unix': int(time.time()),
+        'last_validated_unix': int(time.time()),
     }
+    _ensure_user_runtime_dir_exists()
     with open(serverinfo_path, 'w', encoding='utf-8') as f:
         json.dump(info, f)
     return info
 
 
-def _initialize_security_context(runtime_dir: str, serverinfo_dict: dict) -> None:
+def _initialize_security_context(user_runtime_dir: str, serverinfo_dict: dict) -> None:
     global SERVER_INFO, SERVER_CERT_PATH, SERVER_SECRET_PATH, SERVER_REQUEST_SESSION
     SERVER_INFO = dict(serverinfo_dict)
     security = SERVER_INFO.get('security', {})
     cert_rel = security.get('cert_relpath', 'certs/server_cert.pem')
     secret_rel = security.get('secret_relpath', 'credentials/hmac_secret.txt')
-    SERVER_CERT_PATH = os.path.join(runtime_dir, cert_rel)
-    SERVER_SECRET_PATH = os.path.join(runtime_dir, secret_rel)
+    SERVER_CERT_PATH = os.path.join(user_runtime_dir, cert_rel)
+    SERVER_SECRET_PATH = os.path.join(user_runtime_dir, secret_rel)
     if not os.path.exists(SERVER_CERT_PATH) or not os.path.exists(SERVER_SECRET_PATH):
         raise RuntimeError('Missing paired security files. Re-run pairing.')
     expected_fp = str(security.get('cert_fingerprint_sha256', '')).strip()
@@ -470,6 +507,49 @@ def _initialize_security_context(runtime_dir: str, serverinfo_dict: dict) -> Non
         if actual_fp != expected_fp:
             raise RuntimeError('Local server certificate fingerprint mismatch. Re-run pairing.')
     SERVER_REQUEST_SESSION = None
+
+
+def _validate_server_security_state(serverinfo_path: str, serverinfo_dict: dict) -> dict:
+    info = dict(serverinfo_dict)
+    security = info.get('security', {}) if isinstance(info.get('security', {}), dict) else {}
+    if not security:
+        raise RuntimeError('Missing security metadata. Re-run pairing.')
+    hint_ip = str(info.get('server_ip', '')).strip() or os.environ.get('RXS_SERVER_IP', '').strip() or None
+    discovery_result = _discover_server_via_https_probe(require_pairing=False, target_ip=hint_ip)
+    if discovery_result is None:
+        raise RuntimeError(
+            'Unable to validate server security metadata before secure operations. '
+            'Ensure the server is running and reachable, then retry.'
+        )
+    server_ip, discovered_info = discovery_result
+    discovered_server_id = str(discovered_info.get('server_id', '')).strip()
+    stored_server_id = str(security.get('server_id', '')).strip()
+    if discovered_server_id != stored_server_id:
+        raise RuntimeError('Paired server identity changed. Re-run pairing (pair/enable-pairing).')
+
+    discovered_epoch = int(discovered_info.get('security_epoch', -1))
+    stored_epoch = int(security.get('security_epoch', -1))
+    if discovered_epoch != stored_epoch:
+        raise RuntimeError('Server security material changed. Re-run pairing (pair/enable-pairing).')
+
+    discovered_cert_fp = str(discovered_info.get('cert_fingerprint_sha256', '')).strip()
+    stored_cert_fp = str(security.get('cert_fingerprint_sha256', '')).strip()
+    if discovered_cert_fp != stored_cert_fp:
+        raise RuntimeError('Server certificate fingerprint changed. Re-run pairing (pair/enable-pairing).')
+
+    info['server_ip'] = server_ip
+    info['server_port'] = int(discovered_info['server_port'])
+    info['server_socket_port'] = int(discovered_info['server_socket_port'])
+    info['file_socket_port'] = int(discovered_info['file_socket_port'])
+    info['interactive_wrapper_port'] = int(
+        discovered_info.get('interactive_wrapper_port', _env_int('RXS_INTERACTIVE_WRAPPER_PORT', DEFAULT_INTERACTIVE_WRAPPER_PORT))
+    )
+    security['last_validated_unix'] = int(time.time())
+    info['security'] = security
+    _ensure_user_runtime_dir_exists()
+    with open(serverinfo_path, 'w', encoding='utf-8') as f:
+        json.dump(info, f)
+    return info
 
 
 def _make_client_tls_context() -> ssl.SSLContext:
@@ -670,7 +750,14 @@ def discover_server(require_pairing: bool = False, target_ip: Optional[str] = No
         response_obj[key.strip()] = int(val.strip())
 
     extra_lines = resp_parts[2:]
-    allowed_keys = {'certificate', 'secret_key', 'pairing_expires_unix'}
+    allowed_keys = {
+        'certificate',
+        'secret_key',
+        'pairing_expires_unix',
+        'server_id',
+        'security_epoch',
+        'cert_fingerprint_sha256',
+    }
     for line in extra_lines:
         if ':' not in line:
             print(f'Invalid discovery line format: {line}')
@@ -680,16 +767,31 @@ def discover_server(require_pairing: bool = False, target_ip: Optional[str] = No
         if key not in allowed_keys:
             print(f'Unknown discovery key: {key}')
             return _https_fallback()
-        response_obj[key] = val.strip()
+        cleaned_val = val.strip()
+        if key in {'pairing_expires_unix', 'security_epoch'}:
+            try:
+                response_obj[key] = int(cleaned_val)
+            except ValueError:
+                print(f'Invalid integer discovery value for {key}: {cleaned_val}')
+                return _https_fallback()
+        else:
+            response_obj[key] = cleaned_val
 
     if require_pairing:
-        required_pairing_keys = {'certificate', 'secret_key', 'pairing_expires_unix'}
+        required_pairing_keys = {
+            'certificate',
+            'secret_key',
+            'pairing_expires_unix',
+            'server_id',
+            'security_epoch',
+            'cert_fingerprint_sha256',
+        }
         if not required_pairing_keys.issubset(set(response_obj.keys())):
             print('Discovery response did not include pairing credentials. Pairing may be disabled or expired.')
             return _https_fallback()
         try:
-            pairing_exp = int(str(response_obj['pairing_expires_unix']))
-        except ValueError:
+            pairing_exp = int(response_obj['pairing_expires_unix'])
+        except (TypeError, ValueError):
             print('Invalid pairing_expires_unix value from discovery response')
             return _https_fallback()
         now = int(time.time())
@@ -2118,6 +2220,7 @@ if __name__ == '__main__':
     configure_stdio()
     if not os.path.exists(os.path.join(os.path.expanduser('~'), '.remote_xcode_env')):
         ensure_environment_setup()
+    _ensure_user_runtime_dir_exists()
 
     cwd = unix_path(os.getcwd())
     BUILD_SUCCESS = '** BUILD SUCCEEDED **'
@@ -2142,7 +2245,7 @@ if __name__ == '__main__':
 
 
     # Try to find saved server info (ip and various ports) in serverinfo.txt.
-    serverinfo_path = os.path.join(runtime_dir, 'serverinfo.txt')
+    serverinfo_path = os.path.join(user_runtime_dir, 'serverinfo.txt')
     serverinfo_dict = {}
     if os.path.exists(serverinfo_path):
         with open(serverinfo_path, 'r', encoding='utf-8') as f:
@@ -2211,10 +2314,11 @@ if __name__ == '__main__':
 
 
     # Ensure we have paired cert + shared secret; this requires active pairing window when missing.
-    serverinfo_dict = _ensure_pairing_material(serverinfo_path, runtime_dir, existing_info=serverinfo_dict)
+    serverinfo_dict = _ensure_pairing_material(serverinfo_path, user_runtime_dir, existing_info=serverinfo_dict)
+    serverinfo_dict = _validate_server_security_state(serverinfo_path, serverinfo_dict)
     if 'interactive_wrapper_port' not in serverinfo_dict:
         serverinfo_dict['interactive_wrapper_port'] = _env_int('RXS_INTERACTIVE_WRAPPER_PORT', DEFAULT_INTERACTIVE_WRAPPER_PORT)
-    _initialize_security_context(runtime_dir, serverinfo_dict)
+    _initialize_security_context(user_runtime_dir, serverinfo_dict)
     _save_global_serverinfo_cache(serverinfo_dict)
 
     required_keys = required_conn_keys
@@ -2319,4 +2423,3 @@ if __name__ == '__main__':
 
     else:
         print(f'Invalid argument: {arg}')
-
