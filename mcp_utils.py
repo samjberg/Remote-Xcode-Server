@@ -95,7 +95,20 @@ def get_ip():
         s.close()
     return IP
 
+def contains_any(text:str, candidates:list[str], case_sensitive:bool=True) -> bool:
+    '''Returns whether or not [text] contains any of the strings in [candidates]'''
+    if case_sensitive:
+        for candidate in candidates:
+            if candidate in text:
+                return True
+    else:
+        text = text.lower()
+        for candidate in candidates:
+            if candidate.lower() in text:
+                return True
+    return False
 
+    
 def clear_directory(path) -> None:
     for item_path in os.listdir(path):
         os.remove(os.path.join(path, item_path))
@@ -191,19 +204,17 @@ def normalize_file_line_endings(path:str, fmt='LF') -> None:
     if not os.path.exists(path):
         raise FileNotFoundError
 
-    #the newline=None option causes .read() to strip out ALL line endings, both LF and CRLF
-    with open(path, 'r', newline=None) as f:
-        lines = f.readlines()
+    with open(path, 'rb') as f:
+        text_bytes = f.read()
 
-    newline_str = '\n' if fmt == 'LF' else '\r\n'
+    lines_bytes = text_bytes.splitlines(keepends=False)
+    newline_bytes = b'\n' if fmt == 'LF' else b'\r\n'
 
-
-    with open(path, 'w', newline=newline_str) as f:
-        for line in lines:
+    #write over the file with normalized line endings
+    with open(path, 'wb') as f:
+        for line in lines_bytes:
             clean_line = line.rstrip()
-            f.write(clean_line + '\n')
-
-
+            f.write(clean_line + newline_bytes)
 
 
 #this insane P and R stuff with ParamSpec and TypeVar is just the insanity that is necessary to make typehints show up for functions

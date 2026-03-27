@@ -517,31 +517,6 @@ def _require_posix_tty_modules():
     return termios, tty
 
 
-# this function should be deleted after secure implementation is validated.
-def stream_remote_executable_simple(server_addr: tuple[str, int], command: str) -> None:
-    termios, tty = _require_posix_tty_modules()
-    old_settings = termios.tcgetattr(sys.stdin)
-    tty.setraw(sys.stdin.fileno())
-    interactive_wrapper_port = DEFAULT_INTERACTIVE_WRAPPER_PORT
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.connect((server_addr[0], interactive_wrapper_port))
-        try:
-            while True:
-                r, _, _ = select.select([sys.stdin, sock], [], [])
-                if sys.stdin in r:
-                    raw_user_keystrokes = os.read(sys.stdin.fileno(), 1 * KB)
-                    if not raw_user_keystrokes:
-                        break
-                    sock.sendall(raw_user_keystrokes)
-                if sock in r:
-                    data = sock.recv(4 * KB)
-                    if not data:
-                        break
-                    os.write(sys.stdout.fileno(), data)
-        finally:
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-
 
 def stream_remote_executable_from_server(
     server_addr: tuple[str, int],
@@ -1260,12 +1235,12 @@ def get_changed_server_files(server_addr:tuple[str, int], app_name:str, scope='r
 
 
 
-def sync_uncommitted_changes(server_addr:tuple[str, int]) -> bool:
+def sync_uncommitted_changes(server_addr:tuple[str, int], scope='repo') -> bool:
     '''Performs two way sync with server of all UNCOMMITTED changes.'''
     project_root_path = get_project_root_path()
-    changed_fpaths_client = get_changed_file_paths()
+    changed_fpaths_client = get_changed_file_paths(scope)
     changed_plainpaths_client, changed_binarypaths_client = split_paths_by_text_or_binary(changed_fpaths_client)
-    changed_server_result = get_changed_server_files(server_addr, get_appname())
+    changed_server_result = get_changed_server_files(server_addr, get_appname(), scope)
     if not changed_server_result:
         print('sync_uncommitted_changes failed at get_changed_server_files')
         return False
@@ -1283,8 +1258,6 @@ def sync_uncommitted_changes(server_addr:tuple[str, int]) -> bool:
     #path to newly created diff representing the changes on the client.
     #It needs to be sent to the server (along with changed binary files being sent directly)
     diff_to_send_path = get_diff_for_files(client_only_plainpaths, 'client_side_gitdiff.diff')
-    for _ in range(10):
-        print(f'diff_to_send_path: {diff_to_send_path}')
 
     #send the client-side diff and changed/new binaries on client side to server
     success = send_files(server_addr, [diff_to_send_path, *client_only_binarypaths])
@@ -1399,6 +1372,10 @@ def sync_uncommitted_changes(server_addr:tuple[str, int]) -> bool:
 
         clear_directory(work_path)
 
+    if both_binarypaths:
+        print(f'Unable to sync the following files due to being binary files with conflicting changes on client/server:')
+        for path in both_binarypaths:
+            print(f'\t{path}')
     return True
 
 
@@ -2076,106 +2053,30 @@ def retrieve_diff_for_files(server_addr:tuple[str, int], paths:list[str]) -> Uni
 
 
 
-
-
-
-
-
-def sync_changes_with_server(server_addr:tuple[str, int], sync_branches=False, scope='repo') -> bool:
+def sync_changes_with_server(server_addr:tuple[str, int], sync_branches=True, sync_uncommitted=True, scope='repo') -> bool:
     app_name = get_appname()
 
-    ########################### Reconcile actual git state (commit/branch) between client and server ###########################
-    reconcile_result = reconcile_git_state(server_addr, app_name=app_name)
-    reconcile_status = reconcile_result.get('status', RECONCILE_STATUS_ERROR)
-    if reconcile_status not in [RECONCILE_STATUS_ALIGNED, RECONCILE_STATUS_RECONCILED]:
-        print(f'Phase 1 reconcile blocked: {reconcile_status}')
-        print(f"Reason: {reconcile_result.get('message', '')}")
-        if reconcile_result.get('actions_applied'):
-            print(f"Actions applied before stop: {', '.join(reconcile_result['actions_applied'])}")
-        return False
-    ############################################################################################################################
-
-    ################################################# Sync uncommitted changes #################################################
-    # url = _build_server_url(server_addr, f'/retrieve_changed_file_paths/{app_name}/{scope}')
-    changed_fpaths_client = get_changed_file_paths(scope)
-    changed_plainpaths_client, changed_binarypaths_client = split_paths_by_text_or_binary(changed_fpaths_client)
-
-    # try:
-    #     resp = _secure_request('GET', url, stream=True, timeout=120)
-    #     resp.raise_for_status()
-    # except requests.RequestException as e:
-    #     print(f'Failed to retrieve changed file path lst: {e}')
-    #     return False
-    # if not resp.text:
-    #     print(f'No changed files returned by server (reason not specified)')
-    #     return False
-
-    # resp_json_obj:dict = json.loads(resp.text)
-    changed_server_result = get_changed_server_files(server_addr, app_name, scope)
-    if not changed_server_result:
-        print('sync_changes_with_server failed at get_changed_server_files')
-        return False
-    changed_plainpaths_server, changed_binarypaths_server = changed_server_result
-    # changed_plainpaths_server = resp_json_obj['plaintext_file_paths']
-    # changed_binarypaths_server = resp_json_obj['binary_file_paths']
-
-    # print(f'resp_json_obj: {resp_json_obj}')
-
-    #Lists of paths of files that only have changes on the server
-    server_only_plaintext_paths = [path for path in changed_plainpaths_server if path not in changed_plainpaths_client]
-    server_only_binary_paths = [path for path in changed_binarypaths_server if path not in changed_binarypaths_client]
-
-    #Lists of paths of files that only have changes on the client
-    client_only_plaintext_paths = [path for path in changed_plainpaths_client if path not in changed_plainpaths_server]
-    client_only_binary_paths = [path for path in changed_binarypaths_client if path not in changed_binarypaths_server]
-
-    #Lists of paths of files that have changes on both the client and ther server.  Note this does NOT necessarily mean that they have the SAME changes
-    shared_plaintext_paths = [path for path in changed_plainpaths_client if path in changed_plainpaths_server]
-    shared_binary_paths = [path for path in changed_binarypaths_client if path in changed_binarypaths_server]
-
-    #if there are any plaintext files only on the server, retrieve the diff for those specific files, and then apply the patch locally on the client
-    if server_only_plaintext_paths:
-        diff_path = retrieve_diff_for_files(server_addr, server_only_plaintext_paths)
-        if not diff_path:
-            print('sync_changes_with_server failed at retrieve_diff_for_files (server-only plaintext)')
+    if sync_branches:
+        reconcile_result = reconcile_git_state(server_addr, app_name=app_name)
+        reconcile_status = reconcile_result.get('status', RECONCILE_STATUS_ERROR)
+        if reconcile_status not in [RECONCILE_STATUS_ALIGNED, RECONCILE_STATUS_RECONCILED]:
+            print(f'Phase 1 reconcile blocked: {reconcile_status}')
+            print(f"Reason: {reconcile_result.get('message', '')}")
+            if reconcile_result.get('actions_applied'):
+                print(f"Actions applied before stop: {', '.join(reconcile_result['actions_applied'])}")
             return False
-        apply_patch(diff_path)
 
-    #if there are any binary files only on the server, retrieve each files and save to the same path locally on the client
-    if server_only_binary_paths:
-        success = receive_files_from_server(server_addr, server_only_binary_paths)
+    if sync_uncommitted:
+        success = sync_uncommitted_changes(server_addr, scope)
         if not success:
-            print('Failed to retrieve binary files from server via socket transfer')
+            print(f'Error: syncing uncommited changes failed')
             return False
-    #if there are any plaintext files only on the client, retrieve the diff for those specific files, and then apply the patch locally on the server
-    if client_only_plaintext_paths:
-        project_root_path = get_project_root_path()
-        client_diff_path = get_diff_for_files(client_only_plaintext_paths, 'client_plaintext_diff.diff')
-        client_diff_path = _to_repo_relative_posix(client_diff_path, project_root_path)
-        success = send_files(server_addr, [client_diff_path])
-        if not success:
-            print(f'Failed to send client plaintext files patch to server')
-            return False
-        try:
-            resp = apply_patch_server(server_addr, client_diff_path)
-            resp.raise_for_status()
-        except requests.RequestException as e:
-            print(f'sync_changes_with_server failed at apply_patch_server (client-only plaintext): {e}')
-            return False
-
-    if client_only_binary_paths:
-        success = send_files(server_addr, client_only_binary_paths)
-        if not success:
-            print(f'Failed to send new/changed client binary files to the server')
-
-    #####      Handle this later     #####
-    if shared_plaintext_paths:
-        #we can check if it is possible to apply both sets of changes without conflicts.  This may/can be possible
-        pass
-    if shared_binary_paths:
-        print('There are shared binary files with changes.  Please resolve this manually')
 
     return True
+
+
+
+
 
 
 
@@ -2334,12 +2235,15 @@ if __name__ == '__main__':
 
 
 
+    #list slicing does not raise an IndexError even if the list is empty
+    #args will just be an empty list if no argument is provided
+    args = sys.argv[1:]
 
-
-    if len(sys.argv) > 1:
-        arg = sys.argv[1]
+    if args:
+        arg = args[0]
     else:
-        arg = 'build'
+        print('Please provide an argument')
+        exit()
 
 
     if arg == 'build': #for now, just to allow for flexibility in testing
@@ -2364,10 +2268,30 @@ if __name__ == '__main__':
         else:
             print('Failed to retrieve changes from the server')
     elif 'sync' in arg:
-        if not (('unchanged' in arg) or ('uncomitted' in arg)):
+        subargs = args[1:]
+        if not subargs and arg=='sync':
             sync_changes_with_server(server_addr)
         else:
-            sync_uncommitted_changes(server_addr)
+            if '-scope' in sys.argv:
+                idx = sys.argv.index('-scope')
+                if len(sys.argv) > idx+1:
+                    scope = sys.argv[idx+1].lower()
+                else:
+                    scope = 'repo'
+            else:
+                scope = 'repo'
+
+            if contains_any(arg, ['unchanged', 'uncommitted']):
+                sync_changes_with_server(server_addr, sync_branches=False, sync_uncommitted=True, scope=scope)
+            elif contains_any(arg, ['branches', 'commits']):
+                sync_changes_with_server(server_addr, sync_branches=True, sync_uncommitted=False, scope=scope)
+
+
+            
+        # if not (('unchanged' in arg) or ('uncomitted' in arg)):
+        #     sync_changes_with_server(server_addr)
+        # else:
+        #     sync_uncommitted_changes(server_addr)
     elif 'sendfiles' in arg:
         if len(sys.argv) > 2:
             send_files(server_addr, [os.path.join(os.getcwd(), name) for name in sys.argv[2:]])
