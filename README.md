@@ -140,18 +140,18 @@ Note: the current implementation checks commands using substring matching (e.g. 
 The scripts create helper directories/files automatically:
 
 - Client:
-  - `~/.remote_xcode_server/serverinfo.txt`
-  - `~/.remote_xcode_server/certs/server_cert.pem`
-  - `~/.remote_xcode_server/credentials/hmac_secret.txt`
-  - `~/.remote_xcode_server/.remote_xcode_server_serverinfo.json`
+  - `~/.remote-xcode-server/serverinfo.txt`
+  - `~/.remote-xcode-server/certs/server_cert.pem`
+  - `~/.remote-xcode-server/credentials/hmac_secret.txt`
+  - `~/.remote-xcode-server/.remote_xcode_server_serverinfo.json`
 - Client project-local:
   - `.remote-xcode-server/gitdiff.diff`
 - Server:
   - `.remote-xcode-server/projectinfo.txt`
-  - `~/.remote_xcode_server/.secrets/tls/key.pem`
-  - `~/.remote_xcode_server/.secrets/tls/cert.pem`
-  - `~/.remote_xcode_server/.secrets/auth/hmac_secret.txt`
-  - `~/.remote_xcode_server/.secrets/security_metadata.json`
+  - `~/.remote-xcode-server/.secrets/tls/key.pem`
+  - `~/.remote-xcode-server/.secrets/tls/cert.pem`
+  - `~/.remote-xcode-server/.secrets/auth/hmac_secret.txt`
+  - `~/.remote-xcode-server/.secrets/security_metadata.json`
 
 Notes:
 
@@ -192,9 +192,9 @@ This project works fundamentally, but it is still early and buggy. Known limitat
 
 If credentials become invalid (clock skew, cert mismatch, signature errors), delete:
 
-- `~/.remote_xcode_server/serverinfo.txt`
-- `~/.remote_xcode_server/certs/server_cert.pem`
-- `~/.remote_xcode_server/credentials/hmac_secret.txt`
+- `~/.remote-xcode-server/serverinfo.txt`
+- `~/.remote-xcode-server/certs/server_cert.pem`
+- `~/.remote-xcode-server/credentials/hmac_secret.txt`
 
 Then re-enable pairing on the server and rerun the client.
 

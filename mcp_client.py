@@ -7,6 +7,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.poolmanager import PoolManager
 from mcp_utils import *
 from environment_setup import ensure_environment_setup
+from mcp_utils import _run_git_capture
 
 discovery_socket_port = 9346
 allowed_timestamp_skew_s = 120
@@ -24,6 +25,8 @@ SERVER_SECRET_PATH = ''
 SERVER_REQUEST_SESSION: Optional[requests.Session] = None
 user_runtime_dir = get_user_runtime_dir_path()
 GLOBAL_SERVERINFO_CACHE_PATH = os.path.join(user_runtime_dir, '.remote_xcode_server_serverinfo.json')
+
+
 
 def configure_stdio():
     """Ensure redirected output can represent UTF-8 build logs on Windows."""
@@ -637,9 +640,9 @@ def stream_remote_executable_from_server(
 def launch_remote_interactive_executable_stream(server_addr: tuple[str, int], command: str):
     _require_posix_tty_modules()
     ip, port = server_addr
-    app_name = get_appname()
-    url = _build_server_url(server_addr, f'/interactive/launch/{app_name}/{command}')
-    resp: Response = _secure_request('POST', url, json_data={})
+    project_name = get_appname()
+    url = _build_server_url(server_addr, f'/interactive/launch/{command}')
+    resp: Response = _secure_request('POST', url, params={'project_name': project_name}, json_data={})
     resp.raise_for_status()
     try:
         obj = resp.json()
@@ -803,8 +806,8 @@ def discover_server(require_pairing: bool = False, target_ip: Optional[str] = No
 
 
 def start_build_job(server_addr:tuple[str, int], git_diff_path:str, changed_binary_paths:list[str]=[], args:list[str]=[]) -> Response:
-    app_name = get_appname()
-    url = _build_server_url(server_addr, f'/start-build-job/{app_name}')
+    project_name = get_appname()
+    url = _build_server_url(server_addr, '/start-build-job')
     filename = git_diff_path.split('/')[-1]
 
     files = {'gitdiff': (filename, open(git_diff_path, 'rb'), 'text/plain', {'Expires': 0})}
@@ -817,7 +820,7 @@ def start_build_job(server_addr:tuple[str, int], git_diff_path:str, changed_bina
         files[f'binaryfile{i}'] = (path, open(path, 'rb'), mimetype, {'Expires': 0})
     print(f'Starting build job by making POST request to {url} sending a diff file located at {git_diff_path}\n')
     args_data = [('xcodebuild_args', xcodebuild_arg) for xcodebuild_arg in args]
-    resp = _secure_request('POST', url, data=args_data, files=files, timeout=300)
+    resp = _secure_request('POST', url, params={'project_name': project_name}, data=args_data, files=files, timeout=300)
     return resp
 
 def check_build_job(server_addr:tuple[str, int], job_id:str, offset:int=0) -> Response:
@@ -973,13 +976,19 @@ def _send_file_over_socket(
 
 def receive_files_from_server(server_addr: tuple[str, int], paths: list[str], chunk_size: int = 64 * KB) -> bool:
     ip, _ = server_addr
-    app_name = get_appname()
+    project_name = get_appname()
     rel_paths = [unix_path(path) for path in paths]
     transfer_id = str(uuid4())
-    init_url = _build_server_url(server_addr, f'/sendfilesfromserver/init/{app_name}')
+    init_url = _build_server_url(server_addr, '/sendfilesfromserver/init')
     init_payload = {'transfer_id': transfer_id, 'paths': rel_paths, 'chunk_size': chunk_size}
     try:
-        init_resp = _secure_request('POST', init_url, json_data=init_payload, timeout=120)
+        init_resp = _secure_request(
+            'POST',
+            init_url,
+            params={'project_name': project_name},
+            json_data=init_payload,
+            timeout=120,
+        )
         init_resp.raise_for_status()
     except requests.RequestException as e:
         print(f'Failed to initialize server->client transfer: {e}')
@@ -1109,9 +1118,14 @@ def receive_files_from_server(server_addr: tuple[str, int], paths: list[str], ch
                 if temp_path and os.path.exists(temp_path):
                     os.remove(temp_path)
 
-    complete_url = _build_server_url(server_addr, f'/sendfilesfromserver/complete/{app_name}')
+    complete_url = _build_server_url(server_addr, '/sendfilesfromserver/complete')
     try:
-        complete_resp = _secure_request('POST', complete_url, json_data={'transfer_id': transfer_id})
+        complete_resp = _secure_request(
+            'POST',
+            complete_url,
+            params={'project_name': project_name},
+            json_data={'transfer_id': transfer_id},
+        )
         complete_resp.raise_for_status()
     except requests.RequestException as e:
         print(f'Failed to complete server->client transfer: {e}')
@@ -1124,7 +1138,7 @@ def receive_files_from_server(server_addr: tuple[str, int], paths: list[str], ch
 
 
 def send_files(server_addr:tuple[str, int], paths:list[str], filesize_threshold:int=20*MB, total_threshold=50*MB) -> bool:
-    app_name = get_appname()
+    project_name = get_appname()
     project_root = get_project_root_path(os.getcwd())
     file_entries = []
     for path in paths:
@@ -1136,7 +1150,7 @@ def send_files(server_addr:tuple[str, int], paths:list[str], filesize_threshold:
 
     file_sizes = [entry['size'] for entry in file_entries]
     if all(size < filesize_threshold for size in file_sizes) and (sum(file_sizes) < total_threshold):
-        url = _build_server_url(server_addr, f'/sendfileshttp/{app_name}')
+        url = _build_server_url(server_addr, '/sendfileshttp')
         files = {}
         handles = []
         try:
@@ -1155,7 +1169,7 @@ def send_files(server_addr:tuple[str, int], paths:list[str], filesize_threshold:
                 handles.append(handle)
                 files[f'file{i}'] = (rel_path, handle, mimetype, {'Expires': 0})
 
-            resp = _secure_request('POST', url, files=files, timeout=300)
+            resp = _secure_request('POST', url, params={'project_name': project_name}, files=files, timeout=300)
         finally:
             for handle in handles:
                 handle.close()
@@ -1168,7 +1182,7 @@ def send_files(server_addr:tuple[str, int], paths:list[str], filesize_threshold:
         return True
 
     transfer_id = str(uuid4())
-    url = _build_server_url(server_addr, f'/sendfilessocket/init/{app_name}')
+    url = _build_server_url(server_addr, '/sendfilessocket/init')
     init_payload = {
         'transfer_id': transfer_id,
         'chunk_size': 64 * KB,
@@ -1181,7 +1195,13 @@ def send_files(server_addr:tuple[str, int], paths:list[str], filesize_threshold:
     last_err = None
     for _ in range(3):
         try:
-            init_resp = _secure_request('POST', url, json_data=init_payload, timeout=120)
+            init_resp = _secure_request(
+                'POST',
+                url,
+                params={'project_name': project_name},
+                json_data=init_payload,
+                timeout=120,
+            )
             init_resp.raise_for_status()
             break
         except requests.RequestException as e:
@@ -1221,8 +1241,13 @@ def send_files(server_addr:tuple[str, int], paths:list[str], filesize_threshold:
                 print(f'Server did not accept transfer end: {transfer_ack}')
                 return False
 
-    complete_url = _build_server_url(server_addr, f'/sendfilessocket/complete/{app_name}')
-    complete_resp = _secure_request('POST', complete_url, json_data={'transfer_id': transfer_id})
+    complete_url = _build_server_url(server_addr, '/sendfilessocket/complete')
+    complete_resp = _secure_request(
+        'POST',
+        complete_url,
+        params={'project_name': project_name},
+        json_data={'transfer_id': transfer_id},
+    )
     complete_resp.raise_for_status()
     complete_obj = complete_resp.json()
     if not complete_obj.get('ok', False):
@@ -1233,27 +1258,28 @@ def send_files(server_addr:tuple[str, int], paths:list[str], filesize_threshold:
 
 
 def apply_patch_server(server_addr:tuple[str, int], patch_path:str='') -> Response:
-    app_name = get_appname()
+    project_name = get_appname()
     project_root = get_project_root_path()
     if not patch_path:
         patch_path = os.path.join(get_runtime_dir_path(), 'gitdiff.diff')
     if not os.path.exists(patch_path):
         patch_path, _ = prepare_text_changes()
     patch_path = _to_repo_relative_posix(patch_path, project_root)
-    url = _build_server_url(server_addr, f'/apply-patch-server/{app_name}')
-    resp:Response = _secure_request('GET', url, params={'patch_path': patch_path})
+    url = _build_server_url(server_addr, '/apply-patch-server')
+    resp:Response = _secure_request('GET', url, params={'project_name': project_name, 'patch_path': patch_path})
     return resp
 
 
 
 #Sort of like git push, but for uncommited changes and specifically from the server
-def send_current_changes(server_addr:tuple[str, int]) -> Response:
+def send_current_changes(server_addr:tuple[str, int], project_name:str='') -> Response:
     git_diff_path, changed_binary_paths = prepare_text_changes()
     paths = [os.path.join(get_runtime_dir_path(), 'gitdiff.diff'), *changed_binary_paths]
     print('sending paths:')
     print(paths)
     send_files(server_addr, paths)
-    app_name = get_appname()
+    if not project_name:
+        project_name = get_appname()
     ip, port = server_addr
     # Server route expects a repo-relative patch path under query key "patch_path".
     patch_rel_path = _to_repo_relative_posix(git_diff_path, get_project_root_path())
@@ -1262,11 +1288,11 @@ def send_current_changes(server_addr:tuple[str, int]) -> Response:
     return resp
 
 def retrieve_current_text_changes(server_addr:tuple[str, int], save_as_filename='gitdiff.diff') -> bool:
-    app_name = get_appname()
-    url = _build_server_url(server_addr, f'/retrieve_text_changes/{app_name}')
+    project_name = get_appname()
+    url = _build_server_url(server_addr, '/retrieve_text_changes')
     ran_successfully = True
     try:
-        diff_resp:Response = _secure_request('GET', url, stream=True, timeout=120)
+        diff_resp:Response = _secure_request('GET', url, params={'project_name': project_name}, stream=True, timeout=120)
         diff_resp.raise_for_status()
     except requests.RequestException as e:
         print(f'Failed to retrieve text changes: {e}')
@@ -1289,10 +1315,10 @@ def retrieve_current_changes(server_addr:tuple[str, int], exclude_binary_changes
     retrieved_text_changes = retrieve_current_text_changes(server_addr, save_as_filename)
     if not exclude_binary_changes:
         project_root = get_project_root_path()
-        app_name = get_appname()
-        url = _build_server_url(server_addr, f'/retrieve_changed_binary_paths/{app_name}')
+        project_name = get_appname()
+        url = _build_server_url(server_addr, '/retrieve_changed_binary_paths')
         try:
-            binary_paths_resp:Response = _secure_request('GET', url)
+            binary_paths_resp:Response = _secure_request('GET', url, params={'project_name': project_name})
             binary_paths_resp.raise_for_status()
         except requests.RequestException as e:
             print(f'Failed to retrieve binary path list: {e}')
@@ -1308,17 +1334,17 @@ def retrieve_current_changes(server_addr:tuple[str, int], exclude_binary_changes
             return retrieved_text_changes and retrieved_binary_changes
     return retrieved_text_changes
 
-def get_changed_server_files(server_addr:tuple[str, int], app_name:str, scope='repo') -> Union[tuple[list[str], list[str]], bool]:
-    url = _build_server_url(server_addr, f'/retrieve_changed_file_paths/{app_name}/{scope}')
+def get_changed_server_files(server_addr:tuple[str, int], project_name:str, scope='repo') -> tuple[list[str], list[str]]:
+    url = _build_server_url(server_addr, f'/retrieve_changed_file_paths/{scope}')
     try:
-        resp = _secure_request('GET', url, stream=True, timeout=120)
+        resp = _secure_request('GET', url, params={'project_name': project_name}, stream=True, timeout=120)
         resp.raise_for_status()
     except requests.RequestException as e:
         print(f'Failed to retrieve changed file path lst: {e}')
-        return False
+        raise e
     if not resp.text:
         print(f'No changed files returned by server (reason not specified)')
-        return False
+        return [], []
 
     try:
         resp_json_obj:dict = json.loads(resp.text)
@@ -1326,7 +1352,7 @@ def get_changed_server_files(server_addr:tuple[str, int], app_name:str, scope='r
         changed_binarypaths_server = resp_json_obj['binary_file_paths']
     except (json.JSONDecodeError, KeyError, TypeError) as e:
         print(f'Invalid changed file paths payload from server: {e}')
-        return False
+        raise e
     #respect scope settings in case the default 'repo' argument is not used
     if scope == 'cwd':
         cwd = os.getcwd()
@@ -1526,13 +1552,13 @@ def get_local_git_state() -> dict:
     return get_git_state(project_root)
 
 
-def get_server_git_state(server_addr:tuple[str, int], app_name:str='') -> Optional[dict]:
-    if not app_name:
-        app_name = get_appname()
+def get_server_git_state(server_addr:tuple[str, int], project_name:str='') -> Optional[dict]:
+    if not project_name:
+        project_name = get_appname()
 
-    url = _build_server_url(server_addr, f'/git_state/{app_name}')
+    url = _build_server_url(server_addr, '/git_state')
     try:
-        resp:Response = _secure_request('GET', url)
+        resp:Response = _secure_request('GET', url, params={'project_name': project_name})
         resp.raise_for_status()
     except requests.RequestException as e:
         print(f'Failed to retrieve server git state: {e}')
@@ -1547,16 +1573,16 @@ def get_server_git_state(server_addr:tuple[str, int], app_name:str='') -> Option
     return obj
 
 
-def _post_server_git_action(server_addr:tuple[str, int], action:str, args:Optional[dict]=None, app_name:str='') -> Optional[dict]:
-    if not app_name:
-        app_name = get_appname()
+def _post_server_git_action(server_addr:tuple[str, int], action:str, args:Optional[dict]=None, project_name:str='') -> Optional[dict]:
+    if not project_name:
+        project_name = get_appname()
     if args is None:
         args = {}
 
-    url = _build_server_url(server_addr, f'/git_action/{app_name}')
+    url = _build_server_url(server_addr, '/git_action')
     payload = {'action': action, 'args': args}
     try:
-        resp:Response = _secure_request('POST', url, json_data=payload)
+        resp:Response = _secure_request('POST', url, params={'project_name': project_name}, json_data=payload)
         resp.raise_for_status()
     except requests.RequestException as e:
         print(f'Failed to run server git action {action}: {e}')
@@ -1715,7 +1741,7 @@ def apply_reconcile_actions(server_addr:tuple[str, int], decision:dict) -> dict:
     if decision.get('status') != RECONCILE_STATUS_NEEDS_ACTION:
         return decision
 
-    app_name = get_appname()
+    project_name = get_appname()
     authority_side = decision.get('authority_side', 'none')
     target_branch = decision.get('target_branch', '')
     target_commit = decision.get('target_commit', '')
@@ -1740,13 +1766,13 @@ def apply_reconcile_actions(server_addr:tuple[str, int], decision:dict) -> dict:
             except Exception as e:
                 print(f'Failed to read local git state: {e}')
                 return None
-        return get_server_git_state(server_addr, app_name)
+        return get_server_git_state(server_addr, project_name)
 
     def run_side_action(side:str, action:str, args:dict) -> Optional[dict]:
         if side == 'client':
             result = _run_local_git_action(action, args)
         else:
-            result = _post_server_git_action(server_addr, action, args=args, app_name=app_name)
+            result = _post_server_git_action(server_addr, action, args=args, project_name=project_name)
         actions_applied.append(f'{side}:{action}')
         return result
 
@@ -1850,9 +1876,9 @@ def apply_reconcile_actions(server_addr:tuple[str, int], decision:dict) -> dict:
     )
 
 
-def reconcile_git_state(server_addr:tuple[str, int], app_name:str='') -> dict:
-    if not app_name:
-        app_name = get_appname()
+def reconcile_git_state(server_addr:tuple[str, int], project_name:str='') -> dict:
+    if not project_name:
+        project_name = get_appname()
     actions_applied:list[str] = []
 
     try:
@@ -1860,7 +1886,7 @@ def reconcile_git_state(server_addr:tuple[str, int], app_name:str='') -> dict:
     except Exception as e:
         return _reconcile_result(RECONCILE_STATUS_ERROR, message=f'Failed to read local git state: {e}')
 
-    server_state = get_server_git_state(server_addr, app_name)
+    server_state = get_server_git_state(server_addr, project_name)
     if server_state is None:
         return _reconcile_result(RECONCILE_STATUS_ERROR, message='Failed to retrieve server git state.')
 
@@ -1896,7 +1922,7 @@ def reconcile_git_state(server_addr:tuple[str, int], app_name:str='') -> dict:
             server_addr,
             'has_commit',
             args={'commit': local_head},
-            app_name=app_name,
+            project_name=project_name,
         )
         if server_has_local_result_inner is None:
             return None
@@ -1920,7 +1946,7 @@ def reconcile_git_state(server_addr:tuple[str, int], app_name:str='') -> dict:
             fetch_failures.append(_format_action_failure('client:fetch_origin', fetch_local))
 
     if not server_has_local_head:
-        fetch_server = _post_server_git_action(server_addr, 'fetch_origin', args={}, app_name=app_name)
+        fetch_server = _post_server_git_action(server_addr, 'fetch_origin', args={}, project_name=project_name)
         actions_applied.append('server:fetch_origin')
         if not fetch_server or not fetch_server.get('success', False):
             fetch_failures.append(_format_action_failure('server:fetch_origin', fetch_server))
@@ -1942,7 +1968,7 @@ def reconcile_git_state(server_addr:tuple[str, int], app_name:str='') -> dict:
             server_addr,
             'create_update_bundle',
             {'path': bundle_rel_path, 'start_ref': local_head, 'end_ref': 'HEAD'},
-            app_name=app_name,
+            project_name=project_name,
         )
         actions_applied.append('server:create_update_bundle')
         if not create_server_bundle or not create_server_bundle.get('success', False):
@@ -2004,7 +2030,7 @@ def reconcile_git_state(server_addr:tuple[str, int], app_name:str='') -> dict:
             server_addr,
             'apply_update_bundle',
             args={'path': bundle_rel_path},
-            app_name=app_name,
+            project_name=project_name,
         )
         actions_applied.append('server:apply_update_bundle')
         if not apply_server_bundle or not apply_server_bundle.get('success', False):
@@ -2086,7 +2112,7 @@ def reconcile_git_state(server_addr:tuple[str, int], app_name:str='') -> dict:
             actions_applied=all_actions,
             message=f'Failed to read final local git state: {e}',
         )
-    final_server = get_server_git_state(server_addr, app_name)
+    final_server = get_server_git_state(server_addr, project_name)
     if final_server is None:
         return _reconcile_result(
             RECONCILE_STATUS_ERROR,
@@ -2123,10 +2149,16 @@ def reconcile_git_state(server_addr:tuple[str, int], app_name:str='') -> dict:
 
 
 def retrieve_diff_for_files(server_addr:tuple[str, int], paths:list[str]) -> Union[str, bool]:
-    app_name:str = get_appname()
-    url = _build_server_url(server_addr, f'/retrieve_diff_for_files/{app_name}')
+    project_name:str = get_appname()
+    url = _build_server_url(server_addr, '/retrieve_diff_for_files')
     try:
-        resp:Response = _secure_request('POST', url, json_data={'filepaths': paths}, timeout=120)
+        resp:Response = _secure_request(
+            'POST',
+            url,
+            params={'project_name': project_name},
+            json_data={'filepaths': paths},
+            timeout=120,
+        )
         resp.raise_for_status()
     except requests.RequestException as e:
         print(f"Failed to retrieve diff for specified files ({len(paths)} paths): {e}")
@@ -2156,10 +2188,10 @@ def retrieve_diff_for_files(server_addr:tuple[str, int], paths:list[str]) -> Uni
 
 
 def sync_changes_with_server(server_addr:tuple[str, int], sync_branches=True, sync_uncommitted=True, scope='repo') -> bool:
-    app_name = get_appname()
+    project_name = get_appname()
 
     if sync_branches:
-        reconcile_result = reconcile_git_state(server_addr, app_name=app_name)
+        reconcile_result = reconcile_git_state(server_addr, project_name=project_name)
         reconcile_status = reconcile_result.get('status', RECONCILE_STATUS_ERROR)
         if reconcile_status not in [RECONCILE_STATUS_ALIGNED, RECONCILE_STATUS_RECONCILED]:
             print(f'Phase 1 reconcile blocked: {reconcile_status}')
@@ -2228,6 +2260,7 @@ if __name__ == '__main__':
 
 
 
+    project_name = get_appname(cwd)
     runtime_dir_name = get_runtime_dir_name()
     runtime_dir = unix_path(os.path.join(cwd, runtime_dir_name))
     gitignore_path = os.path.join(cwd, '.gitignore')
@@ -2315,7 +2348,10 @@ if __name__ == '__main__':
 
     # Ensure we have paired cert + shared secret; this requires active pairing window when missing.
     serverinfo_dict = _ensure_pairing_material(serverinfo_path, user_runtime_dir, existing_info=serverinfo_dict)
-    serverinfo_dict = _validate_server_security_state(serverinfo_path, serverinfo_dict)
+    #FIXME The next line is commented out because it is almost completely redunant, and the current implementation
+    #was running discovery on every single request.  However a local only check may be worth doing, so I'm leaving this
+    #note here as something to possibly fix (or really improve) later
+    # serverinfo_dict = _validate_server_security_state(serverinfo_path, serverinfo_dict)
     if 'interactive_wrapper_port' not in serverinfo_dict:
         serverinfo_dict['interactive_wrapper_port'] = _env_int('RXS_INTERACTIVE_WRAPPER_PORT', DEFAULT_INTERACTIVE_WRAPPER_PORT)
     _initialize_security_context(user_runtime_dir, serverinfo_dict)
@@ -2389,13 +2425,6 @@ if __name__ == '__main__':
                 sync_changes_with_server(server_addr, sync_branches=False, sync_uncommitted=True, scope=scope)
             elif contains_any(arg, ['branches', 'commits']):
                 sync_changes_with_server(server_addr, sync_branches=True, sync_uncommitted=False, scope=scope)
-
-
-            
-        # if not (('unchanged' in arg) or ('uncomitted' in arg)):
-        #     sync_changes_with_server(server_addr)
-        # else:
-        #     sync_uncommitted_changes(server_addr)
     elif 'sendfiles' in arg:
         if len(sys.argv) > 2:
             send_files(server_addr, [os.path.join(os.getcwd(), name) for name in sys.argv[2:]])
@@ -2420,6 +2449,119 @@ if __name__ == '__main__':
             print('Usage: removeinteractive <executable_name>')
         else:
             print(remove_allowed_interactive_command(server_addr, sys.argv[2]))
+
+    elif arg == 'listchanges':
+        subargs = [subarg.lower() for subarg in args[1:]]
+        valid_dests = ['all', 'client', 'server']
+        valid_listcommands = ['files', 'diff']
+        if len(subargs) > 2:
+            print("Too many args for command 'listchanges'")
+            exit()
+        elif len(subargs) > 1: #len(subargs) is 2
+            if (subargs[0] in valid_dests) and (subargs[1] in valid_listcommands):
+                dest, cmd = subargs
+            elif (subargs[0] in valid_listcommands) and (subargs[1] in valid_dests):
+                cmd, dest = subargs
+            else:
+                if subargs[0] in valid_dests:
+                    dest = subargs[0]
+                elif subargs[1] in valid_dests:
+                    dest = subargs[1]
+                else:
+                    #I think this is a reasonable default destination, it means the command just works locally by default
+                    dest = 'client'
+
+                if subargs[0] in valid_listcommands:
+                    cmd = subargs[0]
+                elif subargs[1] in valid_listcommands:
+                    cmd = subargs[1]
+                else:
+                    cmd = 'files'
+        elif len(subargs) > 0:
+            subarg = subargs[0]
+            if subarg in valid_dests:
+                dest = subarg
+                cmd = 'files'
+            elif subarg in valid_listcommands:
+                dest = 'client'
+                cmd = subarg
+            else:
+                dest = 'client'
+                cmd = 'files'
+        else:
+            dest = 'client'
+            cmd = 'files'
+
+        if dest == 'client':
+            if cmd == 'files':
+                paths = get_changed_file_paths()
+                print('Changed file paths:')
+                for path in paths:
+                    print(f'\t{path}')
+            elif cmd == 'diff':
+                unstaged_proc = _run_git_capture(['git', 'diff', '--quiet', '--ignore-submodules', '--'], cwd=cwd)
+                staged_proc = _run_git_capture(['git', 'diff', '--cached', '--quiet', '--ignore-submodules', '--'], cwd=cwd)
+                unstaged_output = unstaged_proc.stdout.decode(errors='replace')
+                staged_output = staged_proc.stdout.decode(errors='replace')
+                output = f'unstaged files diff:\n\n{unstaged_output}\n\nstaged files diff:\n\n{staged_output}'
+                print(output)
+            else:
+                print(f'Invalid command: {cmd}')
+
+        elif dest == 'server':
+            plain_paths, binary_paths = get_changed_server_files(server_addr, project_name)
+            if cmd == 'files':
+                paths = list(sorted([*plain_paths, *binary_paths]))
+                print('Changed server file paths:')
+                for path in paths:
+                    print(f'\t{path}')
+            elif cmd == 'diff':
+                server_diff_path = retrieve_diff_for_files(server_addr, plain_paths)
+                with open(server_diff_path, 'r') as f:
+                    diff_text = f.read()
+                print('server files diff:\n\n{diff_text}')
+            else:
+                print(f'Invalid command: {cmd}')
+
+        elif dest == 'all':
+            if cmd == 'files':
+                #client
+                client_paths = get_changed_file_paths()
+                print('Changed client file paths:')
+                for path in client_paths:
+                    print(f'\t{path}')
+                #server
+                plain_paths, binary_paths = get_changed_server_files(server_addr, project_name)
+                server_paths = list(sorted([*plain_paths, *binary_paths]))
+                input('\n\nPress enter to view changed server paths')
+                print('Changed server file paths:')
+                for path in server_paths:
+                    print(f'\t{path}')
+            elif cmd == 'diff':
+                #client
+                unstaged_proc = _run_git_capture(['git', 'diff', '--quiet', '--ignore-submodules', '--'], cwd=cwd)
+                staged_proc = _run_git_capture(['git', 'diff', '--cached', '--quiet', '--ignore-submodules', '--'], cwd=cwd)
+                unstaged_output = unstaged_proc.stdout.decode(errors='replace')
+                staged_output = staged_proc.stdout.decode(errors='replace')
+                print('Client diffs:')
+                output = f'unstaged files diff:\n\n{unstaged_output}\n\nstaged files diff:\n\n{staged_output}'
+                print(output)
+                #server
+                input('\n\nPress enter to view server diff')
+                plain_paths, binary_paths = get_changed_server_files(server_addr, project_name)
+                server_diff_path = retrieve_diff_for_files(server_addr, plain_paths)
+                with open(server_diff_path, 'r') as f:
+                    diff_text = f.read()
+                print('server files diff:\n\n{diff_text}')
+            else:
+                print(f'Invalid command: {cmd}')
+
+
+
+            pass
+        else:
+            print(f'Invalid dest: {dest}')
+            exit()
 
     else:
         print(f'Invalid argument: {arg}')

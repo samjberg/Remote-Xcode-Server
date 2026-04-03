@@ -2,6 +2,10 @@ import os, sys, pathlib, socket, subprocess, shlex, datetime, shutil
 from typing import Callable, Optional, TypeVar, Union
 from mimetypes import guess_type
 from uuid import uuid4
+
+from requests.models import DecodeError
+
+from projects_context_manager import get_project
 try:
     from typing import ParamSpec
 except ImportError:
@@ -14,7 +18,16 @@ R = TypeVar("R", bound=subprocess.CompletedProcess)
 KB = 1024
 MB = KB * KB
 runtime_dir_name = '.remote-xcode-server'
-user_runtime_dir_name = '.remote_xcode_server'
+user_runtime_dir_name = '.remote-xcode-server'
+
+def ensure_directory_exists(dir_path: str) -> None:
+    if not os.path.exists(dir_path):
+        os.makedirs(dir_path)
+    elif not os.path.isdir(dir_path):
+        #dir_path exists but is a file.  Remove it and then run makedirs
+        os.remove(dir_path)
+        os.makedirs(dir_path)
+
 
 def get_runtime_dir_name() -> str:
     return runtime_dir_name
@@ -47,8 +60,17 @@ def get_build_log_path(job_id:int) -> str:
     return build_log_path
 
 
-def uploads_folder_exists() -> bool:
-    cwd = os.getcwd()
+
+def uploads_folder_exists(project_id: str = '', project_name: str = '') -> bool:
+    '''Checks for the existence of the uploads folder.  This is a per-project folder, so this is a per-project function'''
+    if project_id:
+        project = get_project(project_id=project_id)
+    elif project_name:
+        project = get_project(project_name=project_name)
+    else:
+        raise RuntimeError('Must provide either project_id or project_name as argument to upload_folder_exists')
+
+    cwd = project.get('project_root_path', '')
     if runtime_dir_name not in os.listdir(cwd):
         return False
     return os.path.isdir(get_runtime_dir_path(cwd))
@@ -72,7 +94,8 @@ def get_project_root_path(cwd:str='.') -> str:
     while len(path_parts) > 1:
         current_path = '/'.join(path_parts)
         for name in os.listdir(current_path):
-            if name.split('.')[-1] == 'xcodeproj': #if the file extension is 'xcodeproj'
+            # if name.split('.')[-1] == 'xcodeproj': #if the file extension is 'xcodeproj'
+            if name == '.git':
                 return current_path
         path_parts = path_parts[:-1]
     return cwd
@@ -121,7 +144,7 @@ def contains_any(text:str, candidates:list[str], case_sensitive:bool=True) -> bo
                 return True
     return False
 
-    
+
 def clear_directory(path) -> None:
     for item_path in os.listdir(path):
         os.remove(os.path.join(path, item_path))
@@ -229,6 +252,50 @@ def normalize_file_line_endings(path:str, fmt='LF') -> None:
             clean_line = line.rstrip()
             f.write(clean_line + newline_bytes)
 
+def generate_project_id(project_name: str) -> str:
+    if not project_name:
+        return ''
+    normed_project_name = project_name.replace(' ', '_').lower()
+    s = hex(hash(normed_project_name))[2:]
+    project_id = '-'.join([s[:6], s[6:10], s[10:16]])
+    return project_id
+
+def get_git_username(project_root_path='') -> str:
+    project_root_path = project_root_path if project_root_path else get_project_root_path(os.getcwd())
+    proc = run_process(['git', 'config', '--list'], cwd=project_root_path)
+    if proc.returncode:
+        err_msg = proc.stderr.decode(errors='replace')
+        raise RuntimeError(f'Error running git config --list to find git username.  Error message: {err_msg}')
+    
+    text = ''
+    try:
+        text = proc.stdout.decode(errors='replace')
+
+    except Exception as e:
+        raise RuntimeError(f'Error decoding output og git config --list to find git username.  Error message: {e}')
+
+    if not text:
+        raise RuntimeError('Error, no output from git config --list (to find git username)')
+
+    username = ''
+    lines: list[str] = text.splitlines()
+    for line in lines:
+         #just to be safe there is no space or whatever on the username
+        line_parts = [part.strip() for part in line.split('=')]
+        if line_parts[0] == 'user.name' and len(line_parts) >= 2:
+            username = line_parts[1] 
+            break
+        else:
+            raise ValueError('Apparently malformed output line from git config --list.\nOffending line: {line}')
+
+    return username
+
+
+
+
+
+
+
 
 #this insane P and R stuff with ParamSpec and TypeVar is just the insanity that is necessary to make typehints show up for functions
 #that use this decorator (i.e. run_process) for some insane reason.
@@ -284,7 +351,7 @@ def get_commit_date(branch:str) -> Optional[datetime.datetime]:
     year = int(date_part_str[4])
     creation_dt = datetime.datetime(year=year, month=month, day=day, hour=hour, minute=minute, second=second)
     return creation_dt
-    
+
 
 def get_commits_between(start_ref:str, end_ref:str='HEAD') -> list[str]:
     '''Returns a list of all commits "between" start_ref and end_ref, inclusive'''
@@ -325,7 +392,7 @@ def git_verify_bundle(bundle_path:str) -> bool:
     except UnicodeDecodeError as err:
         print(f"Error decoding output from command {' '.join(verify_bundle_command)}\nError Message: {err}")
         return False
-    
+
     lines = res.splitlines()
     for line in lines:
         if line.startswith('error'):
@@ -357,7 +424,7 @@ def get_git_branches(app_name:str='', return_current_branch=False, sort_order='c
     proc = run_process(git_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if not proc.stdout:
         print(f"No output from {' '.join(git_command)}")
-    
+
     text: str = proc.stdout.decode()
     lines = text.splitlines()
     #this is just how git branch output is formatted.  All names start on the 3rd (index 2) character.  The current branch has a * as the 0th index
@@ -371,9 +438,9 @@ def get_git_branches(app_name:str='', return_current_branch=False, sort_order='c
         if line[0] == '*':
             current_branch = line
             break
-    
+
     return return_lines, current_branch
-        
+
 
 def get_merge_base(commit_hash1:str, commit_hash2:str) -> str:
     command = f'git merge-base {commit_hash1} {commit_hash2}'.split(' ')
@@ -388,7 +455,7 @@ def get_merge_base(commit_hash1:str, commit_hash2:str) -> str:
 
 
 def compare_ahead_behind(commit1:str, commit2:str) -> Union[tuple[int, int], None]:
-    '''Returns two ints, representing how many commits ahead each commit is compared to the other''' 
+    '''Returns two ints, representing how many commits ahead each commit is compared to the other'''
     command = shlex.split(f'git rev-list --left-right --count {commit1}...{commit2}')
     project_root = get_project_root_path()
     proc = run_process(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=project_root)
@@ -697,7 +764,7 @@ def get_changed_file_paths(scope='repo') -> list[str]:
         print(f"No output from {' '.join(diff_command)} in proc.stdout")
 
     #split "lines" (file paths) on null byte
-    lines_bytes = [b for b in proc.stdout.split(b'\x00') if b] 
+    lines_bytes = [b for b in proc.stdout.split(b'\x00') if b]
     file_paths = [b.decode(errors='replace') for b in lines_bytes]
     file_paths = [p for p in file_paths if p and p != '.gitignore']
 
@@ -735,7 +802,7 @@ def get_diff_for_files(paths:list[str], diff_filename='specific_files_gitdiff.di
         with open(git_diff_path, 'w') as diff_file:
             diff_file.write('\n')
         return git_diff_path
-    
+
     os.system('git add .')
     with open(git_diff_path, 'w') as diff_file:
         run_process(['git', 'diff', 'HEAD', '--', *paths], stdout=diff_file, stderr=subprocess.STDOUT, cwd=cwd)
@@ -756,7 +823,7 @@ def prepare_text_changes() -> tuple[str, list[str]]:
     changed_binary_paths = [path for path in changed_file_paths if not is_plaintext(path.split('/')[-1])]
     changed_text_paths = [path for path in changed_file_paths if path not in changed_binary_paths and path != '.gitignore']
 
-    
+
     # Build a patch that only contains plaintext files; binary files are sent separately.
     with open(git_diff_path, 'w', newline='') as diff_file:
         if changed_text_paths:

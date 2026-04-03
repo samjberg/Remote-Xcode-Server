@@ -1,3 +1,4 @@
+from ntpath import dirname
 import os, subprocess, socket, json, struct, hashlib, time, re, secrets, ssl, hmac, pty, select
 from flask import Flask, request, send_file, send_from_directory, jsonify, Request, Response
 from threading import Thread, Lock
@@ -5,6 +6,8 @@ from functools import wraps
 from typing import Optional
 from werkzeug.utils import secure_filename
 from mcp_utils import *
+from environment_setup import _normalize_path_for_compare
+import projects_context_manager as pcm
 # from requests import Request
 
 server_port = 8751
@@ -18,16 +21,18 @@ nonce_ttl_s = 300
 SECURITY_METADATA_FILENAME = 'security_metadata.json'
 
 # establish several filesystem level global variables
-cwd = unix_path(os.getcwd())
+# pcm.cwd = unix_path(os.getpcm.cwd())
+cwd = pcm.cwd
 project_name = get_project_name()
 server_dir_name = get_runtime_dir_name()
-server_dir_path = os.path.join(cwd, server_dir_name)
+server_dir_path = os.path.join(pcm.cwd, server_dir_name)
 project_info_filename = 'projectinfo.txt'
 project_info_filepath = os.path.join(server_dir_path, project_info_filename)
 legacy_allowed_interactive_commands_filename = 'allowed_interactive_commands.txt'
 allowed_interactive_commands_filename = 'allowed-interactive-commands.txt'
 legacy_allowed_interactive_commands_path = os.path.join(server_dir_path, legacy_allowed_interactive_commands_filename)
 allowed_interactive_commands_path = os.path.join(server_dir_path, allowed_interactive_commands_filename)
+user_runtime_dir_path = get_user_runtime_dir_path()
 
 PAIRING_EXPIRY_UNIX = 0
 PAIRING_LOCK = Lock()
@@ -490,6 +495,29 @@ def start_discovery_listener():
             with DISCOVERY_LOCK:
                 DISCOVERY_STATUS['last_error'] = f'send_error:{e}'
 
+
+def get_project_root_path_server(project_id='', project_name='') -> str:
+    '''This is sort of stupid but whatever, the tech debt of this project sort of forced me into defining this function
+        as a server-only version to deal with certain issuesj'''
+    project_root_path = ''
+    if project_id:
+        project = pcm.projects_dict.get(project_id, '')
+        if project:
+            return project.get('project_root_path')
+        else:
+            raise ValueError(f'Project is empty')
+    elif project_name:
+        for _, project in pcm.projects_dict.items():
+            if project.get('project_name', '') == project_name:
+                return project.get('project_root_path', '')
+
+    if pcm.current_project:
+        return pcm.current_project.get('project_root_path', '')
+
+    return ''
+
+
+    
 def _locate_which_executable():
     primary_candidates = ['/usr/bin', '/bin']
     for dir_path in primary_candidates:
@@ -522,9 +550,32 @@ def _find_executable_paths(command_names) -> dict[str, str]:
                     path_dict[name] = executable_path
     return path_dict
 
+def _ensure_server_dir():
+    """Ensures the existence of the global .remote-xcode-server directory located by default in the user's home dir"""
+    user_home_dir = get_user_home_dir()
+    server_dir = os.path.join(user_home_dir, server_dir_name)
+    if not os.path.exists(server_dir):
+        os.makedirs(server_dir)
+    elif not os.path.isdir(server_dir):
+        os.remove(server_dir)
+        os.makedirs(server_dir)
 
+def _set_upload_folder(path):
+    global UPLOAD_FOLDER
+    if not os.path.exists(path):
+        raise FileNotFoundError(f'Error, could not find new upload folder: {path}')
+    UPLOAD_FOLDER = path
+    app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+    pcm.UPLOAD_FOLDER = UPLOAD_FOLDER
 
+#ensures existence of global (not project-specific) .remote-xcode-server directory
+_ensure_server_dir()
+#bootstrap security state
 bootstrap_security_state()
+#initialize the project context manager
+pcm.initialize()
+# ensure current upload dir exists even on a brand-new install with no tracked project yet
+ensure_directory_exists(pcm.UPLOAD_FOLDER)
 
 # set up sockets for streaming xcode commands (server) and sending/receiving files (filesocket)
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -545,13 +596,45 @@ discovery_thread.start()
 update_gitignore()
 
 
+#FIRST RUN SETUP
 
-if not uploads_folder_exists():
-    os.mkdir(server_dir_path)
+if pcm.current_project:
+    project_root = pcm.current_project.get('project_root_path', '')
+    if not project_root:
+        #project root found in current_project dict, but it has no value
+        if not 'project_root_path' in pcm.current_project:
+            raise KeyError(f"Key 'project_root_path' not found in current_project: {pcm.current_project}'")
+        else:
+            raise ValueError(f"Value for key 'project_root_path'")
 
-if project_info_filename not in os.listdir(server_dir_path): #this means this is the first time the server is being run, 
-        with open(project_info_filepath, 'w') as f:
-            config_lines = [f'project_root:{cwd}\n', f'project_name:{project_name}\n']
+    pcm.UPLOAD_FOLDER = os.path.join(project_root, pcm.UPLOAD_FOLDER_NAME)
+
+    if not _normalize_path_for_compare(pcm.cwd) == _normalize_path_for_compare(project_root):
+        if os.path.exists(project_root):
+            pcm.cwd = project_root
+        pass
+
+
+
+
+    #this was moved to not be top-level anymore, because this is project-specific, and should only run
+    #if we actually know which project we are in, or at least that we are in a project at all
+    #otherwise it is just creating a folder in a random location, which we want to avoid
+    if not uploads_folder_exists(project_id=pcm.current_project['id']):
+        os.makedirs(pcm.UPLOAD_FOLDER)
+        # os.mkdir(os.path.join(pcm.current_project['project_root_path'], pcm.UPLOAD_FOLDER_NAME))
+else:
+    if not isinstance(pcm.current_project, dict):
+        raise ValueError("Something has gone seriously wrong.  pcm.current_project isn't even a dict.  pcm.currentproject: {pcm.currentproject}")
+
+
+
+
+
+
+if not os.path.exists(os.path.join(pcm.UPLOAD_FOLDER, project_info_filename)): #this means this is the first time the server is being run,
+        with open(os.path.join(pcm.UPLOAD_FOLDER, project_info_filename), 'w') as f:
+            config_lines = [f'project_root:{pcm.cwd}\n', f'project_name:{project_name}\n']
             for line in config_lines:
                 if line[-1] in '\n\r':
                     f.write(line)
@@ -563,11 +646,10 @@ if project_info_filename not in os.listdir(server_dir_path): #this means this is
 
 
 
-
-UPLOAD_FOLDER = unix_path(os.path.join(cwd, server_dir_name))
 JOBS = {}
 app = Flask(__name__)
-app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+UPLOAD_FOLDER = ''
+_set_upload_folder(pcm.UPLOAD_FOLDER)
 TRANSFER_SESSIONS: dict[str, dict] = {}
 OUTBOUND_TRANSFER_SESSIONS: dict[str, dict] = {}
 SESSION_LOCK = Lock()
@@ -714,7 +796,7 @@ def start_interactive_session_listener():
         worker.start()
 
 
-def _launch_interactive_wrapper(appname: str, executable_name: str):
+def _launch_interactive_wrapper(project_name: str, executable_name: str):
     if _looks_like_path_arg(executable_name):
         return jsonify({'ok': False, 'error': 'invalid_executable_name'}), 400
     if executable_name not in allowed_interactive_commands:
@@ -766,23 +848,48 @@ def _launch_interactive_wrapper(appname: str, executable_name: str):
     )
 
 
-@app.route('/interactive/launch/<appname>/<executable_name>', methods=['POST'])
-def launch_interactive_wrapper_v2(appname: str, executable_name: str):
-    return _launch_interactive_wrapper(appname, executable_name)
+@app.route('/interactive/launch/<executable_name>', methods=['POST'])
+def launch_interactive_wrapper_v2(executable_name: str):
+    project_name = request.args.get('project_name', '')
+    return _launch_interactive_wrapper(project_name, executable_name)
 
 
-@app.route('/stream_interactive_wrapper/<appname>/<executable_name>', methods=['GET'])
-def launch_interactive_wrapper_legacy(appname: str, executable_name: str):
-    return _launch_interactive_wrapper(appname, executable_name)
+@app.route('/stream_interactive_wrapper/<executable_name>', methods=['GET'])
+def launch_interactive_wrapper_legacy(executable_name: str):
+    project_name = request.args.get('project_name', '')
+    return _launch_interactive_wrapper(project_name, executable_name)
 
 
-@app.before_request
 def _global_auth_gate():
     if request.path in ['/', '/enable_pairing', '/pairing-bootstrap', '/discovery-status']:
         return None
     ok, status_code, error = _verify_hmac_request(request)
     if not ok:
         return jsonify({'ok': False, 'error': error}), status_code
+    return None
+
+
+@app.before_request
+def _before_request_func():
+    auth_gate_res = _global_auth_gate()
+    if auth_gate_res:
+        return auth_gate_res
+    project_nonspecific_routes = [
+        '/enable_pairing',
+        '/pairing-bootstrap',
+        '/discovery-status',
+        '/add_allowed_interactive_command',
+        '/remove_allowed_interactive_command',
+        '/get_allowed_interactive_commands',
+        '/checkprogress/',
+        '/status/',
+    ]
+    route_is_specific = not any([request.path.startswith(pathroute) for pathroute in project_nonspecific_routes])
+    if route_is_specific:
+        projects_context_result = pcm.handle_project_context()
+        if projects_context_result:
+            return jsonify({'ok': False, 'error': projects_context_result}), 400
+        _set_upload_folder(pcm.UPLOAD_FOLDER)
     return None
 
 
@@ -812,7 +919,7 @@ def get_safe_project_path(client_path:str) -> str:
     if any(p == '..' for p in normalized_parts):
         raise ValueError(f'Path traversal is not allowed: {rel_path}')
 
-    project_root_abs = os.path.abspath(cwd)
+    project_root_abs = os.path.abspath(pcm.cwd)
     dest_abs = os.path.abspath(os.path.join(project_root_abs, normalized_rel))
     if os.path.commonpath([project_root_abs, dest_abs]) != project_root_abs:
         raise ValueError(f'Path escapes project root: {rel_path}')
@@ -1166,7 +1273,7 @@ def _looks_like_path_arg(value: str):
 
 def _get_invalid_xcodebuild_args(args:list[str]) -> list[str]:
     '''Returns a list of invalid arguments'''
-    project_root = get_project_root_path()
+    project_root = get_project_root_path_server()
     path_bearing_flags = ['-project', '-workspace', '-xcconfig', '-sdk', '-derivedDataPath', '-resultBundlePath', '-resultStreamPath',
                           '-archivePath', '-exportPath', '-exportOptionsPlist', '-localizationPath', '-xctestrun', '-testProductsPath',
                           '-clonedSourcePackagesDirPath', '-packageCachePath', '-authenticationKeyPath', '-framework', '-library', '-headers', '-output']
@@ -1355,24 +1462,26 @@ def remove_allowed_interactive_command_route(command:str):
 def get_allowed_interactive_commands_route():
     return jsonify({'ok': True, 'allowed_interactive_commands': allowed_interactive_commands}), 200
 
-    
 
 
-@app.route('/retrieve_text_changes/<appname>')
-def send_changes(appname:str):
+@app.route('/retrieve_text_changes')
+def send_changes():
+    project_name = request.args.get('project_name', '')
     git_diff_path, changed_binary_paths = prepare_text_changes()
     git_diff_dir, git_diff_name = [unix_path(p) for p in os.path.split(git_diff_path)]
     return send_from_directory(git_diff_dir, git_diff_name, as_attachment=True)
 
-@app.route('/retrieve_changed_binary_paths/<appname>')
-def send_changed_binary_paths(appname:str):
+@app.route('/retrieve_changed_binary_paths')
+def send_changed_binary_paths():
+    project_name = request.args.get('project_name', '')
     changed_file_paths = [path for path in get_changed_file_paths() if path]
     changed_binary_paths = [path for path in changed_file_paths if not is_plaintext(path.split('/')[-1])]
     paths_str = '\n'.join(changed_binary_paths)
     return paths_str
 
-@app.route('/retrieve_diff_for_files/<appname>', methods=['POST'])
-def send_diff_for_files(appname:str):
+@app.route('/retrieve_diff_for_files', methods=['POST'])
+def send_diff_for_files():
+    project_name = request.args.get('project_name', '')
     try:
         paths = request.json['filepaths']
     except KeyError as e:
@@ -1383,29 +1492,33 @@ def send_diff_for_files(appname:str):
     return send_from_directory(diffs_path, git_diff_name)
 
 
-@app.route('/retrieve_current_commit_hash/<appname>')
-def send_current_commit_hash(appname:str):
+@app.route('/retrieve_current_commit_hash')
+def send_current_commit_hash():
+    project_name = request.args.get('project_name', '')
     current_commit_hash = get_current_commit_hash()
     return current_commit_hash
 
 
-@app.route('/retrieve_git_branches/<appname>/<sort_order>')
-def send_git_branches(appname:str, sort_order:str):
-    git_branches, current_branch = get_git_branches(appname, return_current_branch=True, sort_order=sort_order)
+@app.route('/retrieve_git_branches/<sort_order>')
+def send_git_branches(sort_order:str):
+    project_name = request.args.get('project_name', '')
+    git_branches, current_branch = get_git_branches(project_name, return_current_branch=True, sort_order=sort_order)
     return jsonify({'branches': git_branches, 'current_branch': current_branch})
 
 
-@app.route('/git_state/<appname>')
-def send_git_state(appname:str):
+@app.route('/git_state')
+def send_git_state():
+    project_name = request.args.get('project_name', '')
     try:
-        state = get_git_state(get_project_root_path())
+        state = get_git_state(get_project_root_path_server(project_name=project_name))
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
     return jsonify(state)
 
 
-@app.route('/git_action/<appname>', methods=['POST'])
-def run_git_action(appname:str):
+@app.route('/git_action', methods=['POST'])
+def run_git_action():
+    project_name = request.args.get('project_name', '')
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
         return jsonify({'success': False, 'error': 'Expected JSON object payload'}), 400
@@ -1428,14 +1541,15 @@ def run_git_action(appname:str):
     if not isinstance(action_args, dict):
         return jsonify({'success': False, 'error': 'Field "args" must be an object if provided'}), 400
 
-    result = execute_git_action(action, action_args, cwd=get_project_root_path())
+    result = execute_git_action(action, action_args, cwd=get_project_root_path_server(project_name=project_name))
     if 'command' not in result and not result.get('success', False):
         return jsonify(result), 400
     return jsonify(result)
 
 
-@app.route('/create-update-bundle/<appname>/<client_head>', methods=['GET'])
-def send_update_bundle(appname:str, client_head:str):
+@app.route('/create-update-bundle/<client_head>', methods=['GET'])
+def send_update_bundle(client_head:str):
+    project_name = request.args.get('project_name', '')
     runtime_dir_path = get_runtime_dir_path()
     bundle_name = 'update.bundle'
     save_path = os.path.join(runtime_dir_path, bundle_name)
@@ -1450,8 +1564,9 @@ def send_update_bundle(appname:str, client_head:str):
 #so it is just a coincidence that the thing I'm trying to pass here as a variable in the url IS literally a path, which happens to be
 #the same as the name of the converter we need to use: "path".  The path converter makes it so that we can pass nested paths here, instead
 #of paths getting cut off once they reach the first '/' (the first path delimiter)
-@app.route('/retrieve_binary_file/<appname>/<path:path>')
-def send_binary_file(appname:str, path:str):
+@app.route('/retrieve_binary_file/<path:path>')
+def send_binary_file(path:str):
+    project_name = request.args.get('project_name', '')
     path = get_safe_project_path(path)
     if not os.path.exists(path):
         filename = os.path.split(path)[-1]
@@ -1466,8 +1581,9 @@ def send_binary_file(appname:str, path:str):
     return send_file(path, as_attachment=True)
 
 
-@app.route('/apply-patch-server/<appname>', methods=['GET'])
-def apply_patch_server(appname):
+@app.route('/apply-patch-server', methods=['GET'])
+def apply_patch_server():
+    project_name = request.args.get('project_name', '')
     patch_path = request.args.get('patch_path', None)
     if not patch_path:
         print('Error: No patch path received from client')
@@ -1476,8 +1592,9 @@ def apply_patch_server(appname):
     return 'successfully applied patch'
 
 
-@app.route('/sendchanges/<appname>', methods=['GET'])
-def receive_changes(appname):
+@app.route('/sendchanges', methods=['GET'])
+def receive_changes():
+    project_name = request.args.get('project_name', '')
     runtime_dir = get_runtime_dir_path()
     patch_path = os.path.join(runtime_dir, 'gitdiff.diff')
     if os.path.exists(patch_path) and (os.path.getsize(patch_path) > 0):
@@ -1491,8 +1608,9 @@ def receive_changes(appname):
 
 
 
-@app.route('/sendfileshttp/<appname>', methods=['POST'])
-def receive_files_http(appname:str):
+@app.route('/sendfileshttp', methods=['POST'])
+def receive_files_http():
+    project_name = request.args.get('project_name', '')
     saved_files = []
     errors = []
     for key in request.files.keys():
@@ -1500,7 +1618,7 @@ def receive_files_http(appname:str):
         if not file:
             errors.append(f'No file object for request.files key: {key}')
             continue
-        rel_path = unix_path(file.filename)
+        rel_path = unix_path(str(file.filename))
         try:
             destination_path = get_safe_project_path(rel_path)
         except ValueError as e:
@@ -1536,8 +1654,9 @@ def receive_files_http(appname:str):
     return jsonify({'ok': ok, 'received_files': saved_files, 'errors': errors}), status
 
 
-@app.route('/sendfilessocket/init/<appname>', methods=['POST'])
-def init_receive_files_socket(appname:str):
+@app.route('/sendfilessocket/init', methods=['POST'])
+def init_receive_files_socket():
+    project_name = request.args.get('project_name', '')
     _cleanup_transfer_sessions()
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
@@ -1598,8 +1717,9 @@ def init_receive_files_socket(appname:str):
     return jsonify({'ok': True, 'transfer_id': transfer_id, 'file_socket_port': file_socket_port, 'errors': []})
 
 
-@app.route('/sendfilesfromserver/init/<appname>', methods=['POST'])
-def init_send_files_from_server(appname: str):
+@app.route('/sendfilesfromserver/init', methods=['POST'])
+def init_send_files_from_server():
+    project_name = request.args.get('project_name', '')
     _cleanup_transfer_sessions()
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
@@ -1666,8 +1786,9 @@ def init_send_files_from_server(appname: str):
     )
 
 
-@app.route('/sendfilesfromserver/complete/<appname>', methods=['POST'])
-def complete_send_files_from_server(appname: str):
+@app.route('/sendfilesfromserver/complete', methods=['POST'])
+def complete_send_files_from_server():
+    project_name = request.args.get('project_name', '')
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
         return jsonify({'ok': False, 'errors': ['Expected JSON object payload']}), 400
@@ -1704,8 +1825,9 @@ def complete_send_files_from_server(appname: str):
     return jsonify({'ok': ok, 'sent_files': sent_files, 'errors': errors}), (200 if ok else 400)
 
 
-@app.route('/sendfilessocket/complete/<appname>', methods=['POST'])
-def complete_receive_files_socket(appname:str):
+@app.route('/sendfilessocket/complete', methods=['POST'])
+def complete_receive_files_socket():
+    project_name = request.args.get('project_name', '')
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
         return jsonify({'ok': False, 'errors': ['Expected JSON object payload']}), 400
@@ -1743,8 +1865,9 @@ def complete_receive_files_socket(appname:str):
     return jsonify({'ok': ok, 'received_files': received_files, 'errors': errors}), status_code
 
 
-@app.route('/sendfilessocket/<appname>', methods=['POST'])
-def receive_files_socket_legacy(appname:str):
+@app.route('/sendfilessocket', methods=['POST'])
+def receive_files_socket_legacy():
+    project_name = request.args.get('project_name', '')
     try:
         data = request.get_json(silent=True) or {}
         paths = data.get('filepaths', [])
@@ -1753,15 +1876,16 @@ def receive_files_socket_legacy(appname:str):
     return jsonify(
         {
             'ok': False,
-            'errors': ['Legacy route no longer supported. Use /sendfilessocket/init/<appname> and /sendfilessocket/complete/<appname>.'],
+            'errors': ['Legacy route no longer supported. Use /sendfilessocket/init?project_name=<project_name> and /sendfilessocket/complete?project_name=<project_name>.'],
             'paths_seen': paths,
         }
     ), 410
 
 
-@app.route('/start-build-job/<appname>', methods=['POST'])
-def start_build_job(appname):
-    print(f'appname: {appname}')
+@app.route('/start-build-job', methods=['POST'])
+def start_build_job():
+    project_name = request.args.get('project_name', '')
+    print(f'project_name: {project_name}')
     xcodebuild_args = request.form.getlist('xcodebuild_args')
 
     if request.method == 'POST' or request.method == 'GET':
@@ -1811,9 +1935,9 @@ def start_build_job(appname):
             #create a secure version of the filename
             filename = secure_filename(file.filename)
             #save the file with the secure filename in UPLOAD_FOLDER
-            file.save(os.path.join(app.config["UPLOAD_FOLDER"], filename))
+            file.save(os.path.join(pcm.UPLOAD_FOLDER, filename))
 
-            patch_path = f'{app.config["UPLOAD_FOLDER"]}/{filename}'
+            patch_path = f'{pcm.UPLOAD_FOLDER}/{filename}'
             if os.path.getsize(patch_path) > 0:
                 git_apply_command = f'git apply {patch_path}'
                 #run the git apply command
@@ -1822,10 +1946,10 @@ def start_build_job(appname):
 
             job_id = str(uuid4())
             if job_id in JOBS.keys():
-                return f'<p>Already building {appname}, job_id: {job_id}</p>'
+                return f'<p>Already building {project_name}, job_id: {job_id}</p>'
 
             build_log_name:str = f'buildlog-{job_id}.txt'
-            build_log_path:str = os.path.join(UPLOAD_FOLDER, build_log_name)
+            build_log_path:str = os.path.join(pcm.UPLOAD_FOLDER, build_log_name)
 
             #Create the new job object and put it in job_id in the JOBS dict.
             #We have to be careful to ensure the file gets closed
@@ -1841,8 +1965,9 @@ def start_build_job(appname):
         return "Some other method besides POST or GET was used.  Don't do that"
         
 
-@app.route('/retrieve_changed_file_paths/<appname>/<scope>')
-def send_changed_file_paths(appname:str, scope:str) -> Response:
+@app.route('/retrieve_changed_file_paths/<scope>')
+def send_changed_file_paths(scope:str) -> Response:
+    project_name = request.args.get('project_name', '')
     changed_file_paths = get_changed_file_paths(scope)
     changed_plaintext_paths = [path for path in changed_file_paths if is_plaintext(path)]
     changed_binary_paths = [path for path in changed_file_paths if path not in changed_plaintext_paths]
@@ -1901,11 +2026,5 @@ if __name__ == '__main__':
     ip, port = '0.0.0.0', get_server_port()
     cert_path, key_path = get_tls_paths()
     app.run(ip, port, ssl_context=(cert_path, key_path))
-
-
-
-
-
-
 
 

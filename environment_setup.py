@@ -37,7 +37,7 @@ def update_windows_path(new_path_directory):
         if normalized_new_path not in path_elements:
             updated_path = f"{new_path_directory};{current_path}"
             winreg.SetValueEx(key, 'Path', 0, winreg.REG_EXPAND_SZ, updated_path)
-            
+
             # Broadcast environment change without risking an indefinite hang.
             HWND_BROADCAST = 0xFFFF
             WM_SETTINGCHANGE = 0x001A
@@ -81,7 +81,7 @@ def update_posix_path(new_path_directory):
             with open(path, 'a') as f:
                 f.write(path_injection_str + '\n')
 
-        
+
 
 
 def ensure_environment_setup():
@@ -94,7 +94,7 @@ def ensure_environment_setup():
             os.remove(runtime_dir_path)
             os.makedirs(runtime_dir_path)
 
-    
+
     #next create all necessary directories in user home path (global info for all projects such as serverinfo)
     if not os.path.exists(user_runtime_path):
         os.makedirs(user_runtime_path)
@@ -106,7 +106,7 @@ def ensure_environment_setup():
 
     certs_path = os.path.join(user_runtime_path, 'certs')
     credentials_path = os.path.join(user_runtime_path, 'credentials')
-    #ensure existence of certs directory (~/.remote_xcode_server/certs)
+    #ensure existence of certs directory (~/.remote-xcode-server/certs)
     if not os.path.exists(certs_path):
         os.makedirs(certs_path)
     else:
@@ -114,7 +114,7 @@ def ensure_environment_setup():
             os.remove(certs_path)
             os.makedirs(certs_path)
 
-    #ensure existence of credentials directory (~/.remote_xcode_server/credentials)
+    #ensure existence of credentials directory (~/.remote-xcode-server/credentials)
     if not os.path.exists(credentials_path):
         os.makedirs(credentials_path)
     else:
@@ -144,14 +144,14 @@ def ensure_environment_setup():
         else:
             update_windows_path(executables_path)
 
-    
+
 
     #if this is a windows machine
     if not posix_os:
         shim_script_name = 'xcodebuild.cmd'
         shim_script_path = os.path.join(executables_path, shim_script_name)
         shim_script_content = f'@echo off\npython "{client_script_path}" build %*'
-    #if this is a posix machine 
+    #if this is a posix machine
     else:
         shim_script_name = 'xcodebuild'
         shim_script_path = os.path.join(executables_path, shim_script_name)
