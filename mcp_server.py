@@ -1,4 +1,3 @@
-from ntpath import dirname
 import os, subprocess, socket, json, struct, hashlib, time, re, secrets, ssl, hmac, pty, select
 from flask import Flask, request, send_file, send_from_directory, jsonify, Request, Response
 from threading import Thread, Lock
@@ -21,18 +20,15 @@ nonce_ttl_s = 300
 SECURITY_METADATA_FILENAME = 'security_metadata.json'
 
 # establish several filesystem level global variables
-# pcm.cwd = unix_path(os.getpcm.cwd())
 cwd = pcm.cwd
-project_name = get_project_name()
-server_dir_name = get_runtime_dir_name()
-server_dir_path = os.path.join(pcm.cwd, server_dir_name)
-project_info_filename = 'projectinfo.txt'
-project_info_filepath = os.path.join(server_dir_path, project_info_filename)
+server_dir_name = get_server_dir_name()
+server_dir_path = get_server_dir_path()
+project_runtime_dir_name = get_project_runtime_dir_name()
+project_runtime_dir_path = os.path.join(pcm.cwd, project_runtime_dir_name)
 legacy_allowed_interactive_commands_filename = 'allowed_interactive_commands.txt'
 allowed_interactive_commands_filename = 'allowed-interactive-commands.txt'
 legacy_allowed_interactive_commands_path = os.path.join(server_dir_path, legacy_allowed_interactive_commands_filename)
 allowed_interactive_commands_path = os.path.join(server_dir_path, allowed_interactive_commands_filename)
-user_runtime_dir_path = get_user_runtime_dir_path()
 
 PAIRING_EXPIRY_UNIX = 0
 PAIRING_LOCK = Lock()
@@ -55,7 +51,7 @@ def get_server_port() -> int:
 
 
 def _secrets_base_dir() -> str:
-    return os.path.join(get_user_runtime_dir_path(), '.secrets')
+    return os.path.join(get_server_dir_path(), '.secrets')
 
 
 def _security_metadata_path() -> str:
@@ -78,7 +74,7 @@ def _generate_secret_key_hmac() -> str:
 
 def _generate_secret_pair(path: Optional[str] = None) -> tuple[str, str]:
     if not path:
-        path = get_user_runtime_dir_path()
+        path = get_server_dir_path()
     print('Generating self-signed certificates for HTTPS...')
     proc = subprocess.run(
         [
@@ -551,31 +547,29 @@ def _find_executable_paths(command_names) -> dict[str, str]:
     return path_dict
 
 def _ensure_server_dir():
-    """Ensures the existence of the global .remote-xcode-server directory located by default in the user's home dir"""
-    user_home_dir = get_user_home_dir()
-    server_dir = os.path.join(user_home_dir, server_dir_name)
-    if not os.path.exists(server_dir):
-        os.makedirs(server_dir)
-    elif not os.path.isdir(server_dir):
-        os.remove(server_dir)
-        os.makedirs(server_dir)
+    """Ensures the existence of the global ~/.remote-xcode-server directory."""
+    ensure_directory_exists(server_dir_path)
 
-def _set_upload_folder(path):
-    global UPLOAD_FOLDER
+def _set_current_project_runtime_dir_path(path: str):
+    global current_project_runtime_dir_path
     if not os.path.exists(path):
         raise FileNotFoundError(f'Error, could not find new upload folder: {path}')
-    UPLOAD_FOLDER = path
-    app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-    pcm.UPLOAD_FOLDER = UPLOAD_FOLDER
+    current_project_runtime_dir_path = path
+    app.config['UPLOAD_FOLDER'] = current_project_runtime_dir_path
+    pcm.project_runtime_dir_path = current_project_runtime_dir_path
 
 #ensures existence of global (not project-specific) .remote-xcode-server directory
 _ensure_server_dir()
 #bootstrap security state
 bootstrap_security_state()
+
+#check for existence of known git repos file.  If it doesn't exist, run pcm.scan_for_git_projects and create it
+# known_git_projects_path = server_dir_path
+
 #initialize the project context manager
 pcm.initialize()
 # ensure current upload dir exists even on a brand-new install with no tracked project yet
-ensure_directory_exists(pcm.UPLOAD_FOLDER)
+ensure_directory_exists(pcm.project_runtime_dir_path)
 
 # set up sockets for streaming xcode commands (server) and sending/receiving files (filesocket)
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -607,7 +601,7 @@ if pcm.current_project:
         else:
             raise ValueError(f"Value for key 'project_root_path'")
 
-    pcm.UPLOAD_FOLDER = os.path.join(project_root, pcm.UPLOAD_FOLDER_NAME)
+    pcm.project_runtime_dir_path = os.path.join(project_root, pcm.project_runtime_dir_name)
 
     if not _normalize_path_for_compare(pcm.cwd) == _normalize_path_for_compare(project_root):
         if os.path.exists(project_root):
@@ -621,8 +615,7 @@ if pcm.current_project:
     #if we actually know which project we are in, or at least that we are in a project at all
     #otherwise it is just creating a folder in a random location, which we want to avoid
     if not uploads_folder_exists(project_id=pcm.current_project['id']):
-        os.makedirs(pcm.UPLOAD_FOLDER)
-        # os.mkdir(os.path.join(pcm.current_project['project_root_path'], pcm.UPLOAD_FOLDER_NAME))
+        os.makedirs(pcm.project_runtime_dir_path)
 else:
     if not isinstance(pcm.current_project, dict):
         raise ValueError("Something has gone seriously wrong.  pcm.current_project isn't even a dict.  pcm.currentproject: {pcm.currentproject}")
@@ -632,24 +625,10 @@ else:
 
 
 
-if not os.path.exists(os.path.join(pcm.UPLOAD_FOLDER, project_info_filename)): #this means this is the first time the server is being run,
-        with open(os.path.join(pcm.UPLOAD_FOLDER, project_info_filename), 'w') as f:
-            config_lines = [f'project_root:{pcm.cwd}\n', f'project_name:{project_name}\n']
-            for line in config_lines:
-                if line[-1] in '\n\r':
-                    f.write(line)
-                else:
-                    f.write(line + '\n')
-            # f.writelines(config_lines)
-
-
-
-
-
 JOBS = {}
 app = Flask(__name__)
-UPLOAD_FOLDER = ''
-_set_upload_folder(pcm.UPLOAD_FOLDER)
+current_project_runtime_dir_path = ''
+_set_current_project_runtime_dir_path(pcm.project_runtime_dir_path)
 TRANSFER_SESSIONS: dict[str, dict] = {}
 OUTBOUND_TRANSFER_SESSIONS: dict[str, dict] = {}
 SESSION_LOCK = Lock()
@@ -889,7 +868,7 @@ def _before_request_func():
         projects_context_result = pcm.handle_project_context()
         if projects_context_result:
             return jsonify({'ok': False, 'error': projects_context_result}), 400
-        _set_upload_folder(pcm.UPLOAD_FOLDER)
+        _set_current_project_runtime_dir_path(pcm.project_runtime_dir_path)
     return None
 
 
@@ -1934,10 +1913,10 @@ def start_build_job():
         if file and allowed_filename(file.filename):
             #create a secure version of the filename
             filename = secure_filename(file.filename)
-            #save the file with the secure filename in UPLOAD_FOLDER
-            file.save(os.path.join(pcm.UPLOAD_FOLDER, filename))
+            #save the file with the secure filename in the current project's runtime dir
+            file.save(os.path.join(pcm.project_runtime_dir_path, filename))
 
-            patch_path = f'{pcm.UPLOAD_FOLDER}/{filename}'
+            patch_path = f'{pcm.project_runtime_dir_path}/{filename}'
             if os.path.getsize(patch_path) > 0:
                 git_apply_command = f'git apply {patch_path}'
                 #run the git apply command
@@ -1949,7 +1928,7 @@ def start_build_job():
                 return f'<p>Already building {project_name}, job_id: {job_id}</p>'
 
             build_log_name:str = f'buildlog-{job_id}.txt'
-            build_log_path:str = os.path.join(pcm.UPLOAD_FOLDER, build_log_name)
+            build_log_path:str = os.path.join(pcm.project_runtime_dir_path, build_log_name)
 
             #Create the new job object and put it in job_id in the JOBS dict.
             #We have to be careful to ensure the file gets closed
@@ -2026,5 +2005,3 @@ if __name__ == '__main__':
     ip, port = '0.0.0.0', get_server_port()
     cert_path, key_path = get_tls_paths()
     app.run(ip, port, ssl_context=(cert_path, key_path))
-
-

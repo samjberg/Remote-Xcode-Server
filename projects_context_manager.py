@@ -1,18 +1,18 @@
 from sys import set_coroutine_origin_tracking_depth
-from mcp_utils import get_user_runtime_dir_path, generate_project_id, get_git_username, get_user_runtime_dir_path, ensure_directory_exists
+from mcp_utils import get_server_dir_path, generate_project_id, get_git_username, ensure_directory_exists
 from flask import request
 import os, json, time, subprocess
 
-user_runtime_dir_path = get_user_runtime_dir_path()
+server_dir_path = get_server_dir_path()
 default_projects_dir_name = 'projects'
-default_projects_dir_path = os.path.join(user_runtime_dir_path, default_projects_dir_name)
+default_projects_dir_path = os.path.join(server_dir_path, default_projects_dir_name)
 projects_dict_filename = 'tracked_projects.csv'
-projects_dict_filepath = os.path.join(user_runtime_dir_path, projects_dict_filename)
+projects_dict_filepath = os.path.join(server_dir_path, projects_dict_filename)
 cwd = os.getcwd()
 current_project = {}
 projects_dict = {}
-UPLOAD_FOLDER_NAME = '.remote-xcode-server'
-UPLOAD_FOLDER = ''
+project_runtime_dir_name = '.remote-xcode-server'
+project_runtime_dir_path = ''
 
 
 def load_projects_dict() -> dict:
@@ -40,15 +40,14 @@ def save_projects_dict(projs_dict: dict=None):
         json.dump(projs_dict, f)
 
 def _ensure_server_dir() -> None:
-    server_dir_path = get_user_runtime_dir_path()
     ensure_directory_exists(server_dir_path)
 
 
 def _ensure_projects_dict_file() -> None:
     global projects_dict_filepath
     if not os.path.exists(projects_dict_filepath):
-        if not os.path.exists(get_user_runtime_dir_path()):
-            os.makedirs(get_user_runtime_dir_path())
+        if not os.path.exists(server_dir_path):
+            os.makedirs(server_dir_path)
         #create empty file at projects_dict_filepath
         with open(projects_dict_filepath, 'w') as f:
             f.write('{}\n')
@@ -116,7 +115,7 @@ def remove_project_from_list(project_id:str = '', project_name: str = '') -> Non
 
 def set_current_project(project_id: str='', project_name: str='', project: dict = None):
     '''Sets current project by either id and/or name'''
-    global current_project, UPLOAD_FOLDER
+    global current_project, project_runtime_dir_path
     if project:
         current_project = project
     elif project_id and project_name:
@@ -162,10 +161,10 @@ def set_current_project(project_id: str='', project_name: str='', project: dict 
         project_root = current_project.get('project_root_path', '')
         if not project_root:
             raise ValueError('Error, invalid project_root_path: {project_root}')
-        UPLOAD_FOLDER = os.path.join(project_root, UPLOAD_FOLDER_NAME)
+        project_runtime_dir_path = os.path.join(project_root, project_runtime_dir_name)
 
-    #verify that UPLOAD_FOLDER (now that it has been computed) exists, if not, create it
-    ensure_directory_exists(UPLOAD_FOLDER)
+    #verify that project_runtime_dir_path (now that it has been computed) exists, if not, create it
+    ensure_directory_exists(project_runtime_dir_path)
 
 
 
@@ -243,7 +242,7 @@ def handle_project_context():
             #this means that project_id was found in the projects file, but not in in-memory projects_dict
             projects_dict[project_id] = project
         else:
-            # this means that project_id was found in 
+            # this means that project_id was found in
             loaded_projects_dict = load_projects_dict()
             if project_id not in loaded_projects_dict:
                 save_projects_dict(projects_dict)
@@ -259,7 +258,7 @@ def handle_project_context():
     project_path = ''
     project_id = generate_project_id(project_name)
     if project_id in projects_dict.keys():
-        set_current_project(project=projects_dict[project_id]) 
+        set_current_project(project=projects_dict[project_id])
     elif project_id:
         #project_id is not in projects_dict (the project is not tracked yet), but there is a project_id, meaning there was a non_empty name
         #search projects dir, each project directory within it is named its project id (NOT the project's actual name)
@@ -285,7 +284,7 @@ def handle_project_context():
                 print('Error in handle_project_context attempting to clone project from remote (github) repo')
                 err_msg = proc.stderr.decode(errors='replace') if proc.stderr else 'git clone failed'
                 return err_msg
-            #extremely crude check for valid ipv4 format, just ensures there are 4 . separated sections (i.e. there are 3 .s) 
+            #extremely crude check for valid ipv4 format, just ensures there are 4 . separated sections (i.e. there are 3 .s)
             if len(client_ip.split('.')) == 4:
                 add_project_to_list(project_name, project_path, client_ip=client_ip, set_as_current_project=True)
         else:
@@ -303,10 +302,25 @@ def handle_project_context():
     save_projects_dict()
     return None
 
+def scan_for_git_projects(scan_root_dir:str, project_names: list[str]=[], ignore_subrepos=True) -> list[str]:
+    '''Recursively scan scan_root_dir and all subdirs for GIT projects'''
+    if not os.path.exists(scan_root_dir):
+        raise FileNotFoundError(f'Error, cannot scan in nonexistant directory path: {scan_root_dir}')
+    elif os.path.isfile(scan_root_dir):
+        raise RuntimeError(f'Error: given directory path is actually a file: {scan_root_dir}')
+    found_git_projects = []
+    for dirpath, dirnames, filenames in os.walk(scan_root_dir):
+        if '.git' in dirnames:
+            found_git_projects.append(dirpath)
+            if ignore_subrepos:
+                dirnames[:] = []
+    return found_git_projects
 
 
 def initialize():
-    global UPLOAD_FOLDER, projects_dict, current_project, cwd
+    global project_runtime_dir_path, projects_dict, current_project, cwd
+    #actual literal cwd that rxs is running from
+    literal_cwd = os.getcwd()
     current_project = {}
     _ensure_projects_dict_file()
     _ensure_default_projects_dir()
@@ -327,8 +341,7 @@ def initialize():
     if current_proj_path:
         cwd = current_proj_path
 
-    UPLOAD_FOLDER = os.path.join(cwd, '.remote-xcode-server')
-
+    project_runtime_dir_path = os.path.join(cwd, project_runtime_dir_name)
 
 
 

@@ -5,7 +5,6 @@ from uuid import uuid4
 
 from requests.models import DecodeError
 
-from projects_context_manager import get_project
 try:
     from typing import ParamSpec
 except ImportError:
@@ -17,8 +16,8 @@ P = ParamSpec("P")
 R = TypeVar("R", bound=subprocess.CompletedProcess)
 KB = 1024
 MB = KB * KB
-runtime_dir_name = '.remote-xcode-server'
-user_runtime_dir_name = '.remote-xcode-server'
+project_runtime_dir_name = '.remote-xcode-server'
+server_dir_name = '.remote-xcode-server'
 
 def ensure_directory_exists(dir_path: str) -> None:
     if not os.path.exists(dir_path):
@@ -29,20 +28,33 @@ def ensure_directory_exists(dir_path: str) -> None:
         os.makedirs(dir_path)
 
 
-def get_runtime_dir_name() -> str:
-    return runtime_dir_name
+def get_project_runtime_dir_name() -> str:
+    return project_runtime_dir_name
 
-def get_user_runtime_dir_name() -> str:
-    return user_runtime_dir_name
+def get_server_dir_name() -> str:
+    return server_dir_name
 
-def get_runtime_dir_path(cwd:Optional[str]=None) -> str:
+def get_project_runtime_dir_path(cwd:Optional[str]=None) -> str:
     """Returns the directory Remote-Xcode-Server uses to save files on both client and server"""
     if cwd is None:
         cwd = os.getcwd()
-    return os.path.join(cwd, runtime_dir_name)
+    return os.path.join(cwd, project_runtime_dir_name)
+
+def get_server_dir_path() -> str:
+    return os.path.join(get_user_home_dir(), server_dir_name)
+
+# Backward-compatible names used throughout the existing codebase.
+def get_runtime_dir_name() -> str:
+    return get_project_runtime_dir_name()
+
+def get_user_runtime_dir_name() -> str:
+    return get_server_dir_name()
+
+def get_runtime_dir_path(cwd:Optional[str]=None) -> str:
+    return get_project_runtime_dir_path(cwd)
 
 def get_user_runtime_dir_path() -> str:
-    return os.path.join(get_user_home_dir(), user_runtime_dir_name)
+    return get_server_dir_path()
 
 def unix_path(path:str) -> str:
     """Returns a POSIX compliant version of path"""
@@ -54,7 +66,7 @@ def allowed_filename(filename:str) -> bool:
 
 def get_build_log_path(job_id:int) -> str:
     cwd = os.getcwd()
-    runtime_path = get_runtime_dir_path(cwd)
+    runtime_path = get_project_runtime_dir_path(cwd)
     filename = f'buildlog-{job_id}.txt'
     build_log_path = os.path.join(runtime_path, filename)
     return build_log_path
@@ -63,6 +75,9 @@ def get_build_log_path(job_id:int) -> str:
 
 def uploads_folder_exists(project_id: str = '', project_name: str = '') -> bool:
     '''Checks for the existence of the uploads folder.  This is a per-project folder, so this is a per-project function'''
+    # Local import avoids circular import at module load time:
+    # mcp_utils -> projects_context_manager -> mcp_utils
+    from projects_context_manager import get_project
     if project_id:
         project = get_project(project_id=project_id)
     elif project_name:
@@ -71,9 +86,9 @@ def uploads_folder_exists(project_id: str = '', project_name: str = '') -> bool:
         raise RuntimeError('Must provide either project_id or project_name as argument to upload_folder_exists')
 
     cwd = project.get('project_root_path', '')
-    if runtime_dir_name not in os.listdir(cwd):
+    if project_runtime_dir_name not in os.listdir(cwd):
         return False
-    return os.path.isdir(get_runtime_dir_path(cwd))
+    return os.path.isdir(get_project_runtime_dir_path(cwd))
 
 def get_project_name() -> str:
     dir_contents = os.listdir()
@@ -159,14 +174,14 @@ def update_gitignore():
     ignores_runtime_dir = False
     if not os.path.exists(gitignore_path):
         with open(gitignore_path, 'w') as f:
-            f.write(f'/{runtime_dir_name}/\n')
+            f.write(f'/{project_runtime_dir_name}/\n')
     else:
         ends_with_newline = False
         with open(gitignore_path, 'r') as f:
             lines = f.readlines()
 
         for line in lines:
-            for s in [f'/{runtime_dir_name}/', f'{runtime_dir_name}/']:
+            for s in [f'/{project_runtime_dir_name}/', f'{project_runtime_dir_name}/']:
                 if s == line or s in line:
                     ignores_runtime_dir = True
 
@@ -179,7 +194,7 @@ def update_gitignore():
 
         additions = []
         if not ignores_runtime_dir:
-            additions.append(f'/{runtime_dir_name}/\n')
+            additions.append(f'/{project_runtime_dir_name}/\n')
 
         if additions:
             with open(gitignore_path, 'a') as f:
