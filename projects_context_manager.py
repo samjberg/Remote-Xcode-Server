@@ -1,5 +1,6 @@
 from sys import set_coroutine_origin_tracking_depth
-from mcp_utils import get_server_dir_path, generate_project_id, get_git_username, ensure_directory_exists
+from environment_setup import _normalize_path_for_compare
+from mcp_utils import get_project_name, get_server_dir_path, generate_project_id, get_git_username, ensure_directory_exists, is_git_repo
 from flask import request
 import os, json, time, subprocess
 
@@ -13,6 +14,8 @@ current_project = {}
 projects_dict = {}
 project_runtime_dir_name = '.remote-xcode-server'
 project_runtime_dir_path = ''
+known_git_repos_filename = 'known_git_repos.json'
+known_git_repos = []
 
 
 def load_projects_dict() -> dict:
@@ -64,7 +67,7 @@ def _create_project(project_name:str, project_root_path: str, client_ip:str ='')
         project['known_clients'].append(client_ip)
     return project
 
-def add_project_to_list(project_name: str, project_root_path: str, client_ip: str='', set_as_current_project=False) -> None:
+def add_project_to_list(project_name: str, project_root_path: str, client_ip: str='', set_as_current_project=False) -> dict:
     global projects_dict
     if not projects_dict:
         projects_dict = load_projects_dict()
@@ -78,6 +81,8 @@ def add_project_to_list(project_name: str, project_root_path: str, client_ip: st
 
     if set_as_current_project:
         set_current_project(project_id, project_name)
+
+    return project
 
 
 
@@ -213,6 +218,19 @@ def _get_project_by_name(project_name: str) -> dict:
         if project.get('project_name') == project_name:
             return project
 
+    #project wasn't found by name in projects_dict or in the projects file
+    #final fallback to searching for a name match in known_git_repos
+    normed_project_name = _normalize_path_for_compare(project_name)
+    for git_repo_path in known_git_repos:
+        unnormed_name = os.path.split(git_repo_path)[1]
+        git_repo_name = _normalize_path_for_compare(unnormed_name)
+        if normed_project_name == git_repo_name:
+            #found project
+            project_root = git_repo_path
+            #create the project and add it to tracked projects
+            project = add_project_to_list(project_name, project_root)
+            return project
+
     return {}
 
 
@@ -302,8 +320,10 @@ def handle_project_context():
     save_projects_dict()
     return None
 
-def scan_for_git_projects(scan_root_dir:str, project_names: list[str]=[], ignore_subrepos=True) -> list[str]:
+def scan_for_git_repos(scan_root_dir:str, project_names: list[str]|None=None, ignore_subrepos=True) -> list[str]:
     '''Recursively scan scan_root_dir and all subdirs for GIT projects'''
+    if project_names is None:
+        project_names = []
     if not os.path.exists(scan_root_dir):
         raise FileNotFoundError(f'Error, cannot scan in nonexistant directory path: {scan_root_dir}')
     elif os.path.isfile(scan_root_dir):
@@ -311,10 +331,71 @@ def scan_for_git_projects(scan_root_dir:str, project_names: list[str]=[], ignore
     found_git_projects = []
     for dirpath, dirnames, filenames in os.walk(scan_root_dir):
         if '.git' in dirnames:
-            found_git_projects.append(dirpath)
+            if not project_names:
+                found_git_projects.append(dirpath)
+            else:
+                name = os.path.split(dirpath)[1]
+                if name in project_names:
+                    found_git_projects.append(dirpath)
             if ignore_subrepos:
                 dirnames[:] = []
     return found_git_projects
+
+def _ensure_known_git_repos_file() -> None:
+    global known_git_repos
+    known_git_repos_path = os.path.join(server_dir_path, known_git_repos_filename)
+    #if known_git_repos_path already exists, attempt to load from it.  Hard-fail on failure.
+    if os.path.exists(known_git_repos_path):
+        try:
+            with open(known_git_repos_path, 'r') as f:
+                payload = json.load(f)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f'Error decoding JSON in known git repos file: {known_git_repos_path}') from e
+        except OSError as e:
+            raise RuntimeError(f'Error opening known git repos file: {known_git_repos_path}') from e
+
+        if not isinstance(payload, dict):
+            raise RuntimeError(f'Invalid known git repos payload type at {known_git_repos_path}: expected object')
+        loaded_known_git_repos = payload.get('known_git_repos', [])
+        if not isinstance(loaded_known_git_repos, list):
+            raise RuntimeError(f'Invalid known_git_repos value at {known_git_repos_path}: expected list')
+
+        for path in loaded_known_git_repos:
+            if isinstance(path, str) and path and path not in known_git_repos:
+                known_git_repos.append(path)
+        return
+    #get command line input from the user
+    user_arg = input('Enter root path to scan for git repos, or provide a filepath with a newline separated list of paths')
+    user_arg = os.path.expanduser(user_arg)
+    paths_to_scan = []
+    found_repos = []
+    if not os.path.exists(user_arg):
+        raise FileNotFoundError(f'Cannot find file or directory at path: {user_arg}')
+    elif os.path.isfile(user_arg):
+        with open(user_arg, 'r') as f:
+            paths_to_scan = [line.strip() for line in f.readlines() if line.strip()]
+            #ensure all paths in paths_to_scan are absolute paths
+            paths_to_scan = [path if os.path.isabs(path) else os.path.abspath(path) for path in paths_to_scan]
+    else:
+        #user_arg is a directory, so just add it to paths_to_scan as the only path to scan
+        path_to_scan = user_arg if os.path.isabs(user_arg) else os.path.abspath(user_arg)
+        paths_to_scan.append(path_to_scan)
+
+    for path in paths_to_scan:
+        found_repos.extend(scan_for_git_repos(path))
+
+    for path in found_repos:
+        if not path in known_git_repos:
+            known_git_repos.append(path)
+
+    #ensure parent folder of known_git_repos_path exists
+    ensure_directory_exists(server_dir_path)
+    with open(known_git_repos_path, 'w') as f:
+        try:
+            json.dump({'known_git_repos': known_git_repos}, f)
+        except Exception as e:
+            print(f'Error trying to write json to known_git_repos file: {e}')
+
 
 
 def initialize():
@@ -324,6 +405,7 @@ def initialize():
     current_project = {}
     _ensure_projects_dict_file()
     _ensure_default_projects_dir()
+    _ensure_known_git_repos_file()
     projects_dict = load_projects_dict()
     if projects_dict:
         most_recent_time = 0.0
@@ -343,6 +425,13 @@ def initialize():
 
     project_runtime_dir_path = os.path.join(cwd, project_runtime_dir_name)
 
+    #if the server program is launched from inside of a known git repo, until proven otherwise, we will treat
+    #that repo as the current rxs project
+    if is_git_repo(literal_cwd):
+        cwd_project_name = os.path.split(literal_cwd)[1]
+        known_repo_names = [os.path.split(path)[1] for path in known_git_repos]
+        if cwd_project_name in known_repo_names:
+            set_current_project(project_name=cwd_project_name)
 
 
 

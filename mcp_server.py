@@ -563,9 +563,6 @@ _ensure_server_dir()
 #bootstrap security state
 bootstrap_security_state()
 
-#check for existence of known git repos file.  If it doesn't exist, run pcm.scan_for_git_projects and create it
-# known_git_projects_path = server_dir_path
-
 #initialize the project context manager
 pcm.initialize()
 # ensure current upload dir exists even on a brand-new install with no tracked project yet
@@ -1446,14 +1443,15 @@ def get_allowed_interactive_commands_route():
 @app.route('/retrieve_text_changes')
 def send_changes():
     project_name = request.args.get('project_name', '')
-    git_diff_path, changed_binary_paths = prepare_text_changes()
+    cwd = pcm.current_project.get('project_root_path', pcm.cwd)
+    git_diff_path, changed_binary_paths = prepare_text_changes(cwd)
     git_diff_dir, git_diff_name = [unix_path(p) for p in os.path.split(git_diff_path)]
     return send_from_directory(git_diff_dir, git_diff_name, as_attachment=True)
 
 @app.route('/retrieve_changed_binary_paths')
 def send_changed_binary_paths():
-    project_name = request.args.get('project_name', '')
-    changed_file_paths = [path for path in get_changed_file_paths() if path]
+    cwd = pcm.current_project.get('project_root_path', pcm.cwd)
+    changed_file_paths = [path for path in get_changed_file_paths(cwd) if path]
     changed_binary_paths = [path for path in changed_file_paths if not is_plaintext(path.split('/')[-1])]
     paths_str = '\n'.join(changed_binary_paths)
     return paths_str
@@ -1466,22 +1464,25 @@ def send_diff_for_files():
     except KeyError as e:
         print(f'Error: key filepaths not found in request json.  err: {e}')
 
-    git_diff_path = get_diff_for_files(paths)
+    cwd = pcm.current_project.get('project_root_path', pcm.cwd)
+    git_diff_path = get_diff_for_files(cwd, paths)
     diffs_path, git_diff_name = os.path.split(git_diff_path)
     return send_from_directory(diffs_path, git_diff_name)
 
 
 @app.route('/retrieve_current_commit_hash')
 def send_current_commit_hash():
-    project_name = request.args.get('project_name', '')
-    current_commit_hash = get_current_commit_hash()
+    cwd = pcm.current_project.get('project_root_path', pcm.cwd)
+    project_name = pcm.current_project.get('project_name', '')
+    current_commit_hash = get_current_commit_hash(cwd, project_name)
     return current_commit_hash
 
 
 @app.route('/retrieve_git_branches/<sort_order>')
 def send_git_branches(sort_order:str):
+    cwd = pcm.current_project.get('project_root_path', pcm.cwd)
     project_name = request.args.get('project_name', '')
-    git_branches, current_branch = get_git_branches(project_name, return_current_branch=True, sort_order=sort_order)
+    git_branches, current_branch = get_git_branches(cwd, project_name, return_current_branch=True, sort_order=sort_order)
     return jsonify({'branches': git_branches, 'current_branch': current_branch})
 
 
@@ -1946,8 +1947,8 @@ def start_build_job():
 
 @app.route('/retrieve_changed_file_paths/<scope>')
 def send_changed_file_paths(scope:str) -> Response:
-    project_name = request.args.get('project_name', '')
-    changed_file_paths = get_changed_file_paths(scope)
+    cwd = pcm.current_project.get('project_root_path', pcm.cwd)
+    changed_file_paths = get_changed_file_paths(cwd, scope)
     changed_plaintext_paths = [path for path in changed_file_paths if is_plaintext(path)]
     changed_binary_paths = [path for path in changed_file_paths if path not in changed_plaintext_paths]
     obj = {'plaintext_file_paths': changed_plaintext_paths, 'binary_file_paths': changed_binary_paths}

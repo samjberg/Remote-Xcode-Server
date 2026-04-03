@@ -600,7 +600,6 @@ def _require_posix_tty_modules():
     return termios, tty
 
 
-
 def stream_remote_executable_from_server(
     server_addr: tuple[str, int],
     stream_id: str,
@@ -1263,7 +1262,7 @@ def apply_patch_server(server_addr:tuple[str, int], patch_path:str='') -> Respon
     if not patch_path:
         patch_path = os.path.join(get_runtime_dir_path(), 'gitdiff.diff')
     if not os.path.exists(patch_path):
-        patch_path, _ = prepare_text_changes()
+        patch_path, _ = prepare_text_changes(cwd)
     patch_path = _to_repo_relative_posix(patch_path, project_root)
     url = _build_server_url(server_addr, '/apply-patch-server')
     resp:Response = _secure_request('GET', url, params={'project_name': project_name, 'patch_path': patch_path})
@@ -1273,7 +1272,7 @@ def apply_patch_server(server_addr:tuple[str, int], patch_path:str='') -> Respon
 
 #Sort of like git push, but for uncommited changes and specifically from the server
 def send_current_changes(server_addr:tuple[str, int], project_name:str='') -> Response:
-    git_diff_path, changed_binary_paths = prepare_text_changes()
+    git_diff_path, changed_binary_paths = prepare_text_changes(cwd)
     paths = [os.path.join(get_runtime_dir_path(), 'gitdiff.diff'), *changed_binary_paths]
     print('sending paths:')
     print(paths)
@@ -1366,7 +1365,7 @@ def get_changed_server_files(server_addr:tuple[str, int], project_name:str, scop
 def sync_uncommitted_changes(server_addr:tuple[str, int], scope='repo') -> bool:
     '''Performs two way sync with server of all UNCOMMITTED changes.'''
     project_root_path = get_project_root_path()
-    changed_fpaths_client = get_changed_file_paths(scope)
+    changed_fpaths_client = get_changed_file_paths(cwd, scope)
     changed_plainpaths_client, changed_binarypaths_client = split_paths_by_text_or_binary(changed_fpaths_client)
     changed_server_result = get_changed_server_files(server_addr, get_appname(), scope)
     if not changed_server_result:
@@ -1385,7 +1384,7 @@ def sync_uncommitted_changes(server_addr:tuple[str, int], scope='repo') -> bool:
 
     #path to newly created diff representing the changes on the client.
     #It needs to be sent to the server (along with changed binary files being sent directly)
-    diff_to_send_path = get_diff_for_files(client_only_plainpaths, 'client_side_gitdiff.diff')
+    diff_to_send_path = get_diff_for_files(cwd, client_only_plainpaths, 'client_side_gitdiff.diff')
 
     #send the client-side diff and changed/new binaries on client side to server
     success = send_files(server_addr, [diff_to_send_path, *client_only_binarypaths])
@@ -2390,7 +2389,7 @@ if __name__ == '__main__':
         xcodebuild_args = []
         if len(sys.argv) > 2:
             xcodebuild_args = sys.argv[2:]
-        git_diff_filepath, changed_binary_paths = prepare_text_changes()
+        git_diff_filepath, changed_binary_paths = prepare_text_changes(cwd)
         resp:Response = start_build_job(server_addr, git_diff_filepath, changed_binary_paths, xcodebuild_args)
         json_obj = json.loads(resp.text)
         print(json_obj)
@@ -2494,7 +2493,7 @@ if __name__ == '__main__':
 
         if dest == 'client':
             if cmd == 'files':
-                paths = get_changed_file_paths()
+                paths = get_changed_file_paths(cwd)
                 print('Changed file paths:')
                 for path in paths:
                     print(f'\t{path}')
@@ -2526,7 +2525,7 @@ if __name__ == '__main__':
         elif dest == 'all':
             if cmd == 'files':
                 #client
-                client_paths = get_changed_file_paths()
+                client_paths = get_changed_file_paths(cwd)
                 print('Changed client file paths:')
                 for path in client_paths:
                     print(f'\t{path}')

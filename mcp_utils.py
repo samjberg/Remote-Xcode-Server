@@ -27,6 +27,10 @@ def ensure_directory_exists(dir_path: str) -> None:
         os.remove(dir_path)
         os.makedirs(dir_path)
 
+def is_git_repo(path:str) -> bool:
+    if '.git' in os.listdir(path):
+        return os.path.isdir(os.path.join(path, '.git'))
+    return False
 
 def get_project_runtime_dir_name() -> str:
     return project_runtime_dir_name
@@ -113,7 +117,7 @@ def get_project_root_path(cwd:str='.') -> str:
             if name == '.git':
                 return current_path
         path_parts = path_parts[:-1]
-    return cwd
+    raise RuntimeError(f'Unable to find project root path from given cwd: {cwd}')
 
 def get_user_home_dir() -> str:
     home_dir_unsanitized = os.path.expanduser('~')
@@ -126,10 +130,6 @@ def get_appname(cwd:str='') -> str:
     if not cwd:
         cwd = os.getcwd()
     root_path = get_project_root_path(cwd)
-    for name in os.listdir(root_path):
-        name_parts = name.split('.')
-        if name_parts[-1] == 'xcodeproj':
-            return name_parts[0]#.replace(' ', '_')
     return os.path.split(root_path)[-1]
     # return root_path.split('/')[-1]#.replace(' ', '_')
 
@@ -432,11 +432,11 @@ def git_apply_update_bundle(bundle_path:str) -> bool:
 
 
 
-def get_git_branches(app_name:str='', return_current_branch=False, sort_order='creatordate') -> Union[list[str], tuple[list[str], str]]:
+def get_git_branches(cwd:str, app_name:str='', return_current_branch=False, sort_order='creatordate') -> Union[list[str], tuple[list[str], str]]:
     if not app_name:
-        app_name = get_appname()
+        app_name = get_appname(cwd)
     git_command = f'git branch --sort={sort_order}'.split(' ')
-    proc = run_process(git_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = run_process(git_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd)
     if not proc.stdout:
         print(f"No output from {' '.join(git_command)}")
 
@@ -685,8 +685,15 @@ def execute_git_action(action:str, args:Optional[dict]=None, cwd:Optional[str]=N
     elif action == 'create_update_bundle':
         command = ['git', 'bundle', 'create', args['path'], f"{args['start_ref']}..{args['end_ref']}", '--all']
     elif action == 'apply_update_bundle':
-        if is_subdir(args['path'], get_project_root_path()):
-            command = ['git', 'fetch', args['path'], '+refs/heads/*:refs/heads/*', '+refs/tags/*:refs/tags/*']
+        bundle_path = args['path']
+        # Treat relative bundle paths as relative to the selected repo cwd, not process cwd.
+        if not os.path.isabs(bundle_path):
+            bundle_path = os.path.join(cwd, bundle_path)
+        bundle_path = os.path.realpath(bundle_path)
+        repo_root = os.path.realpath(cwd)
+
+        if is_subdir(bundle_path, repo_root):
+            command = ['git', 'fetch', bundle_path, '+refs/heads/*:refs/heads/*', '+refs/tags/*:refs/tags/*']
         else:
             raise PermissionError('path argument must be inside of repo')
     else:
@@ -726,11 +733,11 @@ def execute_git_action(action:str, args:Optional[dict]=None, cwd:Optional[str]=N
 
 
 
-def get_current_commit_hash(app_name:str='') -> str:
-    if not app_name:
-        app_name = get_appname()
+def get_current_commit_hash(cwd:str, project_name:str='') -> str:
+    if not project_name:
+        project_name = get_appname(cwd)
     git_command = 'git rev-parse HEAD'.split(' ')
-    proc = subprocess.run(git_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = subprocess.run(git_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd)
     if proc.returncode != 0:
         err_text = proc.stderr.decode(errors='replace') if proc.stderr else ''
         print(f"Getting current git hash failed with command: {' '.join(git_command)}")
@@ -749,7 +756,7 @@ def get_current_commit_hash(app_name:str='') -> str:
 
 
 
-def get_changed_file_paths(scope='repo') -> list[str]:
+def get_changed_file_paths(cwd:str, scope='repo') -> list[str]:
     '''
     Returns a list of paths to all files that have been changed relative to HEAD, including untracked files.
 
@@ -758,8 +765,7 @@ def get_changed_file_paths(scope='repo') -> list[str]:
     only changes in the current directory (and subdirectories) will be included.'''
     # Use argv form (no shell) for cross-platform behavior.
     # Exclude .gitignore in Python instead of relying on shell/pathspec parsing.
-    cwd = os.getcwd()
-    project_root_path = get_project_root_path()
+    project_root_path = get_project_root_path(cwd)
     diff_command = ['git', 'diff', '--name-only', '-z', 'HEAD']
 
     if scope == 'cwd':
@@ -805,8 +811,7 @@ def get_changed_file_paths(scope='repo') -> list[str]:
 
     return file_paths
 
-def get_diff_for_files(paths:list[str], diff_filename='specific_files_gitdiff.diff') -> str:
-    cwd = os.getcwd()
+def get_diff_for_files(cwd: str, paths:list[str], diff_filename='specific_files_gitdiff.diff') -> str:
     runtime_dir_path = get_runtime_dir_path(cwd)
     git_diff_path = unix_path(os.path.join(runtime_dir_path, diff_filename))
     if os.path.exists(git_diff_path): #my brain would actually explode if this returned true lmao
@@ -818,23 +823,22 @@ def get_diff_for_files(paths:list[str], diff_filename='specific_files_gitdiff.di
             diff_file.write('\n')
         return git_diff_path
 
-    os.system('git add .')
+    run_process(['git', 'add', '.'], cwd=cwd)
     with open(git_diff_path, 'w') as diff_file:
         run_process(['git', 'diff', 'HEAD', '--', *paths], stdout=diff_file, stderr=subprocess.STDOUT, cwd=cwd)
     return git_diff_path
 
 
 
-def prepare_text_changes() -> tuple[str, list[str]]:
-    cwd = unix_path(os.getcwd())
+def prepare_text_changes(cwd:str) -> tuple[str, list[str]]:
     diffs_path = get_runtime_dir_path(cwd)
     diff_filename = 'gitdiff.diff'
     git_diff_path = os.path.join(diffs_path, diff_filename)
     if os.path.exists(git_diff_path):
         os.remove(git_diff_path)
-    os.system('git add .')
+    run_process(['git', 'add', '.'], cwd=cwd)
 
-    changed_file_paths = [path for path in get_changed_file_paths() if path]
+    changed_file_paths = [path for path in get_changed_file_paths(cwd) if path]
     changed_binary_paths = [path for path in changed_file_paths if not is_plaintext(path.split('/')[-1])]
     changed_text_paths = [path for path in changed_file_paths if path not in changed_binary_paths and path != '.gitignore']
 
@@ -842,6 +846,6 @@ def prepare_text_changes() -> tuple[str, list[str]]:
     # Build a patch that only contains plaintext files; binary files are sent separately.
     with open(git_diff_path, 'w', newline='') as diff_file:
         if changed_text_paths:
-            subprocess.run(['git', 'diff', 'HEAD', '--', *changed_text_paths], stdout=diff_file)
+            subprocess.run(['git', 'diff', 'HEAD', '--', *changed_text_paths], stdout=diff_file, cwd=cwd)
 
     return git_diff_path, changed_binary_paths

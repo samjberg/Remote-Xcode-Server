@@ -4,7 +4,6 @@ from mcp_utils import get_project_root_path, get_runtime_dir_path, get_user_runt
 from subprocess import run
 
 cwd = os.getcwd()
-project_root_path = get_project_root_path(cwd)
 rxs_root_path = os.path.dirname(os.path.realpath(__file__)) #the root path where THIS SCRIPT is located.  Needed for locating the client script, which is in the same directory
 runtime_dir_path = get_runtime_dir_path(cwd)
 user_runtime_path = get_user_runtime_dir_path()
