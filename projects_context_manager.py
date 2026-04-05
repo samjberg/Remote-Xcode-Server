@@ -1,8 +1,8 @@
 from sys import set_coroutine_origin_tracking_depth
 from environment_setup import _normalize_path_for_compare
-from mcp_utils import get_project_name, get_server_dir_path, generate_project_id, get_git_username, ensure_directory_exists, is_git_repo
+from mcp_utils import get_server_dir_path, generate_project_id, get_git_username, ensure_directory_exists, is_git_repo, mailbox_has_bundle_request
 from flask import request
-import os, json, time, subprocess
+import os, json, time
 
 server_dir_path = get_server_dir_path()
 default_projects_dir_name = 'projects'
@@ -15,7 +15,11 @@ projects_dict = {}
 project_runtime_dir_name = '.remote-xcode-server'
 project_runtime_dir_path = ''
 known_git_repos_filename = 'known_git_repos.json'
+known_git_repos_path = os.path.join(server_dir_path, known_git_repos_filename)
 known_git_repos = []
+mailbox_filename = 'mailbox.json'
+mailbox_path = os.path.join(server_dir_path, mailbox_filename)
+mailbox = {}
 
 
 def load_projects_dict() -> dict:
@@ -33,7 +37,7 @@ def load_projects_dict() -> dict:
 
     return projects_dict
 
-def save_projects_dict(projs_dict: dict=None):
+def save_projects_dict(projs_dict: dict|None=None):
     if projs_dict is None:
         projs_dict = projects_dict
     if not os.path.exists(projects_dict_filepath):
@@ -117,8 +121,10 @@ def remove_project_from_list(project_id:str = '', project_name: str = '') -> Non
                 break
         if id_to_remove:
             del projects_dict[id_to_remove]
+    #update tracked projects file
+    save_projects_dict(projects_dict)
 
-def set_current_project(project_id: str='', project_name: str='', project: dict = None):
+def set_current_project(project_id: str='', project_name: str='', project: dict|None = None):
     '''Sets current project by either id and/or name'''
     global current_project, project_runtime_dir_path
     if project:
@@ -275,12 +281,12 @@ def handle_project_context():
     client_ip = str(request.remote_addr)
     project_path = ''
     project_id = generate_project_id(project_name)
+    found_project = False
     if project_id in projects_dict.keys():
         set_current_project(project=projects_dict[project_id])
     elif project_id:
         #project_id is not in projects_dict (the project is not tracked yet), but there is a project_id, meaning there was a non_empty name
         #search projects dir, each project directory within it is named its project id (NOT the project's actual name)
-        found_project = False
         for proj_id in os.listdir(default_projects_dir_path):
             if proj_id == project_id:
                 #this is a very weird case to imagine, but it could happen.  Where I guess the user has manually placed a project
@@ -291,25 +297,45 @@ def handle_project_context():
                 set_current_project(project_id=project_id, project_name=project_name)
                 break
 
-        if not found_project:
-            #project not found, manually create it in default projects dir, and add to projects_dict
-            project_path = os.path.join(default_projects_dir_path, project_id)
-            os.makedirs(project_path)
-            git_username = _determine_git_username()
-            remote_url = f'https://github.com/{git_username}/{project_name}'
-            proc = subprocess.run(['git', 'clone', remote_url, project_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if proc.returncode:
-                print('Error in handle_project_context attempting to clone project from remote (github) repo')
-                err_msg = proc.stderr.decode(errors='replace') if proc.stderr else 'git clone failed'
-                return err_msg
-            #extremely crude check for valid ipv4 format, just ensures there are 4 . separated sections (i.e. there are 3 .s)
-            if len(client_ip.split('.')) == 4:
-                add_project_to_list(project_name, project_path, client_ip=client_ip, set_as_current_project=True)
-        else:
-            print(project_path)
-
+        
+    #final fallback, search through known_git_repos paths to find any project matches by name
     if not current_project:
-        return 'Failed to set current project context'
+        _ensure_known_git_repos_file()
+        current_project_name = _normalize_path_for_compare(project_name)
+        for path in known_git_repos:
+            repo_name = _normalize_path_for_compare(os.path.split(path)[1])
+            #use current_project_name because it is the normalized version of project_name
+            if repo_name == current_project_name: 
+                add_project_to_list(project_name, path, client_ip, set_as_current_project=True)
+                return None
+    else:
+        found_project = True
+
+
+    #post final fallback.  We genuinely failed to find the project on the server, post a request to
+    #the control mailbox for a full project bundle which will be sent back with the next response to the reuqest
+    if not found_project:
+        global mailbox
+        #project not found, leave an entry in the mailbox requesting the project bundle from the client
+        #also of course create mailbox file if it doesn't exist
+        _ensure_mailbox_file()
+        load_mailbox_from_file() #this ensures mailbox is not an empty dict and does have 'bundle_requests' key
+        proj_id = project_id
+        if proj_id:
+            bundle_request = {'id': proj_id, 'project_name': project_name}
+            #make sure we do not append duplicate entries
+            if not mailbox_has_bundle_request(mailbox, bundle_request['id']):
+                mailbox['bundle_requests'].append(bundle_request)
+            with open(mailbox_path, 'w') as f:
+                json.dump(mailbox, f)
+
+        return_obj = {'ok': False, 'error': 'project missing', 'mailbox': mailbox}
+        return return_obj
+
+    else:
+        print(project_path)
+
+
     project_root = current_project.get('project_root_path', '')
     if not project_root:
         return 'Current project is missing project_root_path'
@@ -341,9 +367,23 @@ def scan_for_git_repos(scan_root_dir:str, project_names: list[str]|None=None, ig
                 dirnames[:] = []
     return found_git_projects
 
+def _ensure_mailbox_file() -> None:
+    if not os.path.exists(mailbox_path):
+        empty_mailbox = {'bundle_requests': []}
+        with open(mailbox_path, 'w') as f:
+            json.dump(empty_mailbox, f)
+    elif os.path.isdir(mailbox_path):
+        raise RuntimeError(f'Error: directory found at mailbox_path: {mailbox_path}, expected file')
+    elif os.path.isfile(mailbox_path):
+        try:
+            with open(mailbox_path, 'r') as f:
+                _ = json.load(f)
+        except json.JSONDecodeError as err:
+            #mailbox file got corrupted somehow
+            print(f'UNABLE TO DECODE MAILBOX FILE.  Continuing, but please pay attention to this message.  Error message: {err}')
+
 def _ensure_known_git_repos_file() -> None:
     global known_git_repos
-    known_git_repos_path = os.path.join(server_dir_path, known_git_repos_filename)
     #if known_git_repos_path already exists, attempt to load from it.  Hard-fail on failure.
     if os.path.exists(known_git_repos_path):
         try:
@@ -364,6 +404,7 @@ def _ensure_known_git_repos_file() -> None:
             if isinstance(path, str) and path and path not in known_git_repos:
                 known_git_repos.append(path)
         return
+
     #get command line input from the user
     user_arg = input('Enter root path to scan for git repos, or provide a filepath with a newline separated list of paths')
     user_arg = os.path.expanduser(user_arg)
@@ -396,6 +437,50 @@ def _ensure_known_git_repos_file() -> None:
         except Exception as e:
             print(f'Error trying to write json to known_git_repos file: {e}')
 
+def load_mailbox_from_file():
+    global mailbox
+    loaded_mailbox:dict = {}
+    with open(mailbox_path, 'r') as f:
+        try:
+            loaded_mailbox = json.load(f)
+        except json.JSONDecodeError as err:
+            raise RuntimeError(f'Error decoding mailbox JSON.  Error message: {err}')
+
+    reqs_to_add = []
+
+    for bundle_req in loaded_mailbox.get('bundle_requests', []):
+        found = False
+        for br in mailbox.get('bundle_requests', []):
+            #intentionally different fallback values so equality check fails if both .get calls fallback
+            if br.get('id', '') == bundle_req.get('id', ' '):
+                found = True
+                break
+
+        if not found:
+            reqs_to_add.append(bundle_req)
+
+    #just make absolutely 100% sure that mailbox is not {}, by manually ensuring it at least has 'bundle_requests'
+    if not 'bundle_requests' in mailbox.keys():
+        mailbox['bundle_requests'] = []
+
+    mailbox['bundle_requests'].extend(reqs_to_add)
+
+def save_mailbox_to_file():
+    global mailbox
+    with open(mailbox_path, 'r') as f:
+        try:
+            json.dump(mailbox, f)
+        except Exception as e:
+            print('Error trying to write json to mailbox file')
+
+
+def add_bundle_request_to_mailbox(bundle_request:dict) -> None:
+    global mailbox
+    load_mailbox_from_file()
+    if not mailbox_has_bundle_request(mailbox, bundle_request=bundle_request):
+        mailbox['bundle_requests'].append(bundle_request)
+        with open(mailbox_path, 'w') as f:
+            json.dump(mailbox, f)
 
 
 def initialize():
@@ -406,6 +491,7 @@ def initialize():
     _ensure_projects_dict_file()
     _ensure_default_projects_dir()
     _ensure_known_git_repos_file()
+    _ensure_mailbox_file()
     projects_dict = load_projects_dict()
     if projects_dict:
         most_recent_time = 0.0
@@ -433,6 +519,8 @@ def initialize():
         if cwd_project_name in known_repo_names:
             set_current_project(project_name=cwd_project_name)
 
+
+    
 
 
 

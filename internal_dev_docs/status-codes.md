@@ -117,3 +117,12 @@ Used in transfer init/complete routes:
 
 `ok` is not a session status; it is per-response success for a specific request.
 
+
+
+### 3.4 project_bundle structure
+- `id`: str, generated via mcp_utils.generate_project_id
+- `project_name`: str, the name of the project, usually the same as the directory name of the project's root directory
+- `project_root_path`: str, absolute path to the project root directory
+- `tracked_timestamp`: int, unix timestamp of when the project was first tracked
+- `last_command_timestamp`: int, unix timestamp of when the last command was executed with this project active
+- `known_clients`: list[str], a list of IP addresses of known clients that have run commands on this project

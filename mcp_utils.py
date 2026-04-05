@@ -2,6 +2,7 @@ import os, sys, pathlib, socket, subprocess, shlex, datetime, shutil
 from typing import Callable, Optional, TypeVar, Union
 from mimetypes import guess_type
 from uuid import uuid4
+from requests import Response
 
 from requests.models import DecodeError
 
@@ -18,6 +19,19 @@ KB = 1024
 MB = KB * KB
 project_runtime_dir_name = '.remote-xcode-server'
 server_dir_name = '.remote-xcode-server'
+project_nonspecific_routes = [
+        '/enable_pairing',
+        '/pairing-bootstrap',
+        '/discovery-status',
+        '/add_allowed_interactive_command',
+        '/remove_allowed_interactive_command',
+        '/get_allowed_interactive_commands',
+        '/checkprogress/',
+        '/status/',
+    ]
+
+def route_is_project_specific(route: str) -> bool:
+    return not any([route.startswith(pathroute) for pathroute in project_nonspecific_routes])
 
 def ensure_directory_exists(dir_path: str) -> None:
     if not os.path.exists(dir_path):
@@ -76,6 +90,74 @@ def get_build_log_path(job_id:int) -> str:
     return build_log_path
 
 
+def get_bundle_name(project_id: str):
+    return f'{project_id}.bundle'
+
+def mailbox_has_bundle_request(mailbox:dict, project_id:str='', project_name:str='', bundle_request:dict|None=None) -> bool:
+    if not mailbox.get('bundle_requests', None):
+        return False
+    if bundle_request:
+        if not project_id:
+            project_id = bundle_request.get('id', '')
+        if not project_name:
+            project_name = bundle_request.get('project_name', '')
+
+    if (not project_id) and (not project_name):
+        raise RuntimeError('Must provide project_id, project_name, or bundle_request')
+
+    if not project_id:
+        project_id = generate_project_id(project_name)
+
+    for br in mailbox.get('bundle_requests', []):
+        if (br.get('id', '') == project_id) or (br.get('project_name') == project_name):
+            return True
+
+    return False
+
+
+
+def mailbox_get_bundle_request(mailbox:dict, project_id:str='', project_name:str='', bundle_request:dict|None=None) -> dict:
+    if not mailbox.get('bundle_requests', None):
+        return {}
+    if bundle_request:
+        if not project_id:
+            project_id = bundle_request.get('id', '')
+        if not project_name:
+            project_name = bundle_request.get('project_name', '')
+
+    if (not project_id) and (not project_name):
+        raise RuntimeError('Must provide project_id, project_name, or bundle_request')
+
+    if not project_id:
+        project_id = generate_project_id(project_name)
+
+    for br in mailbox.get('bundle_requests', []):
+        if (br.get('id', '') == project_id) or (br.get('project_name') == project_name):
+            return br
+
+    return {}
+
+def mailbox_remove_bundle_request(mailbox: dict, project_id: str) -> dict:
+    if not isinstance(mailbox.get('bundle_requests', False), list):
+        return mailbox
+    new_bundle_requests = []
+    for req in mailbox.get('bundle_requests', []):
+        if req.get('id', '') != project_id:
+            new_bundle_requests.append(req)
+    mailbox['bundle_requests'] = new_bundle_requests
+    return mailbox
+
+
+def content_type(resp: Response):
+    return resp.headers.get('Content-Type', '')
+
+
+def http_status_code_is_ok(status_code: int):
+    if not isinstance(status_code, int):
+        raise TypeError('Error: invalid type {type(status_code)} for status_code')
+    return str(status_code).startswith('2')
+
+
 
 def uploads_folder_exists(project_id: str = '', project_name: str = '') -> bool:
     '''Checks for the existence of the uploads folder.  This is a per-project folder, so this is a per-project function'''
@@ -112,10 +194,8 @@ def get_project_root_path(cwd:str='.') -> str:
     path_parts = cwd.split('/')
     while len(path_parts) > 1:
         current_path = '/'.join(path_parts)
-        for name in os.listdir(current_path):
-            # if name.split('.')[-1] == 'xcodeproj': #if the file extension is 'xcodeproj'
-            if name == '.git':
-                return current_path
+        if '.git' in os.listdir(current_path):
+            return current_path
         path_parts = path_parts[:-1]
     raise RuntimeError(f'Unable to find project root path from given cwd: {cwd}')
 
@@ -167,9 +247,9 @@ def clear_directory(path) -> None:
 def dir_is_empty(path) -> bool:
     return len(os.listdir(path)) == 0
 
-def update_gitignore():
-    start_dir = os.getcwd()
-    project_root = get_project_root_path(start_dir)
+def update_gitignore(project_root: str):
+    if not project_root:
+        return
     gitignore_path = os.path.join(project_root, '.gitignore')
     ignores_runtime_dir = False
     if not os.path.exists(gitignore_path):
@@ -380,6 +460,22 @@ def get_commits_between(start_ref:str, end_ref:str='HEAD') -> list[str]:
         return []
     commits = [line.strip() for line in res_str.splitlines()]
     return commits
+
+def git_create_full_project_bundle(project_root_path:str, save_path:str = ''):
+    '''Creates a "full project bundle" (all refs) of the git repo rooted at project_root_path'''
+    project_name = get_appname(project_root_path)
+    bundle_name = f'{project_name}.bundle'
+    proc = run_process(shlex.split(f'git bundle create {bundle_name} --all'), cwd=project_root_path)
+    if proc.returncode:
+        raise RuntimeError('Error creating full project git bundle for project {project_name} at path: {project_root_path}')
+    bundle_path = os.path.join(project_root_path, bundle_name)
+    if save_path:
+        shutil.copy2(bundle_path, save_path)
+        os.remove(bundle_path)
+        return save_path
+    return bundle_path
+
+
 
 def git_create_update_bundle(start_ref:str, end_ref:str='HEAD', save_path='update.bundle') -> str:
     '''Creates an incremental .bundle, which will bring all commits missing (reachable) from start_ref but ARE present in (reachable from) end_ref'''

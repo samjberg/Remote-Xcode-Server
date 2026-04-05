@@ -1,6 +1,6 @@
 import os
 from sys import platform
-from mcp_utils import get_project_root_path, get_runtime_dir_path, get_user_runtime_dir_path, unix_path
+from mcp_utils import ensure_directory_exists, get_project_root_path, get_runtime_dir_path, get_user_runtime_dir_path, unix_path
 from subprocess import run
 
 cwd = os.getcwd()
@@ -11,6 +11,7 @@ executables_path = os.path.join(user_runtime_path, 'executables')
 client_script_name = 'mcp_client.py'
 client_script_path = os.path.join(rxs_root_path, client_script_name)
 
+project_bundles_path = os.path.join(user_runtime_path, 'project-bundles')
 
 def _normalize_path_for_compare(path: str) -> str:
     normalized = os.path.normpath(os.path.expandvars(os.path.expanduser(path.strip())))
@@ -164,6 +165,9 @@ def ensure_environment_setup():
         proc = run(['chmod', '+x', shim_script_path])
         if proc.returncode != 0:
             print(f'Error running command: chmod +x {shim_script_path}')
+
+    #ensure project bundles directory exists (~/.remote-xcode-server/project-bundles)
+    ensure_directory_exists(project_bundles_path)
 
 
 if __name__ == '__main__':

@@ -6,6 +6,7 @@ from typing import Optional
 from werkzeug.utils import secure_filename
 from mcp_utils import *
 from environment_setup import _normalize_path_for_compare
+from mcp_utils import _run_git_capture
 import projects_context_manager as pcm
 # from requests import Request
 
@@ -23,6 +24,7 @@ SECURITY_METADATA_FILENAME = 'security_metadata.json'
 cwd = pcm.cwd
 server_dir_name = get_server_dir_name()
 server_dir_path = get_server_dir_path()
+bundles_path = os.path.join(server_dir_path, 'bundles')
 project_runtime_dir_name = get_project_runtime_dir_name()
 project_runtime_dir_path = os.path.join(pcm.cwd, project_runtime_dir_name)
 legacy_allowed_interactive_commands_filename = 'allowed_interactive_commands.txt'
@@ -584,7 +586,10 @@ interactive_wrapper_socket.listen(16)
 discovery_thread = Thread(target=start_discovery_listener, args=[], daemon=True)
 discovery_thread.start()
 
-update_gitignore()
+if pcm.current_project:
+    if pcm.current_project.get('project_root_path', ''):
+        update_gitignore(pcm.current_project['project_root_path'])
+# update_gitignore()
 
 
 #FIRST RUN SETUP
@@ -850,23 +855,73 @@ def _before_request_func():
     auth_gate_res = _global_auth_gate()
     if auth_gate_res:
         return auth_gate_res
-    project_nonspecific_routes = [
-        '/enable_pairing',
-        '/pairing-bootstrap',
-        '/discovery-status',
-        '/add_allowed_interactive_command',
-        '/remove_allowed_interactive_command',
-        '/get_allowed_interactive_commands',
-        '/checkprogress/',
-        '/status/',
-    ]
-    route_is_specific = not any([request.path.startswith(pathroute) for pathroute in project_nonspecific_routes])
-    if route_is_specific:
+    if route_is_project_specific(request.path):
         projects_context_result = pcm.handle_project_context()
         if projects_context_result:
-            return jsonify({'ok': False, 'error': projects_context_result}), 400
+            return jsonify(projects_context_result), 400
         _set_current_project_runtime_dir_path(pcm.project_runtime_dir_path)
     return None
+
+
+@app.route('/poll-control-mailbox', methods=['GET'])
+def handle_poll_control_mailbox():
+    pcm.load_mailbox_from_file()
+    if not isinstance(pcm.mailbox, dict):
+        raise TypeError('Error: mailbox is type: {type(pcm.mailbox)}, should be type: dict')
+    return pcm.mailbox
+
+@app.route('/reset-known-git-repos')
+def reset_known_git_repos():
+    with open(pcm.known_git_repos_path, 'r') as f:
+        f.write('{}\n')
+    return {}, 200
+
+@app.route('/send-full-project-bundle', methods=['POST'])
+def receive_full_project_bundle():
+    project_id = request.values.get('project_id', '')
+    if not project_id:
+        raise RuntimeError('Error, no project_id in request args in recieve_full_project_bundle')
+    if not 'full_project_bundle' in request.files:
+        raise RuntimeError('Error, expected key full_project_bundle not found in request from client in receieve_full_project_bundle')
+
+    #save received full project bundle to server bundles directory
+    file = request.files['full_project_bundle']
+    bundle_name = file.filename
+    if not bundle_name:
+        print("Warning, file.filename is '', manually creating name from project_id")
+        bundle_name = f'{project_id}.bundle'
+    bundle_path = os.path.join(bundles_path, bundle_name)
+    file.save(bundle_path)
+
+
+    #ensure bundle was saved to the expected location, bundle_path
+    if not os.path.exists(bundle_path):
+        raise FileNotFoundError('Error, bundle not found at expected path: {bundle_path}')
+
+    #ensure that the server default projects directory exists, and that the project DOESNT exist there
+    project_path = os.path.join(pcm.default_projects_dir_path, project_id)
+    if os.path.exists(project_path):
+        if os.path.isdir(project_path):
+            raise RuntimeError("Error, project dir already exists.  We shouldn't have reached this point in the code if the project exists, need to figure out what's going on")
+        else:
+            raise RuntimeError("Error, a file exists in the expected default project dir location: {project_path}")
+    else:
+        os.makedirs(project_path)
+
+    proc = _run_git_capture(['git', 'clone', bundle_path, project_path])
+    if proc.returncode:
+        raise RuntimeError('Error cloning full project bundle from bundle_path: {bundle_path} to project_path: {project_path}')
+
+    #remove bundle request from mailbox, and remove bundle file from bundles directory
+    if os.path.exists(bundle_path):
+        os.remove(bundle_path)
+    
+    #remove bundle request from mailbox
+    pcm.mailbox = mailbox_remove_bundle_request(pcm.mailbox, project_id)
+    #save mailbox to file from pcm.mailbox
+    pcm.save_mailbox_to_file()
+
+    return f'ACK_FULL_PROJECT_BUNDLE', 200
 
 
 
@@ -1529,7 +1584,6 @@ def run_git_action():
 
 @app.route('/create-update-bundle/<client_head>', methods=['GET'])
 def send_update_bundle(client_head:str):
-    project_name = request.args.get('project_name', '')
     runtime_dir_path = get_runtime_dir_path()
     bundle_name = 'update.bundle'
     save_path = os.path.join(runtime_dir_path, bundle_name)
@@ -1546,7 +1600,6 @@ def send_update_bundle(client_head:str):
 #of paths getting cut off once they reach the first '/' (the first path delimiter)
 @app.route('/retrieve_binary_file/<path:path>')
 def send_binary_file(path:str):
-    project_name = request.args.get('project_name', '')
     path = get_safe_project_path(path)
     if not os.path.exists(path):
         filename = os.path.split(path)[-1]
@@ -1563,7 +1616,6 @@ def send_binary_file(path:str):
 
 @app.route('/apply-patch-server', methods=['GET'])
 def apply_patch_server():
-    project_name = request.args.get('project_name', '')
     patch_path = request.args.get('patch_path', None)
     if not patch_path:
         print('Error: No patch path received from client')
@@ -1598,9 +1650,15 @@ def receive_files_http():
         if not file:
             errors.append(f'No file object for request.files key: {key}')
             continue
+        is_full_project_bundle = request.args.get('is_full_project_bundle', False)
         rel_path = unix_path(str(file.filename))
+        filename = os.path.split(rel_path)[-1]
+
         try:
-            destination_path = get_safe_project_path(rel_path)
+            if is_full_project_bundle:
+                destination_path = os.path.join(bundles_path, filename)
+            else:
+                destination_path = get_safe_project_path(rel_path)
         except ValueError as e:
             errors.append(f'Invalid path {rel_path}: {e}')
             continue

@@ -1,3 +1,4 @@
+from flask import jsonify, request, send_file
 import sys, os, socket, requests, json, hashlib, struct, ssl, hmac, secrets, base64, time, subprocess, re, select
 from urllib import parse as parse_url
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -6,7 +7,7 @@ from requests import Response
 from requests.adapters import HTTPAdapter
 from urllib3.poolmanager import PoolManager
 from mcp_utils import *
-from environment_setup import ensure_environment_setup
+from environment_setup import _normalize_path_for_compare, ensure_environment_setup, project_bundles_path
 from mcp_utils import _run_git_capture
 
 discovery_socket_port = 9346
@@ -25,6 +26,8 @@ SERVER_SECRET_PATH = ''
 SERVER_REQUEST_SESSION: Optional[requests.Session] = None
 user_runtime_dir = get_user_runtime_dir_path()
 GLOBAL_SERVERINFO_CACHE_PATH = os.path.join(user_runtime_dir, '.remote_xcode_server_serverinfo.json')
+
+mailbox = {}
 
 
 
@@ -118,7 +121,38 @@ def _secure_request(
     prepared.headers['X-RXS-Timestamp'] = timestamp
     prepared.headers['X-RXS-Nonce'] = nonce
     prepared.headers['X-RXS-Signature'] = signature
-    return session.send(prepared, stream=stream, timeout=timeout, allow_redirects=True)
+    resp = session.send(prepared, stream=stream, timeout=timeout, allow_redirects=True)
+    content_type = resp.headers.get('Content-Type', '').lower()
+    #return immediately if url is not a project-specific route, or if the content_type is not json
+    if (not route_is_project_specific(url)) or ('json' not in content_type):
+        return resp
+
+    global mailbox
+    #ensure that mailbox has 'bundle_requests' list
+    if isinstance(mailbox, dict):
+        if not 'bundle_requests' in mailbox.keys():
+            mailbox['bundle_requests'] = []
+    resp_obj = {}
+    try:
+        resp_obj:dict = resp.json()
+
+    except json.JSONDecodeError as e:
+        print('Error decoding mailbox json')
+        raise e
+
+    server_mailbox = resp_obj.get('mailbox', None)
+    if server_mailbox:
+        requests_to_add = []
+        for server_req in server_mailbox.get('bundle_requests', []):
+            has_req = False
+            for req in mailbox.get('bundle_requests', []):
+                if req.get('id', '') == server_req.get('id', ' '):
+                    has_req = True
+            if not has_req:
+                requests_to_add.append(server_req)
+        mailbox['bundle_requests'].extend(requests_to_add)
+
+    return resp
 
 
 def _build_server_url(server_addr: tuple[str, int], path: str) -> str:
@@ -636,19 +670,108 @@ def stream_remote_executable_from_server(
                 termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
 
 
+
+def send_full_project_bundle(server_addr: tuple[str, int], project_id: str):
+    bundle_path = os.path.join(project_bundles_path, project_id)
+    project_bundle = mailbox_get_bundle_request(mailbox, project_id)
+    if not project_bundle:
+        raise RuntimeError('Error, failed to locate bundle request for project_id: {project_id} in client mailbox')
+    if not os.path.exists(bundle_path):
+        raise FileNotFoundError('Error, project bundle not found at expected path: {bundle_path}')
+
+    project_name = project_bundle.get('project_name', '')
+
+    url = _build_server_url(server_addr, '/send-full-project-bundle')
+    with open(bundle_path, 'rb') as f:
+        files_to_send = {f'full_project_bundle': (os.path.basename(bundle_path), f, 'application/octet-stream')}
+        resp = _secure_request('POST',
+                        url,
+                        params={
+                            'project_id': project_id, 
+                            'project_name': project_name}, 
+                        files=files_to_send)
+
+    if not http_status_code_is_ok(resp.status_code):
+        raise RuntimeError('Error sending full project bundle to server')
+    return resp
+
+
+
+def ensure_server_has_project(response_obj:dict):
+    global mailbox
+    if not 'error' in response_obj.keys():
+        return
+    if response_obj['error'] != 'project missing':
+        return
+    # bundles_paths = [os.path.join(project_bundles_path, bundle_name) for bundle_name in os.listdir(project_bundles_path)]
+    project_name = get_appname()
+    bundle_request = mailbox_get_bundle_request(mailbox, project_name=project_name)
+    if not bundle_request:
+        raise RuntimeError(f'Error, server reported missing the project: {project_name}, but bundle_request cannot be found in client mailbox')
+    project_id = bundle_request.get('id', '')
+    if not project_id:
+        raise RuntimeError(f'Error, bundle_request: {bundle_request} missing project_id')
+
+    bundle_path = os.path.join(project_bundles_path, project_id)
+    saved_bundle_path = ''
+    if project_id not in os.listdir(project_bundles_path):
+        project_root_path = bundle_request.get('project_root_path', '')
+        if not project_root_path:
+            bpn_normed = _normalize_path_for_compare(bundle_request.get('project_name', ''))
+            pn_normed = _normalize_path_for_compare(project_name)
+            if bpn_normed == pn_normed:
+                project_root_path = get_project_root_path(cwd)
+            else:
+                raise RuntimeError(f"Error, bundle_request's project_name: {bpn_normed} does not match cwd project_name")
+
+        #create the full project bundle
+        saved_bundle_path = git_create_full_project_bundle(project_root_path, bundle_path)
+    else:
+        saved_bundle_path = bundle_path
+
+    #ensure the bundle was saved to the expected path, so we don't accidentally send over the wrong bundle
+    if not saved_bundle_path == bundle_path:
+        raise RuntimeError('saved bundle path: {saved_bundle_path} does not match given bundle path: {bundle_path}')
+    elif not os.path.exists(saved_bundle_path):
+        raise RuntimeError('Bundle not found at saved_bundle_path: {saved_bundle_path}')
+
+    #send the full project bundle to the server
+    # send_files(server_addr, [saved_bundle_path])
+    resp = send_full_project_bundle(server_addr, project_id)
+    if not http_status_code_is_ok(resp.status_code):
+        resp.raise_for_status()
+
+    if resp.text == 'ACK_FULL_PROJECT_BUNDLE':
+        #server has acknowledged receipt of the full project bundle.
+        #now do cleanup to ensure that mailbox doesn't have old bundle_requests and whatnot
+        #remove the actual .bundle file
+        os.remove(bundle_path)
+        #remove the bundle request from the client mailbox
+        if len(mailbox.get('bundle_requests', [])) == 1:
+            mailbox['bundle_requests'] = []
+        elif len(mailbox.get('bundle_requests', [])) > 1:
+            mailbox = mailbox_remove_bundle_request(mailbox, project_id)
+
+
+
+
+
 def launch_remote_interactive_executable_stream(server_addr: tuple[str, int], command: str):
     _require_posix_tty_modules()
     ip, port = server_addr
     project_name = get_appname()
     url = _build_server_url(server_addr, f'/interactive/launch/{command}')
     resp: Response = _secure_request('POST', url, params={'project_name': project_name}, json_data={})
-    resp.raise_for_status()
     try:
-        obj = resp.json()
+        obj = resp.json() 
     except ValueError as e:
         raise RuntimeError(f'Invalid launch response from server: {resp.text}') from e
     if not obj.get('ok', False):
-        raise RuntimeError(f'Interactive launch failed: {obj.get("error", "unknown_error")}')
+        #response content type is json (decoding JSON into obj succeeded) but still a failure status
+        #so we run ensure_server_has_project to... ensure the server has the project
+        ensure_server_has_project(obj)
+        launch_remote_interactive_executable_stream(server_addr, command)
+        # raise RuntimeError(f'Interactive launch failed: {obj.get("error", "unknown_error")}')
     stream_id = str(obj.get('stream_id', '')).strip()
     if not stream_id:
         raise RuntimeError('Interactive launch response missing stream_id')
@@ -802,6 +925,49 @@ def discover_server(require_pairing: bool = False, target_ip: Optional[str] = No
             return _https_fallback()
 
     return discovered_server_ip, response_obj
+
+def poll_server_control_mailbox(server_addr: tuple[str, int]):
+    '''Polls the servers "control mailbox", allowing the server to request things from the client without
+    the client actually needing to keep an open port.  Used to communicate when the server needs
+    a git bundle sent over because a project is missing, etc'''
+    cwd = os.getcwd()
+    current_project_name = _normalize_path_for_compare(get_appname(cwd))
+    url = _build_server_url(server_addr, '/poll-control-mailbox')
+    resp = _secure_request('GET', url)
+
+    mailbox = resp.json()
+    bundle_requests: list[dict] = mailbox.get('bundle_requests', [])
+
+    full_bundle_paths = []
+
+    for bundle_request in bundle_requests:
+        br_project_name = _normalize_path_for_compare(bundle_request.get('project_name', ''))
+        if br_project_name == current_project_name:
+            bundle_path = git_create_full_project_bundle(cwd)
+            full_bundle_paths.append(bundle_path)
+
+    if full_bundle_paths:
+        send_files(server_addr, full_bundle_paths)
+
+
+    # for req_obj in bundle_requests:
+    #     if req_obj.get('project_name')
+
+
+
+def send_update_bundle_to_server(client_head:str):
+    project_name = get_appname(os.getcwd())
+    runtime_dir_path = get_runtime_dir_path()
+    bundle_name = 'full_project_update.bundle'
+    save_path = os.path.join(runtime_dir_path, bundle_name)
+    if not client_head:
+        print(f'Error: {client_head} not found in request.values.keys')
+        return f'Error: {client_head} not found in request.values.keys'
+    git_create_update_bundle(client_head, 'HEAD', save_path)
+    return save_path
+
+
+
 
 
 def start_build_job(server_addr:tuple[str, int], git_diff_path:str, changed_binary_paths:list[str]=[], args:list[str]=[]) -> Response:
@@ -1266,7 +1432,17 @@ def apply_patch_server(server_addr:tuple[str, int], patch_path:str='') -> Respon
     patch_path = _to_repo_relative_posix(patch_path, project_root)
     url = _build_server_url(server_addr, '/apply-patch-server')
     resp:Response = _secure_request('GET', url, params={'project_name': project_name, 'patch_path': patch_path})
-    return resp
+    if http_status_code_is_ok(resp.status_code) or 'json' not in content_type(resp).lower():
+        return resp
+
+    try:
+        obj = resp.json() 
+    except ValueError as e:
+        print(f'Error, unable to decode json response from server in apply_patch_server')
+        raise e
+
+    ensure_server_has_project(obj)
+    return apply_patch_server(server_addr, patch_path)
 
 
 
@@ -1283,8 +1459,17 @@ def send_current_changes(server_addr:tuple[str, int], project_name:str='') -> Re
     # Server route expects a repo-relative patch path under query key "patch_path".
     patch_rel_path = _to_repo_relative_posix(git_diff_path, get_project_root_path())
     resp:Response = apply_patch_server(server_addr, patch_rel_path)
-    resp.raise_for_status()
-    return resp
+    if http_status_code_is_ok(resp.status_code) or 'json' not in content_type(resp).lower():
+        return resp
+    try:
+        obj = resp.json() 
+    except ValueError as e:
+        print(f'Error, unable to decode json response from server in apply_patch_server')
+        raise e
+
+    ensure_server_has_project(obj)
+    return send_current_changes(server_addr, project_name)
+
 
 def retrieve_current_text_changes(server_addr:tuple[str, int], save_as_filename='gitdiff.diff') -> bool:
     project_name = get_appname()
@@ -1292,6 +1477,20 @@ def retrieve_current_text_changes(server_addr:tuple[str, int], save_as_filename=
     ran_successfully = True
     try:
         diff_resp:Response = _secure_request('GET', url, params={'project_name': project_name}, stream=True, timeout=120)
+        if not http_status_code_is_ok(diff_resp.status_code):
+            if 'json' in content_type(diff_resp).lower():
+                try:
+                    obj = resp.json()
+                except json.JSONDecodeError as e:
+                    print('Failed decoding JSON in retrieve_current_text_changes')
+                    raise e
+                ensure_server_has_project(obj)
+                #This is an intentional choice.  It doesn't make sense to try to run retrieve_current_text_changes again,
+                #since this scenario is where the project did not exist on the server until we send it over in a bundle
+                #just now.  So in this specific case, we will just ensure_server_has_project and then return
+                return ran_successfully
+
+
         diff_resp.raise_for_status()
     except requests.RequestException as e:
         print(f'Failed to retrieve text changes: {e}')
@@ -1311,6 +1510,8 @@ def retrieve_current_text_changes(server_addr:tuple[str, int], save_as_filename=
 
 #Sort of like git pull, but for uncommitted changes and specifically to the server
 def retrieve_current_changes(server_addr:tuple[str, int], exclude_binary_changes=False, save_as_filename='gitdiff.diff') -> bool:
+    #NOTE this function DOES NOT need to ensure_server_has_project because the first
+    #line called retrieve_current_text_changes, which already does so
     retrieved_text_changes = retrieve_current_text_changes(server_addr, save_as_filename)
     if not exclude_binary_changes:
         project_root = get_project_root_path()
@@ -1337,6 +1538,19 @@ def get_changed_server_files(server_addr:tuple[str, int], project_name:str, scop
     url = _build_server_url(server_addr, f'/retrieve_changed_file_paths/{scope}')
     try:
         resp = _secure_request('GET', url, params={'project_name': project_name}, stream=True, timeout=120)
+        if not http_status_code_is_ok(resp.status_code):
+            try:
+                obj = resp.json() 
+            except ValueError as e:
+                print(f'Error, unable to decode json response from server in get_changed_server_files')
+                raise e
+
+            #again here it would not make sense to try to call the function again after sending over the project bundle
+            #because by definition there cannot be any changed server files.  The project didn't exist on the server until now
+            if obj.get('error', '') == 'project missing':
+                ensure_server_has_project(obj)
+                return [], []
+
         resp.raise_for_status()
     except requests.RequestException as e:
         print(f'Failed to retrieve changed file path lst: {e}')
@@ -1523,6 +1737,7 @@ RECONCILE_STATUS_BLOCKED_DETACHED_HEAD = 'BLOCKED_DETACHED_HEAD'
 RECONCILE_STATUS_BLOCKED_NO_ORIGIN = 'BLOCKED_NO_ORIGIN'
 RECONCILE_STATUS_ERROR = 'ERROR'
 RECONCILE_STATUS_NEEDS_ACTION = 'NEEDS_ACTION'
+RECONCILE_STATUS_MISSING_PROJECT = 'MISSING_PROJECT'
 
 
 def _reconcile_result(
@@ -1569,6 +1784,10 @@ def get_server_git_state(server_addr:tuple[str, int], project_name:str='') -> Op
         print('Server git state response was not valid JSON')
         return None
 
+    if obj.get('error', '') == 'project missing':
+        ensure_server_has_project(obj)
+        return get_server_git_state(server_addr, project_name)
+
     return obj
 
 
@@ -1588,10 +1807,16 @@ def _post_server_git_action(server_addr:tuple[str, int], action:str, args:Option
         return None
 
     try:
-        return resp.json()
+        obj = resp.json()
     except ValueError:
         print(f'Server git action response was not valid JSON for action: {action}')
         return None
+
+    if obj.get('error', '') == 'project missing':
+        ensure_server_has_project(obj)
+        return _post_server_git_action(server_addr, action, args, project_name)
+    return obj
+
 
 
 def _run_local_git_action(action:str, args:Optional[dict]=None) -> dict:
@@ -1880,6 +2105,12 @@ def reconcile_git_state(server_addr:tuple[str, int], project_name:str='') -> dic
         project_name = get_appname()
     actions_applied:list[str] = []
 
+    bundle_requests = mailbox.get('bundle_requests', [])
+    for bundle_req in bundle_requests:
+        if _normalize_path_for_compare(bundle_req.get('project_name', None)) == _normalize_path_for_compare(project_name):
+            return _reconcile_result(RECONCILE_STATUS_NEEDS_ACTION, authority_side='client', message='missing project')
+
+
     try:
         local_state = get_local_git_state()
     except Exception as e:
@@ -2163,6 +2394,16 @@ def retrieve_diff_for_files(server_addr:tuple[str, int], paths:list[str]) -> Uni
         print(f"Failed to retrieve diff for specified files ({len(paths)} paths): {e}")
         return False
 
+    try:
+        obj = resp.json()
+    except json.JSONDecodeError as e:
+        print('Error decoding json in retrieve_diff_for_files')
+        raise e
+
+    if obj.get('error', '') == 'project missing':
+        ensure_server_has_project(obj)
+        return False
+
     runtime_dir_path = get_runtime_dir_path()
     git_diff_name = 'specific_files_gitdiff.diff'
     git_diff_path = os.path.join(runtime_dir_path, git_diff_name)
@@ -2193,6 +2434,34 @@ def sync_changes_with_server(server_addr:tuple[str, int], sync_branches=True, sy
         reconcile_result = reconcile_git_state(server_addr, project_name=project_name)
         reconcile_status = reconcile_result.get('status', RECONCILE_STATUS_ERROR)
         if reconcile_status not in [RECONCILE_STATUS_ALIGNED, RECONCILE_STATUS_RECONCILED]:
+            # if reconcile_status == RECONCILE_STATUS_NEEDS_ACTION and reconcile_result.get('message', '') == 'missing_project':
+            #     bundle_request = mailbox_get_bundle_request(mailbox, project_name=project_name)
+            #     if bundle_request:
+            #         project_root_path = bundle_request.get('project_root_path', '')
+            #         if os.path.exists(project_root_path):
+            #             if '.git' in os.listdir(project_root_path):
+            #                 normed_project_name = _normalize_path_for_compare(project_name)
+            #                 bundle_path = os.path.join(project_bundles_path, f'{normed_project_name}.bundle')
+            #                 git_create_full_project_bundle(os.getcwd(), bundle_path)
+            #                 if not os.path.exists(bundle_path):
+            #                     raise RuntimeError(f'Error, bundle not found at explicitly used save_path: {bundle_path}')
+            #                 success = send_files(server_addr, [bundle_path])
+            #                 if not success:
+            #                     print(f'Error, failed to send full project bundle: {bundle_path} to server')
+            #                     return False
+            #                 return sync_changes_with_server(server_addr, sync_branches, sync_uncommitted, scope)
+            #             else:
+            #                 raise RuntimeError(f'Error, project_root_path: {project_root_path} is not a git repo (does not contain a .git directory)')
+            #         else:
+            #             print(f"Phase 1 reconcile blocked: {reconcile_status}")
+            #             print(f'Reason: Project not found on server, and project not found at project_root_path: {project_root_path} on client, so the bundle could not be sent')
+            #
+            #
+            #     else:
+            #         print(f'Phase 1 reconcile blocked: {reconcile_status}')
+            #         print(f"Reason: {reconcile_result.get('message', '')}")
+            #         return False
+            #
             print(f'Phase 1 reconcile blocked: {reconcile_status}')
             print(f"Reason: {reconcile_result.get('message', '')}")
             if reconcile_result.get('actions_applied'):
@@ -2369,7 +2638,7 @@ if __name__ == '__main__':
     server_addr = (server_ip, server_port)
 
 
-    update_gitignore()
+    update_gitignore(get_project_root_path(cwd))
 
 
 
