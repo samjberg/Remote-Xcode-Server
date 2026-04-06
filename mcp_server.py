@@ -550,6 +550,7 @@ def _set_current_project_runtime_dir_path(path: str):
     current_project_runtime_dir_path = path
     app.config['UPLOAD_FOLDER'] = current_project_runtime_dir_path
     pcm.project_runtime_dir_path = current_project_runtime_dir_path
+    pcm.current_project['runtime_dir_path'] = current_project_runtime_dir_path
 
 #ensures existence of global (not project-specific) .remote-xcode-server directory
 _ensure_server_dir()
@@ -850,7 +851,7 @@ def _before_request_func():
         projects_context_result = pcm.handle_project_context()
         if projects_context_result:
             return jsonify(projects_context_result), 400
-        _set_current_project_runtime_dir_path(pcm.project_runtime_dir_path)
+        _set_current_project_runtime_dir_path(pcm.current_project.get('runtime_dir_path', ''))
     return None
 
 
@@ -902,7 +903,7 @@ def receive_full_project_bundle():
     else:
         os.makedirs(project_path)
 
-    proc = _run_git_capture(['git', 'clone', bundle_path, project_path])
+    proc = _run_git_capture(['git', 'clone', bundle_path, project_path], pcm.current_project.get('project_root_path', pcm.cwd))
     if proc.returncode:
         raise RuntimeError('Error cloning full project bundle from bundle_path: {bundle_path} to project_path: {project_path}')
 

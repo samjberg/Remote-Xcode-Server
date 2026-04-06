@@ -871,7 +871,8 @@ def get_changed_file_paths(cwd:str, scope='repo') -> list[str]:
     only changes in the current directory (and subdirectories) will be included.'''
     # Use argv form (no shell) for cross-platform behavior.
     # Exclude .gitignore in Python instead of relying on shell/pathspec parsing.
-    project_root_path = get_project_root_path(cwd)
+    # project_root_path = get_project_root_path(cwd)
+    project_root_path = cwd
     diff_command = ['git', 'diff', '--name-only', '-z', 'HEAD']
 
     if scope == 'cwd':

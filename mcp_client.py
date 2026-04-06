@@ -139,7 +139,11 @@ def _secure_request(
         print('Error decoding mailbox json')
         raise e
 
-    server_mailbox = resp_obj.get('mailbox', None)
+    try:
+        server_mailbox = resp_obj.get('mailbox', None)
+    except Exception as e:
+        print(f'resp_obj is a str instead of Response.  resp_obj: {resp_obj}')
+        raise e
     if server_mailbox:
         requests_to_add = []
         for server_req in server_mailbox.get('bundle_requests', []):
@@ -669,6 +673,65 @@ def stream_remote_executable_from_server(
                 termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
 
 
+def server_diff(server_addr: tuple[str, int], path: str, save_to_path: str = '') -> bool:
+    '''Diff a repo-relative client file against its server equivalent.
+       Prints diff to stdout and optionally writes it to save_to_path.'''
+    project_root = get_project_root_path(os.getcwd())
+    rel_path = unix_path(str(path)).strip()
+    if not rel_path:
+        raise ValueError('Path must be a non-empty repo-relative path')
+    if rel_path.startswith('/') or (len(rel_path) >= 2 and rel_path[1] == ':'):
+        raise ValueError('Path must be repo-relative, not absolute')
+
+    local_path = _get_safe_local_project_path(rel_path, project_root)
+    if not os.path.exists(local_path):
+        raise FileNotFoundError(f'File not found at repo-relative path: {rel_path}')
+    if not os.path.isfile(local_path):
+        raise RuntimeError(f'Path is not a regular file: {rel_path}')
+
+    runtime_dir = get_runtime_dir_path(project_root)
+    tmp_dir = os.path.join(runtime_dir, 'tmp', 'serverdiff')
+    ensure_directory_exists(tmp_dir)
+
+    filename = os.path.basename(local_path)
+    temp_suffix = uuid4().hex[:8]
+    client_copy_path = os.path.join(tmp_dir, f'client-{temp_suffix}-{filename}')
+    server_copy_path = os.path.join(tmp_dir, f'server-{temp_suffix}-{filename}')
+
+    try:
+        shutil.copy2(local_path, client_copy_path)
+        retrieve_ok = retrieve_file_to_path(server_addr, rel_path, server_copy_path)
+        if not retrieve_ok:
+            print(f'Failed to retrieve server copy for: {rel_path}')
+            return False
+
+        cmd = ['git', 'diff', '--no-index', '--', client_copy_path, server_copy_path]
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=project_root)
+        # `git diff --no-index` returns:
+        # 0 => no differences, 1 => differences found, >1 => error
+        if proc.returncode > 1:
+            err_text = proc.stderr.decode(errors='replace')
+            print(f'Error running client-server diff, return code: {proc.returncode}')
+            if err_text:
+                print(err_text)
+            return False
+
+        diff_text = proc.stdout.decode(errors='replace')
+        print(diff_text)
+
+        if save_to_path:
+            save_abs = save_to_path if os.path.isabs(save_to_path) else os.path.join(project_root, save_to_path)
+            save_parent = os.path.dirname(save_abs)
+            if save_parent:
+                ensure_directory_exists(save_parent)
+            with open(save_abs, 'wb') as f:
+                f.write(proc.stdout)
+        return True
+    finally:
+        if os.path.exists(client_copy_path) and os.path.isfile(client_copy_path):
+            os.remove(client_copy_path)
+        if os.path.exists(server_copy_path) and os.path.isfile(server_copy_path):
+            os.remove(server_copy_path)
 
 def send_full_project_bundle(server_addr: tuple[str, int], project_id: str):
     bundle_path = os.path.join(project_bundles_path, project_id)
@@ -690,6 +753,7 @@ def send_full_project_bundle(server_addr: tuple[str, int], project_id: str):
         resp = _secure_request('POST',
                         url,
                         params={
+                            'is_full_bundle': True,
                             'project_id': project_id, 
                             'project_name': project_name}, 
                         files=files_to_send)
@@ -793,6 +857,57 @@ def retrieve_file(server_addr:tuple[str, int], path) -> bool:
     if not success:
         print(f'Failed to retrieve file {rel_path} from server via sendfilesfromserver transfer')
     return success
+
+def retrieve_file_to_path(server_addr:tuple[str, int], path:str, save_path:str='') -> bool:
+    if not save_path:
+        save_path = path
+
+    project_root = get_project_root_path(os.getcwd())
+    rel_path = unix_path(str(path)).strip()
+    if not rel_path:
+        raise ValueError('Path must be a non-empty repo-relative path')
+    if rel_path.startswith('/') or (len(rel_path) >= 2 and rel_path[1] == ':'):
+        raise ValueError('Path must be repo-relative, not absolute')
+
+    local_path = _get_safe_local_project_path(rel_path, project_root)
+    save_abs = save_path if os.path.isabs(save_path) else os.path.join(project_root, save_path)
+    save_parent = os.path.dirname(save_abs)
+    if save_parent:
+        ensure_directory_exists(save_parent)
+
+    runtime_dir = get_runtime_dir_path(project_root)
+    tmp_dir = os.path.join(runtime_dir, 'tmp', 'retrieve-file')
+    ensure_directory_exists(tmp_dir)
+    backup_path = os.path.join(tmp_dir, f'backup-{uuid4().hex}-{os.path.basename(local_path)}')
+
+    had_original = os.path.exists(local_path)
+    retrieve_ok = False
+    try:
+        if had_original:
+            shutil.copy2(local_path, backup_path)
+
+        retrieve_ok = retrieve_file(server_addr, rel_path)
+        if not retrieve_ok:
+            return False
+
+        if not os.path.exists(local_path) or not os.path.isfile(local_path):
+            raise RuntimeError(f'Expected retrieved file missing at: {local_path}')
+
+        if os.path.abspath(local_path) == os.path.abspath(save_abs):
+            return True
+        shutil.copy2(local_path, save_abs)
+        return True
+    finally:
+        # Restore the original client file so this helper never mutates caller-visible project state.
+        if had_original and os.path.exists(backup_path):
+            shutil.copy2(backup_path, local_path)
+        elif (not had_original) and retrieve_ok and os.path.exists(local_path):
+            # If the file did not originally exist, remove the transient retrieved file.
+            if os.path.isfile(local_path):
+                os.remove(local_path)
+        if os.path.exists(backup_path):
+            os.remove(backup_path)
+
 
 def enable_pairing(server_addr:tuple[str, int]) -> bool:
     ip, port = server_addr
@@ -2835,6 +2950,29 @@ if __name__ == '__main__':
         else:
             print(f'Invalid dest: {dest}')
             exit()
+    elif arg == 'serverdiff':
+        if len(args) < 2:
+            print('Usage: serverdiff <repo-relative-path> [save_to_path]')
+            exit()
+        path = args[1]
+        project_root = get_project_root_path(os.getcwd())
+        runtime_dir = get_runtime_dir_path(project_root)
+        if len(args) >= 3:
+            save_to_path = args[2]
+            save_to_path = save_to_path if os.path.isabs(save_to_path) else os.path.join(project_root, save_to_path)
+            save_to_dir = os.path.dirname(save_to_path)
+        else:
+            save_to_dir = os.path.join(runtime_dir, 'server-diffs')
+            safe_name = unix_path(path).strip('/').replace('/', '__')
+            if not safe_name:
+                safe_name = 'serverdiff'
+            save_to_path = os.path.join(save_to_dir, f'{safe_name}.diff')
+        os.makedirs(save_to_dir, exist_ok=True)
+        success = server_diff(server_addr, path, save_to_path)
+        if success:
+            print(f'Saved client-server diff to: {save_to_path}')
+        else:
+            print('serverdiff failed')
 
     else:
         print(f'Invalid argument: {arg}')

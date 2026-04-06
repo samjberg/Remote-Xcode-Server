@@ -16,6 +16,8 @@ project_runtime_dir_path = ''
 known_git_repos_filename = 'known_git_repos.json'
 known_git_repos_path = os.path.join(server_dir_path, known_git_repos_filename)
 known_git_repos = []
+bundles_dir_name = 'bundles'
+bundles_dir_path = os.path.join(server_dir_path, bundles_dir_name)
 mailbox_filename = 'mailbox.json'
 mailbox_path = os.path.join(server_dir_path, mailbox_filename)
 mailbox = {}
@@ -61,11 +63,15 @@ def _ensure_projects_dict_file() -> None:
 def _ensure_default_projects_dir() -> None:
     ensure_directory_exists(default_projects_dir_path)
 
+def _ensure_bundles_dir() -> None:
+    ensure_directory_exists(bundles_dir_name)
+
 def _create_project(project_name:str, project_root_path: str, client_ip:str =''):
     project_id = generate_project_id(project_name)
     timestamp = time.time()
     project = {'id': project_id, 'project_name': project_name, 'project_root_path': project_root_path,
-             'tracked_timestamp': timestamp, 'last_command_timestamp': timestamp, 'known_clients': []}
+               'runtime_dir_path': os.path.join(project_root_path, '.remote-xcode-server'), 
+               'tracked_timestamp': timestamp, 'last_command_timestamp': timestamp, 'known_clients': []}
     if client_ip:
         project['known_clients'].append(client_ip)
     return project
@@ -207,10 +213,10 @@ def _determine_git_username():
 
 
 def _get_project_by_id(project_id: str) -> dict:
-    project = projects_dict.get(project_id, '')
+    project = projects_dict.get(project_id, {})
     if not project:
         loaded_projects_dict = load_projects_dict()
-        project = loaded_projects_dict.get(project_id, '')
+        project = loaded_projects_dict.get(project_id, {})
     return project
 
 
@@ -252,7 +258,8 @@ def handle_project_context():
     global projects_dict, current_project, cwd
     if request.path == '/':
         return None
-    project_name = request.args.get('project_name', '')
+    project_name = request.values.get('project_name', '')
+    project_id = request.values.get('project_id', '')
     if not project_name:
         return 'Missing required query parameter: project_name'
     project = get_project(project_name=project_name)
@@ -276,10 +283,16 @@ def handle_project_context():
         project['last_command_timestamp'] = now
         save_projects_dict()
         return
+    elif request.values.get('is_full_bundle', False):
+        #we are actively receiving a full bundle transfer from the client.  Need to return None, and I am unsure of
+        #if the current project needs to be set, needs to not be set, or if it doesn't matter
+        #first let's just try returning None
+        return None
 
     client_ip = str(request.remote_addr)
     project_path = ''
-    project_id = generate_project_id(project_name)
+    if not project_id:
+        project_id = generate_project_id(project_name)
     found_project = False
     if project_id in projects_dict.keys():
         set_current_project(project=projects_dict[project_id])
@@ -295,6 +308,8 @@ def handle_project_context():
                 found_project = True
                 set_current_project(project_id=project_id, project_name=project_name)
                 break
+    else:
+        raise ValueError('project_id is None, this should not be possible.  Figure it out.')
 
         
     #final fallback, search through known_git_repos paths to find any project matches by name
@@ -307,8 +322,9 @@ def handle_project_context():
             if repo_name == current_project_name: 
                 add_project_to_list(project_name, path, client_ip, set_as_current_project=True)
                 return None
-    else:
         found_project = True
+    else:
+        found_project = False
 
 
     #post final fallback.  We genuinely failed to find the project on the server, post a request to
@@ -337,11 +353,14 @@ def handle_project_context():
 
     project_root = current_project.get('project_root_path', '')
     if not project_root:
-        return 'Current project is missing project_root_path'
+        return_obj = {'ok': False, 'error': 'project missing', 'mailbox': mailbox}
+        return return_obj
+        # return 'Current project is missing project_root_path'
     cwd = project_root
 
     #this line also updates the project within projects_dict, since current_project was assigned from it as a reference
     current_project['last_command_timestamp'] = now
+    current_project['runtime_dir_path'] = os.path.join(current_project['project_root'], '.remote-xcode-server')
     save_projects_dict()
     return None
 
@@ -490,6 +509,7 @@ def initialize():
     _ensure_projects_dict_file()
     _ensure_default_projects_dir()
     _ensure_known_git_repos_file()
+    _ensure_bundles_dir()
     _ensure_mailbox_file()
     projects_dict = load_projects_dict()
     if projects_dict:
