@@ -1,6 +1,5 @@
 from sys import set_coroutine_origin_tracking_depth
-from environment_setup import _normalize_path_for_compare
-from mcp_utils import get_server_dir_path, generate_project_id, get_git_username, ensure_directory_exists, is_git_repo, mailbox_has_bundle_request
+from mcp_utils import get_server_dir_path, generate_project_id, get_git_username, ensure_directory_exists, is_git_repo, mailbox_has_bundle_request, _normalize_path_for_compare
 from flask import request
 import os, json, time
 

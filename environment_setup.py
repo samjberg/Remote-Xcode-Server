@@ -1,6 +1,6 @@
 import os
 from sys import platform
-from mcp_utils import ensure_directory_exists, get_project_root_path, get_runtime_dir_path, get_user_runtime_dir_path, unix_path
+from mcp_utils import ensure_directory_exists, get_project_root_path, get_runtime_dir_path, get_user_runtime_dir_path, unix_path, _normalize_path_for_compare
 from subprocess import run
 
 cwd = os.getcwd()
@@ -13,12 +13,6 @@ client_script_path = os.path.join(rxs_root_path, client_script_name)
 
 project_bundles_path = os.path.join(user_runtime_path, 'project-bundles')
 
-def _normalize_path_for_compare(path: str) -> str:
-    normalized = os.path.normpath(os.path.expandvars(os.path.expanduser(path.strip())))
-    if os.name == 'nt':
-        return os.path.normcase(normalized)
-    return normalized #any "Code is structurally unreachable" warning on this line is caused by Pylance doing static analysis and assuming it will always be run
-                      #on the current OS.  It is not an actual bug or anything to worry about.
 
 
 def update_windows_path(new_path_directory):

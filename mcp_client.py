@@ -1,14 +1,13 @@
-from flask import jsonify, request, send_file
+from flask import jsonify, request, send_file, Response
 import sys, os, socket, requests, json, hashlib, struct, ssl, hmac, secrets, base64, time, subprocess, re, select
 from urllib import parse as parse_url
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Union
-from requests import Response
 from requests.adapters import HTTPAdapter
 from urllib3.poolmanager import PoolManager
 from mcp_utils import *
-from environment_setup import _normalize_path_for_compare, ensure_environment_setup, project_bundles_path
-from mcp_utils import _run_git_capture
+from environment_setup import ensure_environment_setup, project_bundles_path
+from mcp_utils import _run_git_capture, _normalize_path_for_compare
 
 discovery_socket_port = 9346
 allowed_timestamp_skew_s = 120
@@ -678,8 +677,12 @@ def send_full_project_bundle(server_addr: tuple[str, int], project_id: str):
         raise RuntimeError('Error, failed to locate bundle request for project_id: {project_id} in client mailbox')
     if not os.path.exists(bundle_path):
         raise FileNotFoundError('Error, project bundle not found at expected path: {bundle_path}')
+    if not os.path.isfile(bundle_path):
+        raise RuntimeError(f'Error, directory found at expected project bundle path: {bundle_path}')
 
     project_name = project_bundle.get('project_name', '')
+
+    print(f'project_name: {project_name}\nproject_id: {project_id}')
 
     url = _build_server_url(server_addr, '/send-full-project-bundle')
     with open(bundle_path, 'rb') as f:
@@ -692,6 +695,8 @@ def send_full_project_bundle(server_addr: tuple[str, int], project_id: str):
                         files=files_to_send)
 
     if not http_status_code_is_ok(resp.status_code):
+        print('Error sending full project bundle to server')
+        print(f'resp.text: {resp.text}')
         raise RuntimeError('Error sending full project bundle to server')
     return resp
 

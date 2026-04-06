@@ -1,9 +1,9 @@
+import hashlib
 import os, sys, pathlib, socket, subprocess, shlex, datetime, shutil
 from typing import Callable, Optional, TypeVar, Union
 from mimetypes import guess_type
 from uuid import uuid4
-from requests import Response
-
+from flask import Response
 from requests.models import DecodeError
 
 try:
@@ -347,11 +347,24 @@ def normalize_file_line_endings(path:str, fmt='LF') -> None:
             clean_line = line.rstrip()
             f.write(clean_line + newline_bytes)
 
+
+def _normalize_path_for_compare(path: str) -> str:
+    if path is None:
+        return ''
+    normalized = os.path.normpath(os.path.expandvars(os.path.expanduser(path.strip())))
+    if os.name == 'nt':
+        return unix_path(os.path.normcase(normalized))
+    return normalized #any "Code is structurally unreachable" warning on this line is caused by Pylance doing static analysis and assuming it will always be run
+                      #on the current OS.  It is not an actual bug or anything to worry about.
+
+
 def generate_project_id(project_name: str) -> str:
     if not project_name:
         return ''
-    normed_project_name = project_name.replace(' ', '_').lower()
-    s = hex(hash(normed_project_name))[2:]
+    normed_project_name = _normalize_path_for_compare(project_name)
+    #take 16 (hex) digits from the center of sha256 hexdigest
+    s = hashlib.sha256(normed_project_name.encode()).hexdigest()[24:40]
+    #format into project_id format
     project_id = '-'.join([s[:6], s[6:10], s[10:16]])
     return project_id
 
@@ -415,11 +428,8 @@ def handle_process_errors(f: Callable[P, R]) -> Callable[P, R]:
 
 
 @handle_process_errors
-def run_process(command:Union[str, list[str]], stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd:str=None) -> subprocess.CompletedProcess:
-    if cwd is None:
-        cwd = get_project_root_path()
-    command_arg = command if type(command) == list else shlex.split(command)
-    proc = subprocess.run(command_arg, stdout=stdout, stderr=stderr, cwd=cwd)
+def run_process(command:list[str], stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd:str=None) -> subprocess.CompletedProcess:
+    proc = subprocess.run(command, stdout=stdout, stderr=stderr, cwd=cwd)
     return proc
 
 def get_commit_date(branch:str) -> Optional[datetime.datetime]:

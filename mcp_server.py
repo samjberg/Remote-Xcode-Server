@@ -5,8 +5,7 @@ from functools import wraps
 from typing import Optional
 from werkzeug.utils import secure_filename
 from mcp_utils import *
-from environment_setup import _normalize_path_for_compare
-from mcp_utils import _run_git_capture
+from mcp_utils import _run_git_capture, _normalize_path_for_compare
 import projects_context_manager as pcm
 # from requests import Request
 
@@ -530,23 +529,15 @@ def _locate_which_executable():
     raise FileNotFoundError('Unable to locate "which" executable in primary_candidates')
 
 
-
 def _find_executable_paths(command_names) -> dict[str, str]:
-    path_dict = {}
-    which_executable_path = _locate_which_executable()
+    path_dict:dict = {}
     for name in command_names:
         if name not in path_dict:
-            proc = run_process([which_executable_path, name])
-            if proc.returncode != 0:
-                print(f'Error locating executable for command: {name}')
-            if proc.stdout:
-                resolved = proc.stdout.decode(errors='replace').strip().splitlines()
-                if not resolved:
-                    continue
-                executable_path = resolved[0].strip()
-                if executable_path and os.path.isfile(executable_path) and os.access(executable_path, os.X_OK):
-                    path_dict[name] = executable_path
+            path = shutil.which(name)
+            if path:
+                path_dict[name] = path
     return path_dict
+
 
 def _ensure_server_dir():
     """Ensures the existence of the global ~/.remote-xcode-server directory."""
@@ -878,6 +869,9 @@ def reset_known_git_repos():
 
 @app.route('/send-full-project-bundle', methods=['POST'])
 def receive_full_project_bundle():
+    print(f'request.values:')
+    for key, val in request.values.items():
+        print(f'{key}: {val}')
     project_id = request.values.get('project_id', '')
     if not project_id:
         raise RuntimeError('Error, no project_id in request args in recieve_full_project_bundle')
