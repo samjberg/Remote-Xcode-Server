@@ -253,6 +253,27 @@ def get_project(project_id:str = '', project_name:str = '') -> dict:
     return {}
 
 
+def get_project_root_path(project_id='', project_name='') -> str:
+    '''This is sort of stupid but whatever, the tech debt of this project sort of forced me into defining this function
+        as a server-only version to deal with certain issuesj'''
+    global projects_dict
+
+    if (not project_id) and (not project_name):
+        if current_project:
+            project_id = current_project.get('id', '')
+        else:
+            raise RuntimeError('Error, cannot get project root path.  No project_id or project_name provided, and there is no current_project')
+    elif not project_id:
+        project_id = generate_project_id(project_name)
+
+    project = projects_dict.get(project_id, '')
+    if project:
+        return project.get('project_root_path')
+    else:
+        raise ValueError(f'Project is empty')
+
+
+
 #this function is called by the @app.before_request decorated function
 def handle_project_context():
     global projects_dict, current_project, cwd
@@ -311,7 +332,7 @@ def handle_project_context():
     else:
         raise ValueError('project_id is None, this should not be possible.  Figure it out.')
 
-        
+
     #final fallback, search through known_git_repos paths to find any project matches by name
     if not current_project:
         _ensure_known_git_repos_file()
@@ -322,14 +343,15 @@ def handle_project_context():
             if repo_name == current_project_name: 
                 add_project_to_list(project_name, path, client_ip, set_as_current_project=True)
                 return None
-        found_project = True
-    else:
         found_project = False
+    else:
+        found_project = True
 
 
     #post final fallback.  We genuinely failed to find the project on the server, post a request to
     #the control mailbox for a full project bundle which will be sent back with the next response to the reuqest
     if not found_project:
+        #FIXME this is where the failure is happening
         global mailbox
         #project not found, leave an entry in the mailbox requesting the project bundle from the client
         #also of course create mailbox file if it doesn't exist
@@ -360,7 +382,7 @@ def handle_project_context():
 
     #this line also updates the project within projects_dict, since current_project was assigned from it as a reference
     current_project['last_command_timestamp'] = now
-    current_project['runtime_dir_path'] = os.path.join(current_project['project_root'], '.remote-xcode-server')
+    current_project['runtime_dir_path'] = os.path.join(current_project['project_root_path'], '.remote-xcode-server')
     save_projects_dict()
     return None
 
@@ -485,11 +507,13 @@ def load_mailbox_from_file():
 
 def save_mailbox_to_file():
     global mailbox
-    with open(mailbox_path, 'r') as f:
+    with open(mailbox_path, 'w') as f:
         try:
             json.dump(mailbox, f)
         except Exception as e:
             print('Error trying to write json to mailbox file')
+            print(f'Current mailbox: {mailbox}')
+            raise e
 
 
 def add_bundle_request_to_mailbox(bundle_request:dict) -> None:

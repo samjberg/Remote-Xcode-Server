@@ -1,4 +1,4 @@
-from flask import jsonify, request, send_file, Response
+from requests import Response
 import sys, os, socket, requests, json, hashlib, struct, ssl, hmac, secrets, base64, time, subprocess, re, select
 from urllib import parse as parse_url
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -671,6 +671,13 @@ def stream_remote_executable_from_server(
                         os.write(sys.stdout.fileno(), data)
             finally:
                 termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+
+
+def clear_server_mailbox(server_addr: tuple[str, int]) -> Response:
+    url = _build_server_url(server_addr, '/clear-control-mailbox')
+    resp = _secure_request('GET', url)
+    resp.raise_for_status()
+    return resp
 
 
 def server_diff(server_addr: tuple[str, int], path: str, save_to_path: str = '') -> bool:
@@ -1458,6 +1465,9 @@ def send_files(server_addr:tuple[str, int], paths:list[str], filesize_threshold:
         finally:
             for handle in handles:
                 handle.close()
+        if resp.status_code == 400:
+            print(f'resp.text: {resp.text}')
+
         resp.raise_for_status()
         result = resp.json()
         print(f'result: {result}')
@@ -2837,6 +2847,8 @@ if __name__ == '__main__':
             print('Usage: removeinteractive <executable_name>')
         else:
             print(remove_allowed_interactive_command(server_addr, sys.argv[2]))
+    elif arg == 'clearmailbox':
+        clear_server_mailbox(server_addr)
 
     elif arg == 'listchanges':
         subargs = [subarg.lower() for subarg in args[1:]]

@@ -1,6 +1,6 @@
 import os
 from sys import platform
-from mcp_utils import ensure_directory_exists, get_project_root_path, get_runtime_dir_path, get_user_runtime_dir_path, unix_path, _normalize_path_for_compare
+from mcp_utils import ensure_directory_exists, get_runtime_dir_path, get_user_runtime_dir_path, unix_path, _normalize_path_for_compare
 from subprocess import run
 
 cwd = os.getcwd()

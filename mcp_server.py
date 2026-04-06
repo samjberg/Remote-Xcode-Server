@@ -436,6 +436,25 @@ def _wrap_server_tls_socket(conn: socket.socket) -> ssl.SSLSocket:
         raise RuntimeError('Server TLS context is not initialized')
     return SERVER_TLS_CONTEXT.wrap_socket(conn, server_side=True)
 
+def get_project_root_path_server(project_id='', project_name='') -> str:
+    '''This is sort of stupid but whatever, the tech debt of this project sort of forced me into defining this function
+        as a server-only version to deal with certain issuesj'''
+    if project_id:
+        project = pcm.projects_dict.get(project_id, '')
+        if project:
+            return project.get('project_root_path')
+        else:
+            raise ValueError(f'Project is empty')
+    elif project_name:
+        for _, project in pcm.projects_dict.items():
+            if project.get('project_name', '') == project_name:
+                return project.get('project_root_path', '')
+
+    if pcm.current_project:
+        return pcm.current_project.get('project_root_path', '')
+
+    return ''
+
 
 def start_discovery_listener():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -493,28 +512,6 @@ def start_discovery_listener():
                 DISCOVERY_STATUS['last_error'] = f'send_error:{e}'
 
 
-def get_project_root_path_server(project_id='', project_name='') -> str:
-    '''This is sort of stupid but whatever, the tech debt of this project sort of forced me into defining this function
-        as a server-only version to deal with certain issuesj'''
-    project_root_path = ''
-    if project_id:
-        project = pcm.projects_dict.get(project_id, '')
-        if project:
-            return project.get('project_root_path')
-        else:
-            raise ValueError(f'Project is empty')
-    elif project_name:
-        for _, project in pcm.projects_dict.items():
-            if project.get('project_name', '') == project_name:
-                return project.get('project_root_path', '')
-
-    if pcm.current_project:
-        return pcm.current_project.get('project_root_path', '')
-
-    return ''
-
-
-    
 def _locate_which_executable():
     primary_candidates = ['/usr/bin', '/bin']
     for dir_path in primary_candidates:
@@ -543,17 +540,24 @@ def _ensure_server_dir():
     """Ensures the existence of the global ~/.remote-xcode-server directory."""
     ensure_directory_exists(server_dir_path)
 
+def _ensure_bundles_dir():
+    bundles_path = os.path.join(server_dir_path, 'bundles')
+    ensure_directory_exists(bundles_path)
+
 def _set_current_project_runtime_dir_path(path: str):
     global current_project_runtime_dir_path
     if not os.path.exists(path):
         raise FileNotFoundError(f'Error, could not find new upload folder: {path}')
-    current_project_runtime_dir_path = path
-    app.config['UPLOAD_FOLDER'] = current_project_runtime_dir_path
-    pcm.project_runtime_dir_path = current_project_runtime_dir_path
-    pcm.current_project['runtime_dir_path'] = current_project_runtime_dir_path
+    if pcm.current_project.get('project_root_path', ''):
+        current_project_runtime_dir_path = path
+        app.config['UPLOAD_FOLDER'] = current_project_runtime_dir_path
+        pcm.project_runtime_dir_path = current_project_runtime_dir_path
+        pcm.current_project['runtime_dir_path'] = current_project_runtime_dir_path
 
 #ensures existence of global (not project-specific) .remote-xcode-server directory
 _ensure_server_dir()
+#ensure existence of bundles directory
+_ensure_bundles_dir()
 #bootstrap security state
 bootstrap_security_state()
 
@@ -851,7 +855,14 @@ def _before_request_func():
         projects_context_result = pcm.handle_project_context()
         if projects_context_result:
             return jsonify(projects_context_result), 400
-        _set_current_project_runtime_dir_path(pcm.current_project.get('runtime_dir_path', ''))
+        project_root_path = pcm.current_project.get('project_root_path', '')
+        if project_root_path:
+            runtime_dir_path = os.path.join(project_root_path, server_dir_name)
+            _set_current_project_runtime_dir_path(runtime_dir_path)
+        else:
+            runtime_dir_path = pcm.current_project.get('runtime_dir_path', '')
+            if runtime_dir_path:
+                _set_current_project_runtime_dir_path(runtime_dir_path)
     return None
 
 
@@ -861,6 +872,13 @@ def handle_poll_control_mailbox():
     if not isinstance(pcm.mailbox, dict):
         raise TypeError('Error: mailbox is type: {type(pcm.mailbox)}, should be type: dict')
     return pcm.mailbox
+
+@app.route('/clear-control-mailbox', methods=['GET', 'POST'])
+def clear_mailbox():
+    pcm.mailbox = {'bundle_requests': []}
+    with open(pcm.mailbox_path, 'w') as f:
+        json.dump(pcm.mailbox, f)
+    return ''
 
 @app.route('/reset-known-git-repos')
 def reset_known_git_repos():

@@ -3,7 +3,7 @@ import os, sys, pathlib, socket, subprocess, shlex, datetime, shutil
 from typing import Callable, Optional, TypeVar, Union
 from mimetypes import guess_type
 from uuid import uuid4
-from flask import Response
+from requests import Response
 from requests.models import DecodeError
 
 try:
@@ -26,6 +26,7 @@ project_nonspecific_routes = [
         '/add_allowed_interactive_command',
         '/remove_allowed_interactive_command',
         '/get_allowed_interactive_commands',
+        '/clear-control-mailbox',
         '/checkprogress/',
         '/status/',
     ]
