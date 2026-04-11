@@ -1,5 +1,5 @@
 import hashlib
-import os, sys, pathlib, socket, subprocess, shlex, datetime, shutil
+import os, sys, pathlib, socket, subprocess, shlex, datetime, shutil, time
 from typing import Callable, Optional, TypeVar, Union
 from mimetypes import guess_type
 from uuid import uuid4
@@ -19,6 +19,7 @@ KB = 1024
 MB = KB * KB
 project_runtime_dir_name = '.remote-xcode-server'
 server_dir_name = '.remote-xcode-server'
+username = os.getlogin()
 project_nonspecific_routes = [
         '/enable_pairing',
         '/pairing-bootstrap',
@@ -57,7 +58,8 @@ def get_project_runtime_dir_path(cwd:Optional[str]=None) -> str:
     """Returns the directory Remote-Xcode-Server uses to save files on both client and server"""
     if cwd is None:
         cwd = os.getcwd()
-    return os.path.join(cwd, project_runtime_dir_name)
+    project_root_path = get_project_root_path(cwd)
+    return os.path.join(project_root_path, project_runtime_dir_name)
 
 def get_server_dir_path() -> str:
     return os.path.join(get_user_home_dir(), server_dir_name)
@@ -227,23 +229,29 @@ def get_ip():
         s.close()
     return IP
 
-def contains_any(text:str, candidates:list[str], case_sensitive:bool=True) -> bool:
+def contains_any(text:Union[str, list[str]], candidates:list[str], case_sensitive:bool=True) -> bool:
     '''Returns whether or not [text] contains any of the strings in [candidates]'''
     if case_sensitive:
         for candidate in candidates:
             if candidate in text:
                 return True
     else:
-        text = text.lower()
+        if isinstance(text, str):
+            text = text.lower()
+        elif isinstance(text, list):
+            text = [s.lower() for s in text]
         for candidate in candidates:
             if candidate.lower() in text:
                 return True
     return False
 
 
-def clear_directory(path) -> None:
-    for item_path in os.listdir(path):
-        os.remove(os.path.join(path, item_path))
+def clear_directory(path: str) -> None:
+    if not os.path.exists(path):
+        os.makedirs(path)
+    if len(os.listdir(path)) > 0:
+        for item_path in os.listdir(path):
+            os.remove(os.path.join(path, item_path))
 
 def dir_is_empty(path) -> bool:
     return len(os.listdir(path)) == 0
@@ -315,7 +323,7 @@ def split_paths_by_text_or_binary(paths:list[str]) -> tuple[list[str], list[str]
     return plaintext_paths, binary_paths
 
 
-def is_subdir(path, directory):
+def is_subdir(path: str, directory: str):
     path = os.path.realpath(path)
     directory = os.path.realpath(directory)
 
@@ -357,6 +365,32 @@ def _normalize_path_for_compare(path: str) -> str:
         return unix_path(os.path.normcase(normalized))
     return normalized #any "Code is structurally unreachable" warning on this line is caused by Pylance doing static analysis and assuming it will always be run
                       #on the current OS.  It is not an actual bug or anything to worry about.
+
+def generate_random_hex_str(length: int = -1, seed: str = ''):
+    if length == -1:
+        #use default length 16 if no length is specified
+        length = 16
+    if not seed:
+        seed = str(time.time()).split('.')[1]
+    s = hashlib.sha256(seed.encode()).hexdigest()
+    total_length = len(s)
+    while total_length < length:
+        s += hashlib.sha256(s.encode()).hexdigest()
+    random_hex_str = s[:length]
+    return random_hex_str
+
+
+def generate_diff_id(file_paths: list[str] = [], diff_path: str = '') -> str:
+    seed = ''
+    if not diff_path:
+        if not isinstance(file_paths, list):
+            raise TypeError('Error, generate_diff_id takes a |list| of file paths or a single path to the diff as a |str|')
+        file_names = [os.path.split(path)[1] for path in file_paths]
+        seed = ''.join(file_names)
+    else:
+        seed = _normalize_path_for_compare(diff_path)
+
+    return generate_random_hex_str(length=8, seed=seed)
 
 
 def generate_project_id(project_name: str) -> str:

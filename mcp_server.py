@@ -1,4 +1,4 @@
-import os, subprocess, socket, json, struct, hashlib, time, re, secrets, ssl, hmac, pty, select
+import os, subprocess, json, struct, hashlib, time, re, secrets, ssl, hmac, pty, select
 from flask import Flask, request, send_file, send_from_directory, jsonify, Request, Response
 from threading import Thread, Lock
 from functools import wraps
@@ -547,7 +547,8 @@ def _ensure_bundles_dir():
 def _set_current_project_runtime_dir_path(path: str):
     global current_project_runtime_dir_path
     if not os.path.exists(path):
-        raise FileNotFoundError(f'Error, could not find new upload folder: {path}')
+        os.makedirs(path)
+        # raise FileNotFoundError(f'Error, could not find new upload folder: {path}')
     if pcm.current_project.get('project_root_path', ''):
         current_project_runtime_dir_path = path
         app.config['UPLOAD_FOLDER'] = current_project_runtime_dir_path
@@ -585,6 +586,9 @@ discovery_thread.start()
 if pcm.current_project:
     if pcm.current_project.get('project_root_path', ''):
         update_gitignore(pcm.current_project['project_root_path'])
+else:
+    #NOTE if there is no current_project on startup, we have to ensure update_gitignore is called when the project is found
+    pass
 # update_gitignore()
 
 
@@ -963,7 +967,11 @@ def get_safe_project_path(client_path:str) -> str:
     if any(p == '..' for p in normalized_parts):
         raise ValueError(f'Path traversal is not allowed: {rel_path}')
 
-    project_root_abs = os.path.abspath(pcm.cwd)
+    project_root_path = pcm.current_project.get('project_root_path', '')
+    if not project_root_path:
+        raise ValueError('project_root_path is empty')
+
+    project_root_abs = os.path.abspath(project_root_path)
     dest_abs = os.path.abspath(os.path.join(project_root_abs, normalized_rel))
     if os.path.commonpath([project_root_abs, dest_abs]) != project_root_abs:
         raise ValueError(f'Path escapes project root: {rel_path}')
@@ -1630,11 +1638,26 @@ def send_binary_file(path:str):
 @app.route('/apply-patch-server', methods=['GET'])
 def apply_patch_server():
     patch_path = request.args.get('patch_path', None)
+    print(f'patch_path received from client: {patch_path}')
     if not patch_path:
         print('Error: No patch path received from client')
         return 'Error: no patch path received from the client'
-    apply_patch(patch_path)
-    return 'successfully applied patch'
+    project_root_path = pcm.current_project.get('project_root_path', '')
+    if not project_root_path:
+        raise RuntimeError('Error, cannot apply patch on server, project root path is unknown')
+    if not os.path.isabs(patch_path):
+        patch_path = os.path.join(project_root_path, patch_path)
+    else:
+        if not is_subdir(patch_path, project_root_path):
+            raise RuntimeError(f'Error, given patch_path: {patch_path} cannot be found inside of project root path: {project_root_path}')
+
+    print(f'patch_path (absolute path): {patch_path}')
+    if os.path.getsize(patch_path) > 2:
+        print(f'Running "git apply {patch_path}" using cwd={project_root_path}')
+        proc = run_process(['git', 'apply', '--allow-empty', patch_path], cwd=project_root_path)
+        if proc.returncode:
+            raise RuntimeError(f'Error running git apply {patch_path} on server')
+    return jsonify({'ok': True, 'errors': [], 'message': 'Successfully applied patch on server'})
 
 
 @app.route('/sendchanges', methods=['GET'])
@@ -2017,7 +2040,7 @@ def start_build_job():
         
 
 @app.route('/retrieve_changed_file_paths/<scope>')
-def send_changed_file_paths(scope:str) -> Response:
+def send_changed_file_paths(scope:str):
     cwd = pcm.current_project.get('project_root_path', pcm.cwd)
     changed_file_paths = get_changed_file_paths(cwd, scope)
     changed_plaintext_paths = [path for path in changed_file_paths if is_plaintext(path)]

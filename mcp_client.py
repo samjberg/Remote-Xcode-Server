@@ -1,5 +1,5 @@
 from requests import Response
-import sys, os, socket, requests, json, hashlib, struct, ssl, hmac, secrets, base64, time, subprocess, re, select
+import sys, os, requests, json, hashlib, struct, ssl, hmac, secrets, base64, time, subprocess, re, select
 from urllib import parse as parse_url
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Union
@@ -8,6 +8,7 @@ from urllib3.poolmanager import PoolManager
 from mcp_utils import *
 from environment_setup import ensure_environment_setup, project_bundles_path
 from mcp_utils import _run_git_capture, _normalize_path_for_compare
+from parseargs import parse_args
 
 discovery_socket_port = 9346
 allowed_timestamp_skew_s = 120
@@ -680,9 +681,11 @@ def clear_server_mailbox(server_addr: tuple[str, int]) -> Response:
     return resp
 
 
-def server_diff(server_addr: tuple[str, int], path: str, save_to_path: str = '') -> bool:
+def server_diff(server_addr: tuple[str, int], path: str, save_to_path: str = '', swapsides=False) -> bool:
     '''Diff a repo-relative client file against its server equivalent.
-       Prints diff to stdout and optionally writes it to save_to_path.'''
+       Prints diff to stdout and optionally writes it to save_to_path.
+       By default client is the left-side and server is the right-side,
+       and this is swapped if swapsides=True'''
     project_root = get_project_root_path(os.getcwd())
     rel_path = unix_path(str(path)).strip()
     if not rel_path:
@@ -704,6 +707,8 @@ def server_diff(server_addr: tuple[str, int], path: str, save_to_path: str = '')
     temp_suffix = uuid4().hex[:8]
     client_copy_path = os.path.join(tmp_dir, f'client-{temp_suffix}-{filename}')
     server_copy_path = os.path.join(tmp_dir, f'server-{temp_suffix}-{filename}')
+    left_side_path = client_copy_path if not swapsides else server_copy_path
+    right_side_path = server_copy_path if not swapsides else client_copy_path
 
     try:
         shutil.copy2(local_path, client_copy_path)
@@ -712,7 +717,7 @@ def server_diff(server_addr: tuple[str, int], path: str, save_to_path: str = '')
             print(f'Failed to retrieve server copy for: {rel_path}')
             return False
 
-        cmd = ['git', 'diff', '--no-index', '--', client_copy_path, server_copy_path]
+        cmd = ['git', 'diff', '--no-index', '--', left_side_path, right_side_path]
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=project_root)
         # `git diff --no-index` returns:
         # 0 => no differences, 1 => differences found, >1 => error
@@ -934,6 +939,14 @@ def discover_server(require_pairing: bool = False, target_ip: Optional[str] = No
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     s.settimeout(3.0)
+    # Windows UDP sockets can raise WSAECONNRESET on recvfrom() after probing an
+    # unreachable target (ICMP Port Unreachable). Discovery probes multiple
+    # targets, so disable this behavior when available to avoid hard crashes.
+    if os.name == 'nt' and hasattr(socket, 'SIO_UDP_CONNRESET'):
+        try:
+            s.ioctl(socket.SIO_UDP_CONNRESET, False)
+        except OSError:
+            pass
 
     resp = ''
     discovered_server_ip = ''
@@ -964,6 +977,8 @@ def discover_server(require_pairing: bool = False, target_ip: Optional[str] = No
                 resp = resp_bytes.decode()
                 discovered_server_ip = addr[0]
                 break
+            except ConnectionResetError:
+                continue
             except socket.timeout:
                 continue
         if resp:
@@ -1467,7 +1482,8 @@ def send_files(server_addr:tuple[str, int], paths:list[str], filesize_threshold:
                 handle.close()
         if resp.status_code == 400:
             print(f'resp.text: {resp.text}')
-
+        
+        print(resp.text)
         resp.raise_for_status()
         result = resp.json()
         print(f'result: {result}')
@@ -1562,6 +1578,7 @@ def apply_patch_server(server_addr:tuple[str, int], patch_path:str='') -> Respon
     patch_path = _to_repo_relative_posix(patch_path, project_root)
     url = _build_server_url(server_addr, '/apply-patch-server')
     resp:Response = _secure_request('GET', url, params={'project_name': project_name, 'patch_path': patch_path})
+    print(f'Received resp: {resp.text}')
     if http_status_code_is_ok(resp.status_code) or 'json' not in content_type(resp).lower():
         return resp
 
@@ -1704,7 +1721,74 @@ def get_changed_server_files(server_addr:tuple[str, int], project_name:str, scop
 
     return changed_plainpaths_server, changed_binarypaths_server
 
+def sync_files(server_addr:tuple[str, int], paths: list[str]) -> bool:
+    # changed_plainpaths_server, changed_binarypaths_server = get_changed_server_files(server_addr, get_appname()) 
+    # changed_plainpaths_client, changed_binarypaths_client = get_changed_file_paths(cwd)
+    if isinstance(paths, str):
+        paths = [paths]
+    project_runtime_dir = get_runtime_dir_path(cwd)
+    project_root_path = os.path.dirname(project_runtime_dir)
+    working_dir = os.path.join(project_runtime_dir, '.working')
+    clear_directory(working_dir)
+    for path in paths:
+        #we do not write back to actual filepaths in this loop in case we encounter an error in future loop iterations
+        #this loop performs the merge operation, but exclusively within working_dir
 
+        #ensure we are working with relative paths
+        if os.path.isabs(path):
+            path = os.path.relpath(path, project_root_path)
+        fname = os.path.basename(path)
+        base_version_path = os.path.join(working_dir, f'base_{fname}')
+        client_version_path = os.path.join(working_dir, f'client_{fname}')
+        server_version_path = os.path.join(working_dir, f'server_{fname}')
+
+        #retrieve server file to working_dir
+        retrieve_file_to_path(server_addr, path, server_version_path)
+        #copy client file to working dir
+        shutil.copy2(path, client_version_path)
+        #write base version to working dir
+        with open(base_version_path, 'wb') as base_version_file:
+            try:
+                show_proc = subprocess.run(
+                    ['git', 'show', f'HEAD:{path}'],
+                    stdout=base_version_file,
+                    stderr=subprocess.PIPE,
+                    cwd=project_root_path,
+                )
+            except Exception as e:
+                print(f'Error getting base version for filepath: {path}')
+                raise e
+
+        normalize_file_line_endings(client_version_path)
+        normalize_file_line_endings(server_version_path)
+        normalize_file_line_endings(base_version_path)
+        #actually run git merge-file
+        merge_proc = subprocess.run(
+            ['git', 'merge-file', client_version_path, base_version_path, server_version_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=working_dir,
+        )
+
+        if merge_proc.returncode:
+            print(f'git merge-file returned error code: {merge_proc.returncode}')
+            print(f'Error message: {merge_proc.stderr.decode()}')
+            return False
+        else:
+            print(f'Successfully ran git merge-file on {fname}')
+
+    for path in paths:
+        #this loop is for actually "saving" the changes.  Writing to the actual paths
+        #on the client, and doing.... whatever we have to do for the server. I still need to figure that out
+        if os.path.isabs(path):
+            path = os.path.relpath(path, project_root_path)
+        fname = os.path.basename(path)
+        merged_version_path = os.path.join(working_dir, f'client_{fname}')
+        #copy merged version to actual client path
+        shutil.copy2(merged_version_path, path)
+
+    success = send_files(server_addr, paths)
+    return success
 
 def sync_uncommitted_changes(server_addr:tuple[str, int], scope='repo') -> bool:
     '''Performs two way sync with server of all UNCOMMITTED changes.'''
@@ -1728,13 +1812,21 @@ def sync_uncommitted_changes(server_addr:tuple[str, int], scope='repo') -> bool:
 
     #path to newly created diff representing the changes on the client.
     #It needs to be sent to the server (along with changed binary files being sent directly)
-    diff_to_send_path = get_diff_for_files(cwd, client_only_plainpaths, 'client_side_gitdiff.diff')
+    diff_id = generate_diff_id(client_only_plainpaths)
+    client_diff_filename = f'client_side_{diff_id}.diff'
+    diff_to_send_path = get_diff_for_files(cwd, client_only_plainpaths, client_diff_filename)
+
+    if os.path.exists(diff_to_send_path):
+        with open(diff_to_send_path, 'r') as f:
+            print(f'Diff contents for diff located at {diff_to_send_path}')
+            print(f.read())
 
     #send the client-side diff and changed/new binaries on client side to server
     success = send_files(server_addr, [diff_to_send_path, *client_only_binarypaths])
     if not success:
         print('sync_uncommitted_changes failed at send_files (client-only changes)')
         return False
+
 
     #apply the client only text changes to the server
     try:
@@ -1764,14 +1856,14 @@ def sync_uncommitted_changes(server_addr:tuple[str, int], scope='repo') -> bool:
 
     #idk, just a random folder name to put all of the versions of the files in
     work_path = os.path.join(get_runtime_dir_path(), '.working')
-    if not os.path.exists(work_path):
-        os.mkdir(work_path)
-    else:
+    ensure_directory_exists(work_path)
+    if len(os.listdir(work_path)) > 0:
         clear_directory(work_path)
 
 
-
+    print('JUST BEFORE FOR PATH IN BOTH_PLAINPATHS LOOP')
     for path in both_plainpaths:
+        print(f'Working on file at: {path} in both_plainpaths')
         if not dir_is_empty(work_path):
             clear_directory(work_path)
 
@@ -1867,7 +1959,7 @@ RECONCILE_STATUS_BLOCKED_DETACHED_HEAD = 'BLOCKED_DETACHED_HEAD'
 RECONCILE_STATUS_BLOCKED_NO_ORIGIN = 'BLOCKED_NO_ORIGIN'
 RECONCILE_STATUS_ERROR = 'ERROR'
 RECONCILE_STATUS_NEEDS_ACTION = 'NEEDS_ACTION'
-RECONCILE_STATUS_MISSING_PROJECT = 'MISSING_PROJECT'
+RECONCILE_STATUS_MISSING_PROJECT = 'project missing'
 
 
 def _reconcile_result(
@@ -2238,7 +2330,7 @@ def reconcile_git_state(server_addr:tuple[str, int], project_name:str='') -> dic
     bundle_requests = mailbox.get('bundle_requests', [])
     for bundle_req in bundle_requests:
         if _normalize_path_for_compare(bundle_req.get('project_name', None)) == _normalize_path_for_compare(project_name):
-            return _reconcile_result(RECONCILE_STATUS_NEEDS_ACTION, authority_side='client', message='missing project')
+            return _reconcile_result(RECONCILE_STATUS_MISSING_PROJECT, authority_side='client', message='missing project')
 
 
     try:
@@ -2508,7 +2600,7 @@ def reconcile_git_state(server_addr:tuple[str, int], project_name:str='') -> dic
     )
 
 
-def retrieve_diff_for_files(server_addr:tuple[str, int], paths:list[str]) -> Union[str, bool]:
+def retrieve_diff_for_files(server_addr:tuple[str, int], paths:list[str]) -> str:
     project_name:str = get_appname()
     url = _build_server_url(server_addr, '/retrieve_diff_for_files')
     try:
@@ -2522,21 +2614,22 @@ def retrieve_diff_for_files(server_addr:tuple[str, int], paths:list[str]) -> Uni
         resp.raise_for_status()
     except requests.RequestException as e:
         print(f"Failed to retrieve diff for specified files ({len(paths)} paths): {e}")
-        return False
-
-    try:
-        obj = resp.json()
-    except json.JSONDecodeError as e:
-        print('Error decoding json in retrieve_diff_for_files')
         raise e
 
-    if obj.get('error', '') == 'project missing':
-        ensure_server_has_project(obj)
-        return False
+    # try:
+    #     obj = resp.json()
+    # except json.JSONDecodeError as e:
+    #     print('Error decoding json in retrieve_diff_for_files')
+    #     raise e
+
+    # if obj.get('error', '') == 'project missing':
+    #     ensure_server_has_project(obj)
+    #     return False
 
     runtime_dir_path = get_runtime_dir_path()
     git_diff_name = 'specific_files_gitdiff.diff'
     git_diff_path = os.path.join(runtime_dir_path, git_diff_name)
+    resp.iter_content()
 
     with open(git_diff_path, 'wb') as diff_file:
         KB = 1024
@@ -2562,9 +2655,19 @@ def sync_changes_with_server(server_addr:tuple[str, int], sync_branches=True, sy
 
     if sync_branches:
         reconcile_result = reconcile_git_state(server_addr, project_name=project_name)
+        #I have tested, and this reconcile_result.get call is NOT the cause of the issue.  It IS a dict that has a 'status' key
         reconcile_status = reconcile_result.get('status', RECONCILE_STATUS_ERROR)
         if reconcile_status not in [RECONCILE_STATUS_ALIGNED, RECONCILE_STATUS_RECONCILED]:
-            # if reconcile_status == RECONCILE_STATUS_NEEDS_ACTION and reconcile_result.get('message', '') == 'missing_project':
+            if reconcile_status == RECONCILE_STATUS_MISSING_PROJECT:
+                resp_obj = reconcile_result
+                if not 'error' in resp_obj:
+                    resp_obj['error'] = 'project missing'
+                ensure_server_has_project(resp_obj)
+                sync_changes_with_server(server_addr, sync_branches=sync_branches, sync_uncommitted=sync_uncommitted, scope=scope)
+            else:
+                print(f'Project found, but reconcile status still invalid. reconcile status: {reconcile_status}')
+                print(f"Reason: {reconcile_result.get('message', '')}")
+                return False
             #     bundle_request = mailbox_get_bundle_request(mailbox, project_name=project_name)
             #     if bundle_request:
             #         project_root_path = bundle_request.get('project_root_path', '')
@@ -2772,6 +2875,11 @@ if __name__ == '__main__':
 
 
 
+    args_dct = parse_args(sys.argv)
+    long_flags_dict = args_dct['long']
+    short_flags_dict = args_dct['short']
+    plain_args = args_dct['args']
+
 
     #list slicing does not raise an IndexError even if the list is empty
     #args will just be an empty list if no argument is provided
@@ -2806,23 +2914,44 @@ if __name__ == '__main__':
         else:
             print('Failed to retrieve changes from the server')
     elif 'sync' in arg:
-        subargs = args[1:]
-        if not subargs and arg=='sync':
-            sync_changes_with_server(server_addr)
-        else:
-            if '-scope' in sys.argv:
-                idx = sys.argv.index('-scope')
-                if len(sys.argv) > idx+1:
-                    scope = sys.argv[idx+1].lower()
-                else:
-                    scope = 'repo'
+        args = args[1:]
+        if not args:
+            error_msg =  '''
+            Error, sub argument required for command sync.
+            sub-args: uncommited/unchanged, branches, all
+            '''
+            raise RuntimeError(error_msg)
+        if '--scope' in args:
+            idx = args.index('--scope') + 1
+            if idx < len(args):
+                scope = args[idx]
             else:
                 scope = 'repo'
+        else:
+            scope = 'repo'
 
-            if contains_any(arg, ['unchanged', 'uncommitted']):
-                sync_changes_with_server(server_addr, sync_branches=False, sync_uncommitted=True, scope=scope)
-            elif contains_any(arg, ['branches', 'commits']):
-                sync_changes_with_server(server_addr, sync_branches=True, sync_uncommitted=False, scope=scope)
+        if not scope in ['repo', 'cwd']:
+            scope = 'repo'
+                
+        if 'all' in args:
+            sync_changes_with_server(server_addr, scope=scope)
+        elif contains_any(args, ['uncommitted', 'uncomitted', 'uncommited', 'uncomited', 'unchanged']):
+        # elif 'uncommited' in args or 'unchanged' in args:
+            sync_changes_with_server(server_addr, sync_branches=False, scope=scope)
+        elif 'branches' in args or 'commits' in args:
+            sync_changes_with_server(server_addr, sync_uncommitted=False, scope=scope)
+        # elif 'files' in args:
+        elif contains_any(args, ['files', 'file']):
+            #the way this code works, it doesn't matter if there is 1 or multiple files.  So just allow either and treat them the same
+            start_idx = args.index('files') + 1
+            paths = args[start_idx:]
+            success = sync_files(server_addr, paths)
+            if success:
+                print(f'Successfully two-way synchronized the following files with server {paths}')
+        else:
+            raise RuntimeError(f'Unknown subargs for sync: {args}')
+
+
     elif 'sendfiles' in arg:
         if len(sys.argv) > 2:
             send_files(server_addr, [os.path.join(os.getcwd(), name) for name in sys.argv[2:]])
@@ -2980,11 +3109,17 @@ if __name__ == '__main__':
                 safe_name = 'serverdiff'
             save_to_path = os.path.join(save_to_dir, f'{safe_name}.diff')
         os.makedirs(save_to_dir, exist_ok=True)
+        swap_sides = contains_any(args, ['swap', 'swapsides'])
         success = server_diff(server_addr, path, save_to_path)
         if success:
             print(f'Saved client-server diff to: {save_to_path}')
         else:
             print('serverdiff failed')
+
+    elif arg == 'help':
+        if len(args) < 2:
+            generic_help_message = ''''''
+            print(generic_help_message)
 
     else:
         print(f'Invalid argument: {arg}')

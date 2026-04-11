@@ -1,5 +1,5 @@
 from sys import set_coroutine_origin_tracking_depth
-from mcp_utils import get_server_dir_path, generate_project_id, get_git_username, ensure_directory_exists, is_git_repo, mailbox_has_bundle_request, _normalize_path_for_compare
+from mcp_utils import generate_project_id, get_server_dir_path, get_git_username, ensure_directory_exists, is_git_repo, mailbox_has_bundle_request, _normalize_path_for_compare, update_gitignore
 from flask import request
 import os, json, time
 
@@ -143,7 +143,7 @@ def set_current_project(project_id: str='', project_name: str='', project: dict|
                                The project_id was found, but its dict had no stored project_name'''
                 raise ValueError(err_msg)
         else:
-            raise RuntimeError(f'Project not found.  Given name: {project_name}\nGiven id: {project_id}')
+            current_project = {'id': project_id, 'project_name': project_name}
     elif project_id:
         #project_name is ''
         proj_dct = projects_dict.get(project_id, None)
@@ -175,12 +175,23 @@ def set_current_project(project_id: str='', project_name: str='', project: dict|
 
     if current_project:
         project_root = current_project.get('project_root_path', '')
-        if not project_root:
-            raise ValueError('Error, invalid project_root_path: {project_root}')
-        project_runtime_dir_path = os.path.join(project_root, project_runtime_dir_name)
+        if project_root:
+            # raise ValueError('Error, invalid project_root_path: {project_root}')
+            project_runtime_dir_path = os.path.join(project_root, project_runtime_dir_name)
 
     #verify that project_runtime_dir_path (now that it has been computed) exists, if not, create it
     ensure_directory_exists(project_runtime_dir_path)
+    #ensure that .gitignore has been updated with .remote-xcode-server
+    project_root_path = current_project.get('project_root_path', '')
+    if not project_root_path:
+        if not project_id:
+            project_id = generate_project_id(project_name)
+        project_root_path = os.path.join(default_projects_dir_path, project_id)
+        current_project['project_root_path'] = project_root_path
+        # raise RuntimeError(f'Error, set current project but project_root_path is unknown')
+    else:
+        update_gitignore(project_root_path)
+
 
 
 
@@ -273,8 +284,6 @@ def get_project_root_path(project_id='', project_name='') -> str:
         raise ValueError(f'Project is empty')
 
 
-
-#this function is called by the @app.before_request decorated function
 def handle_project_context():
     global projects_dict, current_project, cwd
     if request.path == '/':
@@ -282,109 +291,89 @@ def handle_project_context():
     project_name = request.values.get('project_name', '')
     project_id = request.values.get('project_id', '')
     if not project_name:
-        return 'Missing required query parameter: project_name'
-    project = get_project(project_name=project_name)
-    now = time.time()
-    if project:
-        #update projects dict
-        project_id = project['id']
-        #project not in projects_dict or in the saved projects_dict file
-        if project_id not in projects_dict:
-            #this means that project_id was found in the projects file, but not in in-memory projects_dict
-            projects_dict[project_id] = project
-        else:
-            # this means that project_id was found in
-            loaded_projects_dict = load_projects_dict()
-            if project_id not in loaded_projects_dict:
-                save_projects_dict(projects_dict)
-
-        cwd = project['project_root_path']
-        projects_dict[project_id] = project
-        set_current_project(project_id=project_id, project_name=project_name)
-        project['last_command_timestamp'] = now
-        save_projects_dict()
-        return
-    elif request.values.get('is_full_bundle', False):
-        #we are actively receiving a full bundle transfer from the client.  Need to return None, and I am unsure of
-        #if the current project needs to be set, needs to not be set, or if it doesn't matter
-        #first let's just try returning None
-        return None
-
-    client_ip = str(request.remote_addr)
-    project_path = ''
+        raise RuntimeError(f"Error, request missing required parameter: 'project_name'")
     if not project_id:
         project_id = generate_project_id(project_name)
-    found_project = False
-    if project_id in projects_dict.keys():
-        set_current_project(project=projects_dict[project_id])
-    elif project_id:
-        #project_id is not in projects_dict (the project is not tracked yet), but there is a project_id, meaning there was a non_empty name
-        #search projects dir, each project directory within it is named its project id (NOT the project's actual name)
-        for proj_id in os.listdir(default_projects_dir_path):
-            if proj_id == project_id:
-                #this is a very weird case to imagine, but it could happen.  Where I guess the user has manually placed a project
-                #inside of rxs's default project directory where it places projects that it doesn't have a given path for
-                project_path = os.path.join(default_projects_dir_path, proj_id)
-                add_project_to_list(project_name, project_path, client_ip)
-                found_project = True
-                set_current_project(project_id=project_id, project_name=project_name)
-                break
+    if not project_id:
+        raise RuntimeError(f'Error, neither project_name nor project_id were provided.  At least project_name is required.')
+    if not projects_dict:
+        projects_dict = load_projects_dict()
+
+    project = get_project(project_id)
+    if not project and request.values.get('is_full_bundle', False):
+        return None
+
+    #ok now project_name and project_id are both guaranteed from this point on
+
+    #we have to do projects_dict checks before running set_current_project, because set_current_project sets project_id
+    if project_id in projects_dict:
+        project = projects_dict['project_id']
+        project_root_path = project.get('project_root_path', '')
+        if project_root_path and os.path.exists(project_root_path):
+            project['project_root_path'] = project_root_path
+            #successfully found project and its root path, set current project and return None (success)
+            set_current_project(project=project)
+            return None
+        else:
+            project_root_path = os.path.join(default_projects_dir_path, project_id)
+            project['project_root_path'] = project_root_path
+
     else:
-        raise ValueError('project_id is None, this should not be possible.  Figure it out.')
-
-
-    #final fallback, search through known_git_repos paths to find any project matches by name
-    if not current_project:
-        _ensure_known_git_repos_file()
-        current_project_name = _normalize_path_for_compare(project_name)
-        for path in known_git_repos:
-            repo_name = _normalize_path_for_compare(os.path.split(path)[1])
-            #use current_project_name because it is the normalized version of project_name
-            if repo_name == current_project_name: 
-                add_project_to_list(project_name, path, client_ip, set_as_current_project=True)
+        #first fallback, search default projects dir path (where rxs saves non-pre-existing projects)
+        ensure_directory_exists(default_projects_dir_path)
+        for found_project_id in os.listdir(default_projects_dir_path):
+            if found_project_id == project_id:
+                project_root_path = os.path.join(default_projects_dir_path, found_project_id)
+                project = {'id': project_id, 'project_name': project_name, 'project_root_path': project_root_path}
+                set_current_project(project=project)
                 return None
-        found_project = False
+
+
+        #final fallback to searching for project name in known git repos
+        for repo_path in known_git_repos:
+            repo_name = os.path.split(repo_path)[1]
+            if _normalize_path_for_compare(repo_name) == _normalize_path_for_compare(project_name):
+                project_root_path = repo_path
+                project = {'id': project_id, 'project_name': project_name, 'project_root_path': project_root_path}
+                set_current_project(project=project)
+                return None
+
+
+    if project:
+        #if project is found (if it is found we know it is valid at this point)
+        #handle projects dict saving
+        if current_project.get('id', ' ') != project_id:
+            raise RuntimeError('Project id mismatch')
+        if not project_id in projects_dict:
+            projects_dict[project_id] = current_project
+        loaded_projects_dict = load_projects_dict()
+        for proj_id, proj in projects_dict.items():
+            if proj_id not in loaded_projects_dict:
+                loaded_projects_dict[proj_id] = proj
+        save_projects_dict(loaded_projects_dict)
+
+    # if not project:
     else:
-        found_project = True
+        #project is not found (but it is still a project specific request, hence being in this function)
+        #handle dealing with finding bundle request in mailbox and clearning mailbox, etc
 
-
-    #post final fallback.  We genuinely failed to find the project on the server, post a request to
-    #the control mailbox for a full project bundle which will be sent back with the next response to the reuqest
-    if not found_project:
-        #FIXME this is where the failure is happening
         global mailbox
         #project not found, leave an entry in the mailbox requesting the project bundle from the client
         #also of course create mailbox file if it doesn't exist
         _ensure_mailbox_file()
         load_mailbox_from_file() #this ensures mailbox is not an empty dict and does have 'bundle_requests' key
         proj_id = project_id
-        if proj_id:
-            bundle_request = {'id': proj_id, 'project_name': project_name}
-            #make sure we do not append duplicate entries
-            if not mailbox_has_bundle_request(mailbox, bundle_request['id']):
-                mailbox['bundle_requests'].append(bundle_request)
-            with open(mailbox_path, 'w') as f:
-                json.dump(mailbox, f)
+        bundle_request = {'id': proj_id, 'project_name': project_name}
+        #make sure we do not append duplicate entries
+        if not mailbox_has_bundle_request(mailbox, bundle_request['id']):
+            mailbox['bundle_requests'].append(bundle_request)
+        with open(mailbox_path, 'w') as f:
+            json.dump(mailbox, f)
 
         return_obj = {'ok': False, 'error': 'project missing', 'mailbox': mailbox}
         return return_obj
 
-    else:
-        print(project_path)
 
-
-    project_root = current_project.get('project_root_path', '')
-    if not project_root:
-        return_obj = {'ok': False, 'error': 'project missing', 'mailbox': mailbox}
-        return return_obj
-        # return 'Current project is missing project_root_path'
-    cwd = project_root
-
-    #this line also updates the project within projects_dict, since current_project was assigned from it as a reference
-    current_project['last_command_timestamp'] = now
-    current_project['runtime_dir_path'] = os.path.join(current_project['project_root_path'], '.remote-xcode-server')
-    save_projects_dict()
-    return None
 
 def scan_for_git_repos(scan_root_dir:str, project_names: list[str]|None=None, ignore_subrepos=True) -> list[str]:
     '''Recursively scan scan_root_dir and all subdirs for GIT projects'''
@@ -446,7 +435,7 @@ def _ensure_known_git_repos_file() -> None:
         return
 
     #get command line input from the user
-    user_arg = input('Enter root path to scan for git repos, or provide a filepath with a newline separated list of paths')
+    user_arg = input('Enter root path to scan for git repos, or provide a filepath with a newline separated list of paths\n')
     user_arg = os.path.expanduser(user_arg)
     paths_to_scan = []
     found_repos = []
