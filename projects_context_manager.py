@@ -131,7 +131,7 @@ def remove_project_from_list(project_id:str = '', project_name: str = '') -> Non
 
 def set_current_project(project_id: str='', project_name: str='', project: dict|None = None):
     '''Sets current project by either id and/or name'''
-    global current_project, project_runtime_dir_path
+    global current_project, project_runtime_dir_path, projects_dict
     if project:
         current_project = project
     elif project_id and project_name:
@@ -178,6 +178,8 @@ def set_current_project(project_id: str='', project_name: str='', project: dict|
         if project_root:
             # raise ValueError('Error, invalid project_root_path: {project_root}')
             project_runtime_dir_path = os.path.join(project_root, project_runtime_dir_name)
+            if current_project.get('runtime_dir_path', '') != project_runtime_dir_path:
+                current_project['runtime_dir_path'] = project_runtime_dir_path
 
     #verify that project_runtime_dir_path (now that it has been computed) exists, if not, create it
     ensure_directory_exists(project_runtime_dir_path)
@@ -192,6 +194,21 @@ def set_current_project(project_id: str='', project_name: str='', project: dict|
     else:
         update_gitignore(project_root_path)
 
+
+    changed = False
+
+    #update projects_dict
+    if not current_project['id'] in projects_dict:
+        projects_dict[current_project['id']] = current_project
+        changed = True
+
+    loaded_projects_dict = load_projects_dict()
+    for proj_id in loaded_projects_dict.keys():
+        if not proj_id in projects_dict:
+            projects_dict[proj_id] = loaded_projects_dict[proj_id]
+            changed = True
+    if changed or not loaded_projects_dict:
+        save_projects_dict(projects_dict)
 
 
 
@@ -300,14 +317,15 @@ def handle_project_context():
         projects_dict = load_projects_dict()
 
     project = get_project(project_id)
-    if not project and request.values.get('is_full_bundle', False):
+    #handle scenario where project is not known but this request is sending over the project bundle
+    if not project and request.values.get('is_full_bundle', ''):
         return None
 
     #ok now project_name and project_id are both guaranteed from this point on
 
     #we have to do projects_dict checks before running set_current_project, because set_current_project sets project_id
     if project_id in projects_dict:
-        project = projects_dict['project_id']
+        project = projects_dict[project_id]
         project_root_path = project.get('project_root_path', '')
         if project_root_path and os.path.exists(project_root_path):
             project['project_root_path'] = project_root_path
