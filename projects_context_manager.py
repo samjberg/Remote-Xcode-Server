@@ -1,5 +1,5 @@
 from sys import set_coroutine_origin_tracking_depth
-from mcp_utils import generate_project_id, get_server_dir_path, get_git_username, ensure_directory_exists, is_git_repo, mailbox_has_bundle_request, _normalize_path_for_compare, update_gitignore
+from mcp_utils import generate_project_id, get_project_runtime_dir_path, get_runtime_dir_name, get_server_dir_path, get_git_username, ensure_directory_exists, is_git_repo, mailbox_has_bundle_request, _normalize_path_for_compare, update_gitignore
 from flask import request
 import os, json, time
 
@@ -11,6 +11,7 @@ projects_dict_filepath = os.path.join(server_dir_path, projects_dict_filename)
 cwd = os.getcwd()
 current_project = {}
 projects_dict = {}
+user_projects_path = ''
 project_runtime_dir_name = '.remote-xcode-server'
 project_runtime_dir_path = ''
 known_git_repos_filename = 'known_git_repos.json'
@@ -66,15 +67,85 @@ def _ensure_default_projects_dir() -> None:
 def _ensure_bundles_dir() -> None:
     ensure_directory_exists(bundles_dir_name)
 
+
+def _create_todo_info(project_id: str = '', project_name: str = ''):
+    if (not project_id) and (not project_name):
+        raise ValueError('Error: must provide project_id and/or project_name to create TODO info')
+    elif not project_id:
+        project_id = generate_project_id(project_name)
+
+    project = projects_dict.get(project_id, {})
+    if not project:
+        if not project_name:
+            raise ValueError(f'Error, project: {project_id} not found')
+        else:
+            raise ValueError(f'Error, project named: {project_name} (id: {project_id}) not found')
+
+    project_root_path = get_project_root_path(project_id)
+    if not project_root_path:
+        raise RuntimeError(f'Error, root path not known for project: {project_name} (id: {project_id}).  Cannot create todo info')
+
+    project_runtime_dir = os.path.join(project_root_path, get_runtime_dir_name())
+    todos_path = os.path.join(project_runtime_dir, 'todos.json')
+    rel_path = os.path.relpath(todos_path, project_root_path)
+    # os.path.join(project_root_path, ')
+    todo_info = {'path': todos_path, 'rel_path': rel_path, 'todos_list': []}
+    return todo_info
+
+
 def _create_project(project_name:str, project_root_path: str, client_ip:str =''):
     project_id = generate_project_id(project_name)
     timestamp = time.time()
+    todo_info = _create_todo_info(project_id, project_name)
     project = {'id': project_id, 'project_name': project_name, 'project_root_path': project_root_path,
                'runtime_dir_path': os.path.join(project_root_path, '.remote-xcode-server'), 
-               'tracked_timestamp': timestamp, 'last_command_timestamp': timestamp, 'known_clients': []}
+               'tracked_timestamp': timestamp, 'last_command_timestamp': timestamp, 'known_clients': [], 'todo_info': todo_info}
     if client_ip:
         project['known_clients'].append(client_ip)
     return project
+
+
+
+def upsert_project(project: dict) -> bool:
+    '''Updates an existing project, or adds a new project if one does not already exist with the same id'''
+    global projects_dict
+    pid = project['id']
+    if not projects_dict:
+        projects_dict = load_projects_dict()
+
+    prev_mem = projects_dict.get(pid, {})
+    merged = {**prev_mem, **project}
+    projects_dict[pid] = merged
+
+    loaded = load_projects_dict()
+    prev_disk = loaded.get(pid, {})
+    loaded[pid] = {**prev_disk, **merged}
+
+    changed = (prev_mem != merged) or (prev_disk != loaded[pid])
+    if changed:
+        save_projects_dict(loaded)
+    return changed
+
+def update_project_key(key: str, val: str, project_id: str = '', project_name: str = ''):
+    if not project_id:
+        if not project_name:
+            raise ValueError(f'Must provide project_id and/or project_name to update a project')
+        project_id = generate_project_id(project_name)
+    project = projects_dict.get(project_id, {})
+    if not project:
+        raise KeyError(f'Error: project_id: {project_id} not found in projects_dict')
+    upsert_project(project)
+
+def _request_value_to_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return value != 0
+    normalized = str(value).strip().lower()
+    return normalized in {'1', 'true', 't', 'yes', 'y', 'on'}
+
 
 def add_project_to_list(project_name: str, project_root_path: str, client_ip: str='', set_as_current_project=False) -> dict:
     global projects_dict
@@ -195,20 +266,7 @@ def set_current_project(project_id: str='', project_name: str='', project: dict|
         update_gitignore(project_root_path)
 
 
-    changed = False
-
-    #update projects_dict
-    if not current_project['id'] in projects_dict:
-        projects_dict[current_project['id']] = current_project
-        changed = True
-
-    loaded_projects_dict = load_projects_dict()
-    for proj_id in loaded_projects_dict.keys():
-        if not proj_id in projects_dict:
-            projects_dict[proj_id] = loaded_projects_dict[proj_id]
-            changed = True
-    if changed or not loaded_projects_dict:
-        save_projects_dict(projects_dict)
+    upsert_project(current_project)
 
 
 
@@ -282,8 +340,6 @@ def get_project(project_id:str = '', project_name:str = '') -> dict:
 
 
 def get_project_root_path(project_id='', project_name='') -> str:
-    '''This is sort of stupid but whatever, the tech debt of this project sort of forced me into defining this function
-        as a server-only version to deal with certain issuesj'''
     global projects_dict
 
     if (not project_id) and (not project_name):
@@ -318,7 +374,8 @@ def handle_project_context():
 
     project = get_project(project_id)
     #handle scenario where project is not known but this request is sending over the project bundle
-    if not project and request.values.get('is_full_bundle', ''):
+    is_full_bundle = _request_value_to_bool(request.values.get('is_full_bundle', ''))
+    if not project and is_full_bundle:
         return None
 
     #ok now project_name and project_id are both guaranteed from this point on
@@ -362,13 +419,7 @@ def handle_project_context():
         #handle projects dict saving
         if current_project.get('id', ' ') != project_id:
             raise RuntimeError('Project id mismatch')
-        if not project_id in projects_dict:
-            projects_dict[project_id] = current_project
-        loaded_projects_dict = load_projects_dict()
-        for proj_id, proj in projects_dict.items():
-            if proj_id not in loaded_projects_dict:
-                loaded_projects_dict[proj_id] = proj
-        save_projects_dict(loaded_projects_dict)
+        upsert_project(current_project)
 
     # if not project:
     else:
@@ -430,7 +481,7 @@ def _ensure_mailbox_file() -> None:
             print(f'UNABLE TO DECODE MAILBOX FILE.  Continuing, but please pay attention to this message.  Error message: {err}')
 
 def _ensure_known_git_repos_file() -> None:
-    global known_git_repos
+    global known_git_repos, user_projects_path
     #if known_git_repos_path already exists, attempt to load from it.  Hard-fail on failure.
     if os.path.exists(known_git_repos_path):
         try:
@@ -454,19 +505,21 @@ def _ensure_known_git_repos_file() -> None:
 
     #get command line input from the user
     user_arg = input('Enter root path to scan for git repos, or provide a filepath with a newline separated list of paths\n')
-    user_arg = os.path.expanduser(user_arg)
+    user_projects_path = os.path.expanduser(user_arg)
+    for i in range(10):
+        print(f'USER_PROJECTS_PATH: {user_projects_path}')
     paths_to_scan = []
     found_repos = []
-    if not os.path.exists(user_arg):
-        raise FileNotFoundError(f'Cannot find file or directory at path: {user_arg}')
-    elif os.path.isfile(user_arg):
-        with open(user_arg, 'r') as f:
+    if not os.path.exists(user_projects_path):
+        raise FileNotFoundError(f'Cannot find file or directory at path: {user_projects_path}')
+    elif os.path.isfile(user_projects_path):
+        with open(user_projects_path, 'r') as f:
             paths_to_scan = [line.strip() for line in f.readlines() if line.strip()]
             #ensure all paths in paths_to_scan are absolute paths
             paths_to_scan = [path if os.path.isabs(path) else os.path.abspath(path) for path in paths_to_scan]
     else:
         #user_arg is a directory, so just add it to paths_to_scan as the only path to scan
-        path_to_scan = user_arg if os.path.isabs(user_arg) else os.path.abspath(user_arg)
+        path_to_scan = user_projects_path if os.path.isabs(user_projects_path) else os.path.abspath(user_projects_path)
         paths_to_scan.append(path_to_scan)
 
     for path in paths_to_scan:
@@ -480,7 +533,7 @@ def _ensure_known_git_repos_file() -> None:
     ensure_directory_exists(server_dir_path)
     with open(known_git_repos_path, 'w') as f:
         try:
-            json.dump({'known_git_repos': known_git_repos}, f)
+            json.dump({'known_git_repos_path': user_projects_path, 'known_git_repos': known_git_repos}, f)
         except Exception as e:
             print(f'Error trying to write json to known_git_repos file: {e}')
 
@@ -554,6 +607,10 @@ def initialize():
 
         set_current_project(project_id=most_recent_project_id)
         current_project = projects_dict[most_recent_project_id]
+        #ensure every project in projects_dict has a todo_info entry, so we can reliably access it elsewhere
+        if not current_project.get('todo_info', None):
+            todo_info = _create_todo_info(current_project['id'], current_project.get('project_name', ''))
+            current_project['todo_info'] = todo_info
 
     current_proj_path = current_project.get('project_root_path', '')
     if current_proj_path:
@@ -571,6 +628,5 @@ def initialize():
 
 
     
-
 
 

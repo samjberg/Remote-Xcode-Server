@@ -362,8 +362,9 @@ def _normalize_path_for_compare(path: str) -> str:
         return ''
     normalized = os.path.normpath(os.path.expandvars(os.path.expanduser(path.strip())))
     if os.name == 'nt':
-        return unix_path(os.path.normcase(normalized))
-    return normalized #any "Code is structurally unreachable" warning on this line is caused by Pylance doing static analysis and assuming it will always be run
+        return unix_path(normalized.lower())
+        # return unix_path(os.path.normcase(normalized))
+    return normalized.lower() #any "Code is structurally unreachable" warning on this line is caused by Pylance doing static analysis and assuming it will always be run
                       #on the current OS.  It is not an actual bug or anything to worry about.
 
 def generate_random_hex_str(length: int = -1, seed: str = ''):

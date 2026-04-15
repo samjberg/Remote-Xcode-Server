@@ -9,7 +9,13 @@ from mcp_utils import *
 from environment_setup import ensure_environment_setup, project_bundles_path
 from mcp_utils import _run_git_capture, _normalize_path_for_compare
 from parseargs import parse_args
+import rich
+from rich import pretty
+from rich.console import Console
 
+
+console = Console()
+pretty.install(console)
 discovery_socket_port = 9346
 allowed_timestamp_skew_s = 120
 SECURITY_SCHEMA_VERSION = 3
@@ -1092,24 +1098,19 @@ def poll_server_control_mailbox(server_addr: tuple[str, int]):
         send_files(server_addr, full_bundle_paths)
 
 
-    # for req_obj in bundle_requests:
-    #     if req_obj.get('project_name')
 
-
-
-def send_update_bundle_to_server(client_head:str):
-    project_name = get_appname(os.getcwd())
-    runtime_dir_path = get_runtime_dir_path()
-    bundle_name = 'full_project_update.bundle'
-    save_path = os.path.join(runtime_dir_path, bundle_name)
-    if not client_head:
-        print(f'Error: {client_head} not found in request.values.keys')
-        return f'Error: {client_head} not found in request.values.keys'
-    git_create_update_bundle(client_head, 'HEAD', save_path)
-    return save_path
-
-
-
+def retrieve_todos_from_server(server_addr: tuple[str, int]) -> list[str]:
+    project_name = get_appname()
+    url = _build_server_url(server_addr, '/retrieve-todos')
+    resp = _secure_request('GET', url, params={'project_name': project_name})
+    resp.raise_for_status()
+    try:
+        resp_dct = resp.json()
+    except json.JSONDecodeError as e:
+        print(f'Unable to decode JSON for response to /retrieve-todos.  Full response text: {resp.text}')
+        raise e
+    todos: list[str] = resp_dct.get('todos', [])
+    return todos
 
 
 def start_build_job(server_addr:tuple[str, int], git_diff_path:str, changed_binary_paths:list[str]=[], args:list[str]=[]) -> Response:
@@ -1480,7 +1481,16 @@ def send_files(server_addr:tuple[str, int], paths:list[str], filesize_threshold:
         finally:
             for handle in handles:
                 handle.close()
-        if resp.status_code == 400:
+        if resp.status_code:
+            try:
+                obj: dict = resp.json()
+                if obj.get('error', '') == 'project missing':
+                    ensure_server_has_project(obj)
+                    send_files(server_addr, paths, filesize_threshold, total_threshold)
+                # if 
+            except json.JSONDecodeError as e:
+                print('Unable to decode response (error response) json')
+                raise e
             print(f'resp.text: {resp.text}')
         
         print(resp.text)
@@ -1577,7 +1587,7 @@ def apply_patch_server(server_addr:tuple[str, int], patch_path:str='') -> Respon
         patch_path, _ = prepare_text_changes(cwd)
     patch_path = _to_repo_relative_posix(patch_path, project_root)
     url = _build_server_url(server_addr, '/apply-patch-server')
-    resp:Response = _secure_request('GET', url, params={'project_name': project_name, 'patch_path': patch_path})
+    resp:Response = _secure_request('GET', url, params={'project_name': project_name, 'patch_path': patch_path, 'run_restore': True})
     print(f'Received resp: {resp.text}')
     if http_status_code_is_ok(resp.status_code) or 'json' not in content_type(resp).lower():
         return resp
@@ -2934,12 +2944,15 @@ if __name__ == '__main__':
             scope = 'repo'
                 
         if 'all' in args:
-            sync_changes_with_server(server_addr, scope=scope)
+            with console.status('Syncing all changes...'):
+                sync_changes_with_server(server_addr, scope=scope)
         elif contains_any(args, ['uncommitted', 'uncomitted', 'uncommited', 'uncomited', 'unchanged']):
-        # elif 'uncommited' in args or 'unchanged' in args:
-            sync_changes_with_server(server_addr, sync_branches=False, scope=scope)
+            # elif 'uncommited' in args or 'unchanged' in args:
+            with console.status('Syncing uncommitted changes...'):
+                sync_changes_with_server(server_addr, sync_branches=False, scope=scope)
         elif 'branches' in args or 'commits' in args:
-            sync_changes_with_server(server_addr, sync_uncommitted=False, scope=scope)
+            with console.status('Syncing commits...'):
+                sync_changes_with_server(server_addr, sync_uncommitted=False, scope=scope)
         # elif 'files' in args:
         elif contains_any(args, ['files', 'file']):
             #the way this code works, it doesn't matter if there is 1 or multiple files.  So just allow either and treat them the same
@@ -3092,29 +3105,36 @@ if __name__ == '__main__':
             print(f'Invalid dest: {dest}')
             exit()
     elif arg == 'serverdiff':
-        if len(args) < 2:
-            print('Usage: serverdiff <repo-relative-path> [save_to_path]')
-            exit()
-        path = args[1]
-        project_root = get_project_root_path(os.getcwd())
-        runtime_dir = get_runtime_dir_path(project_root)
-        if len(args) >= 3:
-            save_to_path = args[2]
-            save_to_path = save_to_path if os.path.isabs(save_to_path) else os.path.join(project_root, save_to_path)
-            save_to_dir = os.path.dirname(save_to_path)
-        else:
-            save_to_dir = os.path.join(runtime_dir, 'server-diffs')
-            safe_name = unix_path(path).strip('/').replace('/', '__')
-            if not safe_name:
-                safe_name = 'serverdiff'
-            save_to_path = os.path.join(save_to_dir, f'{safe_name}.diff')
-        os.makedirs(save_to_dir, exist_ok=True)
-        swap_sides = contains_any(args, ['swap', 'swapsides'])
-        success = server_diff(server_addr, path, save_to_path)
+        with console.status("Running serverdiff..."):
+            if len(args) < 2:
+                print('Usage: serverdiff <repo-relative-path> [save_to_path]')
+                exit()
+            path = args[1]
+            project_root = get_project_root_path(os.getcwd())
+            runtime_dir = get_runtime_dir_path(project_root)
+            if len(args) >= 3:
+                save_to_path = args[2]
+                save_to_path = save_to_path if os.path.isabs(save_to_path) else os.path.join(project_root, save_to_path)
+                save_to_dir = os.path.dirname(save_to_path)
+            else:
+                save_to_dir = os.path.join(runtime_dir, 'server-diffs')
+                safe_name = unix_path(path).strip('/').replace('/', '__')
+                if not safe_name:
+                    safe_name = 'serverdiff'
+                save_to_path = os.path.join(save_to_dir, f'{safe_name}.diff')
+            os.makedirs(save_to_dir, exist_ok=True)
+            swap_sides = contains_any(args, ['swap', 'swapsides'])
+            success = server_diff(server_addr, path, save_to_path)
         if success:
             print(f'Saved client-server diff to: {save_to_path}')
         else:
             print('serverdiff failed')
+
+    elif 'gettodo' in arg:
+        #TODO implement actual todo command
+        todo_lst = retrieve_todos_from_server(server_addr)
+        for todo in todo_lst:
+            print(todo + '\n\n\n')
 
     elif arg == 'help':
         if len(args) < 2:

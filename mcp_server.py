@@ -884,6 +884,32 @@ def clear_mailbox():
         json.dump(pcm.mailbox, f)
     return ''
 
+@app.route('/retrieve-todos', methods=['GET'])
+def send_todos():
+    project_name = request.args.get('project_name', '')
+    if not project_name:
+        raise ValueError("Missing required request param: 'project_name'")
+    project = pcm.current_project
+    todo_info = project.get('todo_info', {})
+    todo_dct = {}
+    if not todo_info:
+        project_id = project.get('id', '')
+        if not project_id:
+            raise ValueError(f'Error: project: {project} has no id')
+        project_root_path = get_project_root_path_server(project_id)
+        project_runtime_dir = os.path.join(project_root_path, get_runtime_dir_name())
+        todos_path = os.path.join(project_runtime_dir, 'todos.json')
+        if os.path.exists(todos_path):
+            with open(todos_path, 'r') as f:
+                todo_dct = json.load(f)
+
+        with open(todos_path, 'w') as f:
+            json.dump({'todos': []}, f)
+
+    return todo_dct, 200
+
+
+
 @app.route('/reset-known-git-repos')
 def reset_known_git_repos():
     with open(pcm.known_git_repos_path, 'r') as f:
@@ -895,9 +921,12 @@ def receive_full_project_bundle():
     print(f'request.values:')
     for key, val in request.values.items():
         print(f'{key}: {val}')
+    project_name = request.values.get('project_name', '')
     project_id = request.values.get('project_id', '')
+    if not project_name:
+        raise RuntimeError('Error, no project_name in request args in receive_full_project_bundle')
     if not project_id:
-        raise RuntimeError('Error, no project_id in request args in recieve_full_project_bundle')
+        raise RuntimeError('Error, no project_id in request args in receive_full_project_bundle')
     if not 'full_project_bundle' in request.files:
         raise RuntimeError('Error, expected key full_project_bundle not found in request from client in receieve_full_project_bundle')
 
@@ -916,7 +945,30 @@ def receive_full_project_bundle():
         raise FileNotFoundError('Error, bundle not found at expected path: {bundle_path}')
 
     #ensure that the server default projects directory exists, and that the project DOESNT exist there
-    project_path = os.path.join(pcm.default_projects_dir_path, project_id)
+
+    normed_project_name = _normalize_path_for_compare(project_name)
+    project_path = ''
+
+    if os.path.exists(pcm.user_projects_path):
+        if os.path.isdir(pcm.user_projects_path):
+            for dirpath, dirnames, filenames in os.walk(pcm.user_projects_path):
+                if _normalize_path_for_compare(os.path.split(dirpath)[1]) == normed_project_name:
+                    project_path = dirpath
+                    break
+                should_break = False
+                for dirname in dirnames:
+                    if _normalize_path_for_compare(dirname) == normed_project_name:
+                        project_path = os.path.join(dirpath, dirname)
+                        should_break = True
+                        break
+                if should_break:
+                    break
+
+    if not project_path:
+        project_path = os.path.join(pcm.default_projects_dir_path, project_id)
+
+    print(f'Using project_path: {project_path}')
+
     if os.path.exists(project_path):
         if os.path.isdir(project_path):
             raise RuntimeError("Error, project dir already exists.  We shouldn't have reached this point in the code if the project exists, need to figure out what's going on")
@@ -1638,6 +1690,7 @@ def send_binary_file(path:str):
 @app.route('/apply-patch-server', methods=['GET'])
 def apply_patch_server():
     patch_path = request.args.get('patch_path', None)
+    run_restore = request.args.get('run_restore', None)
     print(f'patch_path received from client: {patch_path}')
     if not patch_path:
         print('Error: No patch path received from client')
@@ -1653,10 +1706,23 @@ def apply_patch_server():
 
     print(f'patch_path (absolute path): {patch_path}')
     if os.path.getsize(patch_path) > 2:
+        if run_restore:
+            reset_proc = run_process(['git', 'restore', '.'], cwd=project_root_path)
+            if reset_proc.returncode:
+                raise RuntimeError(f'Error running "git restore .".  Error message: {reset_proc.stderr.decode(errors='replace')}')
         print(f'Running "git apply {patch_path}" using cwd={project_root_path}')
         proc = run_process(['git', 'apply', '--allow-empty', patch_path], cwd=project_root_path)
         if proc.returncode:
-            raise RuntimeError(f'Error running git apply {patch_path} on server')
+            # raise RuntimeError(f'Error running git apply {patch_path} on server.  Error message: {proc.stderr.decode()}')
+            if 'patch does not apply' in proc.stderr.decode(errors='replace'):
+                proc = run_process(['git', 'restore', '.'], cwd=project_root_path)
+                if proc.returncode:
+                    raise RuntimeError('Error run "git restore ."')
+                proc = run_process(['git', 'apply', '--allow-empty', patch_path], cwd=project_root_path)
+                if proc.returncode:
+                    raise RuntimeError(f'Error running git apply {patch_path} on server.  Error message: {proc.stderr.decode()}')
+
+
     return jsonify({'ok': True, 'errors': [], 'message': 'Successfully applied patch on server'})
 
 
@@ -2097,6 +2163,8 @@ def hello_world():
 
 
 if __name__ == '__main__':
+    #TODO add minimal command handling for doing things like moving projects from default dir to a regular, named directory, find the path to a project, etc.
+    #Only launch the server if this odes not happen
     ip, port = '0.0.0.0', get_server_port()
     cert_path, key_path = get_tls_paths()
     app.run(ip, port, ssl_context=(cert_path, key_path))
