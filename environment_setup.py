@@ -1,6 +1,6 @@
 import os
 from sys import platform
-from mcp_utils import ensure_directory_exists, get_runtime_dir_path, get_user_runtime_dir_path, unix_path, _normalize_path_for_compare
+from mcp_utils import ensure_directory_exists, get_runtime_dir_path, get_user_runtime_dir_path, unix_path, normalize_path_for_compare
 from subprocess import run
 
 cwd = os.getcwd()
@@ -24,8 +24,8 @@ def update_windows_path(new_path_directory):
         except FileNotFoundError:
             current_path = ""
 
-        path_elements = [_normalize_path_for_compare(ele) for ele in current_path.split(os.pathsep) if ele.strip()]
-        normalized_new_path = _normalize_path_for_compare(new_path_directory)
+        path_elements = [normalize_path_for_compare(ele) for ele in current_path.split(os.pathsep) if ele.strip()]
+        normalized_new_path = normalize_path_for_compare(new_path_directory)
 
         # Avoid duplicates
         if normalized_new_path not in path_elements:
@@ -130,8 +130,8 @@ def ensure_environment_setup():
 
     #Ensure that executables_path is in the system PATH (this is what enables xcodebuild to register as a command)
     curr_path = os.environ['PATH']
-    path_elements = [_normalize_path_for_compare(path) for path in curr_path.split(os.pathsep) if path.strip()]
-    normalized_executables_path = _normalize_path_for_compare(executables_path)
+    path_elements = [normalize_path_for_compare(path) for path in curr_path.split(os.pathsep) if path.strip()]
+    normalized_executables_path = normalize_path_for_compare(executables_path)
     if normalized_executables_path not in path_elements:
         if posix_os:
             update_posix_path(executables_path)

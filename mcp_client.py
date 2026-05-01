@@ -7,7 +7,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.poolmanager import PoolManager
 from mcp_utils import *
 from environment_setup import ensure_environment_setup, project_bundles_path
-from mcp_utils import _run_git_capture, _normalize_path_for_compare
+from mcp_utils import _run_git_capture, normalize_path_for_compare
 from parseargs import parse_args
 import rich
 from rich import pretty
@@ -772,8 +772,8 @@ def send_full_project_bundle(server_addr: tuple[str, int], project_id: str):
                         url,
                         params={
                             'is_full_bundle': True,
-                            'project_id': project_id, 
-                            'project_name': project_name}, 
+                            'project_id': project_id,
+                            'project_name': project_name},
                         files=files_to_send)
 
     if not http_status_code_is_ok(resp.status_code):
@@ -804,8 +804,8 @@ def ensure_server_has_project(response_obj:dict):
     if project_id not in os.listdir(project_bundles_path):
         project_root_path = bundle_request.get('project_root_path', '')
         if not project_root_path:
-            bpn_normed = _normalize_path_for_compare(bundle_request.get('project_name', ''))
-            pn_normed = _normalize_path_for_compare(project_name)
+            bpn_normed = normalize_path_for_compare(bundle_request.get('project_name', ''))
+            pn_normed = normalize_path_for_compare(project_name)
             if bpn_normed == pn_normed:
                 project_root_path = get_project_root_path(cwd)
             else:
@@ -850,7 +850,7 @@ def launch_remote_interactive_executable_stream(server_addr: tuple[str, int], co
     url = _build_server_url(server_addr, f'/interactive/launch/{command}')
     resp: Response = _secure_request('POST', url, params={'project_name': project_name}, json_data={})
     try:
-        obj = resp.json() 
+        obj = resp.json()
     except ValueError as e:
         raise RuntimeError(f'Invalid launch response from server: {resp.text}') from e
     if not obj.get('ok', False):
@@ -1079,7 +1079,7 @@ def poll_server_control_mailbox(server_addr: tuple[str, int]):
     the client actually needing to keep an open port.  Used to communicate when the server needs
     a git bundle sent over because a project is missing, etc'''
     cwd = os.getcwd()
-    current_project_name = _normalize_path_for_compare(get_appname(cwd))
+    current_project_name = normalize_path_for_compare(get_appname(cwd))
     url = _build_server_url(server_addr, '/poll-control-mailbox')
     resp = _secure_request('GET', url)
 
@@ -1089,7 +1089,7 @@ def poll_server_control_mailbox(server_addr: tuple[str, int]):
     full_bundle_paths = []
 
     for bundle_request in bundle_requests:
-        br_project_name = _normalize_path_for_compare(bundle_request.get('project_name', ''))
+        br_project_name = normalize_path_for_compare(bundle_request.get('project_name', ''))
         if br_project_name == current_project_name:
             bundle_path = git_create_full_project_bundle(cwd)
             full_bundle_paths.append(bundle_path)
@@ -1196,12 +1196,16 @@ def _recv_frame(s: socket.socket) -> tuple[dict, bytes]:
 
 def _file_sha256(path: str, chunk_size: int = 256 * KB) -> str:
     digest = hashlib.sha256()
-    with open(path, 'rb') as f:
-        while True:
-            chunk = f.read(chunk_size)
-            if not chunk:
-                break
-            digest.update(chunk)
+    try:
+        with open(path, 'rb') as f:
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                digest.update(chunk)
+    except PermissionError as e:
+        print(f'Permission error trying to access file: {path}, unable to run _file_sha256')
+
     return digest.hexdigest()
 
 
@@ -1473,9 +1477,13 @@ def send_files(server_addr:tuple[str, int], paths:list[str], filesize_threshold:
                         mimetype = 'text/plain'
                     else:
                         mimetype = 'application/octet-stream'
-                handle = open(abs_path, 'rb')
-                handles.append(handle)
-                files[f'file{i}'] = (rel_path, handle, mimetype, {'Expires': 0})
+                try:
+                    handle = open(abs_path, 'rb')
+                    handles.append(handle)
+                    files[f'file{i}'] = (rel_path, handle, mimetype, {'Expires': 0})
+                except PermissionError as e:
+                    print(f'Permission error accessing file: {path}, unable to send it. Skipping and continuing for now.')
+
 
             resp = _secure_request('POST', url, params={'project_name': project_name}, files=files, timeout=300)
         finally:
@@ -1487,12 +1495,12 @@ def send_files(server_addr:tuple[str, int], paths:list[str], filesize_threshold:
                 if obj.get('error', '') == 'project missing':
                     ensure_server_has_project(obj)
                     send_files(server_addr, paths, filesize_threshold, total_threshold)
-                # if 
+                # if
             except json.JSONDecodeError as e:
                 print('Unable to decode response (error response) json')
                 raise e
             print(f'resp.text: {resp.text}')
-        
+
         print(resp.text)
         resp.raise_for_status()
         result = resp.json()
@@ -1593,7 +1601,7 @@ def apply_patch_server(server_addr:tuple[str, int], patch_path:str='') -> Respon
         return resp
 
     try:
-        obj = resp.json() 
+        obj = resp.json()
     except ValueError as e:
         print(f'Error, unable to decode json response from server in apply_patch_server')
         raise e
@@ -1619,7 +1627,7 @@ def send_current_changes(server_addr:tuple[str, int], project_name:str='') -> Re
     if http_status_code_is_ok(resp.status_code) or 'json' not in content_type(resp).lower():
         return resp
     try:
-        obj = resp.json() 
+        obj = resp.json()
     except ValueError as e:
         print(f'Error, unable to decode json response from server in apply_patch_server')
         raise e
@@ -1697,7 +1705,7 @@ def get_changed_server_files(server_addr:tuple[str, int], project_name:str, scop
         resp = _secure_request('GET', url, params={'project_name': project_name}, stream=True, timeout=120)
         if not http_status_code_is_ok(resp.status_code):
             try:
-                obj = resp.json() 
+                obj = resp.json()
             except ValueError as e:
                 print(f'Error, unable to decode json response from server in get_changed_server_files')
                 raise e
@@ -1732,7 +1740,7 @@ def get_changed_server_files(server_addr:tuple[str, int], project_name:str, scop
     return changed_plainpaths_server, changed_binarypaths_server
 
 def sync_files(server_addr:tuple[str, int], paths: list[str]) -> bool:
-    # changed_plainpaths_server, changed_binarypaths_server = get_changed_server_files(server_addr, get_appname()) 
+    # changed_plainpaths_server, changed_binarypaths_server = get_changed_server_files(server_addr, get_appname())
     # changed_plainpaths_client, changed_binarypaths_client = get_changed_file_paths(cwd)
     if isinstance(paths, str):
         paths = [paths]
@@ -1899,7 +1907,7 @@ def sync_uncommitted_changes(server_addr:tuple[str, int], scope='repo') -> bool:
         #restore the local file so conflicts/failures do not leave the repo clobbered
         shutil.copy2(client_version_path, path)
 
-        
+
 
         #run 'git show HEAD:{rel_path} > {base_version_path}' to save the base version to {base_version_path}
         with open(base_version_path, 'wb') as base_version_file:
@@ -2339,7 +2347,7 @@ def reconcile_git_state(server_addr:tuple[str, int], project_name:str='') -> dic
 
     bundle_requests = mailbox.get('bundle_requests', [])
     for bundle_req in bundle_requests:
-        if _normalize_path_for_compare(bundle_req.get('project_name', None)) == _normalize_path_for_compare(project_name):
+        if normalize_path_for_compare(bundle_req.get('project_name', None)) == normalize_path_for_compare(project_name):
             return _reconcile_result(RECONCILE_STATUS_MISSING_PROJECT, authority_side='client', message='missing project')
 
 
@@ -2683,7 +2691,7 @@ def sync_changes_with_server(server_addr:tuple[str, int], sync_branches=True, sy
             #         project_root_path = bundle_request.get('project_root_path', '')
             #         if os.path.exists(project_root_path):
             #             if '.git' in os.listdir(project_root_path):
-            #                 normed_project_name = _normalize_path_for_compare(project_name)
+            #                 normed_project_name = normalize_path_for_compare(project_name)
             #                 bundle_path = os.path.join(project_bundles_path, f'{normed_project_name}.bundle')
             #                 git_create_full_project_bundle(os.getcwd(), bundle_path)
             #                 if not os.path.exists(bundle_path):
@@ -2942,7 +2950,7 @@ if __name__ == '__main__':
 
         if not scope in ['repo', 'cwd']:
             scope = 'repo'
-                
+
         if 'all' in args:
             with console.status('Syncing all changes...'):
                 sync_changes_with_server(server_addr, scope=scope)

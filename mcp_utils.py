@@ -357,7 +357,7 @@ def normalize_file_line_endings(path:str, fmt='LF') -> None:
             f.write(clean_line + newline_bytes)
 
 
-def _normalize_path_for_compare(path: str) -> str:
+def normalize_path_for_compare(path: str) -> str:
     if path is None:
         return ''
     normalized = os.path.normpath(os.path.expandvars(os.path.expanduser(path.strip())))
@@ -389,7 +389,7 @@ def generate_diff_id(file_paths: list[str] = [], diff_path: str = '') -> str:
         file_names = [os.path.split(path)[1] for path in file_paths]
         seed = ''.join(file_names)
     else:
-        seed = _normalize_path_for_compare(diff_path)
+        seed = normalize_path_for_compare(diff_path)
 
     return generate_random_hex_str(length=8, seed=seed)
 
@@ -397,7 +397,7 @@ def generate_diff_id(file_paths: list[str] = [], diff_path: str = '') -> str:
 def generate_project_id(project_name: str) -> str:
     if not project_name:
         return ''
-    normed_project_name = _normalize_path_for_compare(project_name)
+    normed_project_name = normalize_path_for_compare(project_name)
     #take 16 (hex) digits from the center of sha256 hexdigest
     s = hashlib.sha256(normed_project_name.encode()).hexdigest()[24:40]
     #format into project_id format
@@ -410,7 +410,7 @@ def get_git_username(project_root_path='') -> str:
     if proc.returncode:
         err_msg = proc.stderr.decode(errors='replace')
         raise RuntimeError(f'Error running git config --list to find git username.  Error message: {err_msg}')
-    
+
     text = ''
     try:
         text = proc.stdout.decode(errors='replace')
@@ -427,7 +427,7 @@ def get_git_username(project_root_path='') -> str:
          #just to be safe there is no space or whatever on the username
         line_parts = [part.strip() for part in line.split('=')]
         if line_parts[0] == 'user.name' and len(line_parts) >= 2:
-            username = line_parts[1] 
+            username = line_parts[1]
             break
         else:
             raise ValueError('Apparently malformed output line from git config --list.\nOffending line: {line}')

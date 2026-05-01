@@ -5,7 +5,7 @@ from functools import wraps
 from typing import Optional
 from werkzeug.utils import secure_filename
 from mcp_utils import *
-from mcp_utils import _run_git_capture, _normalize_path_for_compare
+from mcp_utils import _run_git_capture, normalize_path_for_compare
 import projects_context_manager as pcm
 # from requests import Request
 
@@ -605,7 +605,7 @@ if pcm.current_project:
 
     pcm.project_runtime_dir_path = os.path.join(project_root, pcm.project_runtime_dir_name)
 
-    if not _normalize_path_for_compare(pcm.cwd) == _normalize_path_for_compare(project_root):
+    if not normalize_path_for_compare(pcm.cwd) == normalize_path_for_compare(project_root):
         if os.path.exists(project_root):
             pcm.cwd = project_root
         pass
@@ -713,7 +713,7 @@ def _stream_interactive_session(conn: socket.socket, session: dict, stream_id: s
             final_session = INTERACTIVE_SESSIONS.pop(stream_id, None)
         if final_session:
             _close_interactive_session_resources(final_session)
-    
+
 
 
 def start_interactive_session_listener():
@@ -946,18 +946,18 @@ def receive_full_project_bundle():
 
     #ensure that the server default projects directory exists, and that the project DOESNT exist there
 
-    normed_project_name = _normalize_path_for_compare(project_name)
+    normed_project_name = normalize_path_for_compare(project_name)
     project_path = ''
 
     if os.path.exists(pcm.user_projects_path):
         if os.path.isdir(pcm.user_projects_path):
             for dirpath, dirnames, filenames in os.walk(pcm.user_projects_path):
-                if _normalize_path_for_compare(os.path.split(dirpath)[1]) == normed_project_name:
+                if normalize_path_for_compare(os.path.split(dirpath)[1]) == normed_project_name:
                     project_path = dirpath
                     break
                 should_break = False
                 for dirname in dirnames:
-                    if _normalize_path_for_compare(dirname) == normed_project_name:
+                    if normalize_path_for_compare(dirname) == normed_project_name:
                         project_path = os.path.join(dirpath, dirname)
                         should_break = True
                         break
@@ -984,7 +984,7 @@ def receive_full_project_bundle():
     #remove bundle request from mailbox, and remove bundle file from bundles directory
     if os.path.exists(bundle_path):
         os.remove(bundle_path)
-    
+
     #remove bundle request from mailbox
     pcm.mailbox = mailbox_remove_bundle_request(pcm.mailbox, project_id)
     #save mailbox to file from pcm.mailbox
@@ -1381,7 +1381,7 @@ def _get_invalid_xcodebuild_args(args:list[str]) -> list[str]:
     path_bearing_flags = ['-project', '-workspace', '-xcconfig', '-sdk', '-derivedDataPath', '-resultBundlePath', '-resultStreamPath',
                           '-archivePath', '-exportPath', '-exportOptionsPlist', '-localizationPath', '-xctestrun', '-testProductsPath',
                           '-clonedSourcePackagesDirPath', '-packageCachePath', '-authenticationKeyPath', '-framework', '-library', '-headers', '-output']
-    
+
     flags:list[tuple[int, str]] = []
     invalid_args:list[str] = []
     #establish flags and their indices within args
@@ -1389,7 +1389,7 @@ def _get_invalid_xcodebuild_args(args:list[str]) -> list[str]:
         if len(arg) > 0:
             if arg[0] == '-':
                 flags.append((i, arg))
-    
+
     #we need indices so that we can check the "next argument" in the case of "-flag arg" syntax, since arg is the "next argument" in that situation
     for i, arg in flags:
         #handle "-flag=value" syntax
@@ -1474,7 +1474,36 @@ def run_xcodebuild(job_id, xcodebuild_args):
             log_write.close()
         if conn:
             conn.close()
-        
+
+
+
+def remove_untracked_files(project_root_path: str):
+    proc = run_process(['git', 'status'], cwd=project_root_path)
+    if proc.returncode:
+        err_msg = proc.stderr.decode(errors='replace')
+        raise RuntimeError(f'Error running git status.  Error message:  {err_msg}')
+
+    text: str = proc.stdout.decode(errors='replace')
+    lines = text.splitlines()
+    untracked_files_idx = -1
+    for i in range(len(lines)-1, -1, -1):
+        if lines[i].startswith('Untracked files'):
+            untracked_files_idx = i
+            break
+
+    if untracked_files_idx != -1:
+        start_idx = untracked_files_idx + 2
+        for line in lines[start_idx:]:
+            path = line.strip()
+            abspath = os.path.abspath(path) if not os.path.isabs(path) else path
+            if not os.path.exists(abspath):
+                raise FileNotFoundError(f"Error, file {abspath} not found even though it was reported untracked by 'git status'")
+            os.remove(abspath)
+
+
+
+
+
 
 @app.route('/enable_pairing')
 def enable_pairing():
@@ -1710,6 +1739,7 @@ def apply_patch_server():
             reset_proc = run_process(['git', 'restore', '.'], cwd=project_root_path)
             if reset_proc.returncode:
                 raise RuntimeError(f'Error running "git restore .".  Error message: {reset_proc.stderr.decode(errors='replace')}')
+            remove_untracked_files(project_root_path)
         print(f'Running "git apply {patch_path}" using cwd={project_root_path}')
         proc = run_process(['git', 'apply', '--allow-empty', patch_path], cwd=project_root_path)
         if proc.returncode:
@@ -2050,7 +2080,7 @@ def start_build_job():
             if file_key == 'gitdiff':
                 continue
             binary_file = request.files[file_key]
-            #I know this seems wrong.  But FileStorage.filename always returns the FIRST ITEM (0 index) in the tuple that was 
+            #I know this seems wrong.  But FileStorage.filename always returns the FIRST ITEM (0 index) in the tuple that was
             #used as the value in the files dict sent by the requests library (from the client).  And for the binary files, I am
             #passing the path in the 0th index instead of the filename, because I need to save the files in the same relative locations
             rel_path = unix_path(binary_file.filename)
@@ -2103,7 +2133,7 @@ def start_build_job():
             return 'No file, or disallowed file type was uploaded'
     else:
         return "Some other method besides POST or GET was used.  Don't do that"
-        
+
 
 @app.route('/retrieve_changed_file_paths/<scope>')
 def send_changed_file_paths(scope:str):

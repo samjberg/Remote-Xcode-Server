@@ -1,5 +1,5 @@
 from sys import set_coroutine_origin_tracking_depth
-from mcp_utils import generate_project_id, get_project_runtime_dir_path, get_runtime_dir_name, get_server_dir_path, get_git_username, ensure_directory_exists, is_git_repo, mailbox_has_bundle_request, _normalize_path_for_compare, update_gitignore
+from mcp_utils import generate_project_id, get_project_runtime_dir_path, get_runtime_dir_name, get_server_dir_path, get_git_username, ensure_directory_exists, is_git_repo, mailbox_has_bundle_request, normalize_path_for_compare, update_gitignore
 from flask import request
 import os, json, time
 
@@ -98,7 +98,7 @@ def _create_project(project_name:str, project_root_path: str, client_ip:str ='')
     timestamp = time.time()
     todo_info = _create_todo_info(project_id, project_name)
     project = {'id': project_id, 'project_name': project_name, 'project_root_path': project_root_path,
-               'runtime_dir_path': os.path.join(project_root_path, '.remote-xcode-server'), 
+               'runtime_dir_path': os.path.join(project_root_path, '.remote-xcode-server'),
                'tracked_timestamp': timestamp, 'last_command_timestamp': timestamp, 'known_clients': [], 'todo_info': todo_info}
     if client_ip:
         project['known_clients'].append(client_ip)
@@ -317,10 +317,10 @@ def _get_project_by_name(project_name: str) -> dict:
 
     #project wasn't found by name in projects_dict or in the projects file
     #final fallback to searching for a name match in known_git_repos
-    normed_project_name = _normalize_path_for_compare(project_name)
+    normed_project_name = normalize_path_for_compare(project_name)
     for git_repo_path in known_git_repos:
         unnormed_name = os.path.split(git_repo_path)[1]
-        git_repo_name = _normalize_path_for_compare(unnormed_name)
+        git_repo_name = normalize_path_for_compare(unnormed_name)
         if normed_project_name == git_repo_name:
             #found project
             project_root = git_repo_path
@@ -407,7 +407,7 @@ def handle_project_context():
         #final fallback to searching for project name in known git repos
         for repo_path in known_git_repos:
             repo_name = os.path.split(repo_path)[1]
-            if _normalize_path_for_compare(repo_name) == _normalize_path_for_compare(project_name):
+            if normalize_path_for_compare(repo_name) == normalize_path_for_compare(project_name):
                 project_root_path = repo_path
                 project = {'id': project_id, 'project_name': project_name, 'project_root_path': project_root_path}
                 set_current_project(project=project)
@@ -627,6 +627,6 @@ def initialize():
             set_current_project(project_name=cwd_project_name)
 
 
-    
+
 
 
